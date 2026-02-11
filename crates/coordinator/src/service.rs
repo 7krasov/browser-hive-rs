@@ -385,6 +385,7 @@ impl ScraperCoordinator for CoordinatorService {
             let scope_workers = match workers.get(&req.scope_name) {
                 Some(w) => w,
                 None => {
+                    warn!(ray_id = %ray_id, "Scope not found: {}", req.scope_name);
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(Response::new(ScrapePageResponse {
                         success: false,
