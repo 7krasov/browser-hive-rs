@@ -248,7 +248,7 @@ The coordinator supports multiple deployment modes:
 
 | Mode | Reusable? | Behavior | Best for |
 |------|-----------|----------|----------|
-| `always_new` | No | Fresh context per request, destroyed after | One-shot scraping |
+| `always_new` | No | Fresh context per request, destroyed after | One-shot scraping, per-request geo-targeting |
 | `reusable` (default) | Yes | Contexts reused until recycled by lifecycle | Multi-page workflows, login flows |
 | `reusable_preinit` | Yes | Same as `reusable`, pre-created on startup | Low-latency first requests |
 
@@ -256,6 +256,20 @@ The coordinator supports multiple deployment modes:
 - `WORKER_MAX_IDLE_TIME_SECS` (default: 5 min) - recycled after being idle
 - `max_lifetime` (default: 6 hours) - recycled after this age
 - `max_requests` (default: 10,000) - recycled after this many requests
+
+**Session modes and proxy country behavior:**
+
+The `country_code` field in scrape requests controls proxy geo-targeting. How it interacts with session modes:
+
+| Mode | Client sends `country_code` | Client doesn't send `country_code` |
+|------|---------------------------|-----------------------------------|
+| `always_new` | New context with requested country, no sticky session | New context, provider picks random IP/country per request |
+| `reusable` | **Dedicated** new context with requested country + sticky session (if provider supports it) | Reuses idle context or creates new; sticky session keeps same IP |
+| `reusable_preinit` | Same as `reusable` | Pre-created contexts have no country; sticky session keeps same IP |
+
+Key behavior: In `reusable`/`reusable_preinit` modes, when `country_code` is specified, `BrowserPool::get_or_create_context()` **always creates a dedicated new context** instead of reusing an idle one. This is because proxy country affects connection identity (exit IP) and cannot be changed on an existing context. The decision is driven by `ProxyParams::requires_dedicated_context()`.
+
+**Sticky sessions** (if supported by proxy provider): The proxy provider uses the browser context ID as a session identifier in proxy credentials, ensuring the same proxy IP is assigned to all requests through that context. This is automatically enabled for `reusable`/`reusable_preinit` modes. Production proxy providers should accept a `use_session: bool` parameter and include session ID in proxy credentials when enabled.
 
 **Coordinator modes**:
 - Local mode: Set `COORDINATOR_MODE=local` to use hardcoded worker endpoint from `WORKER_ENDPOINT` env var

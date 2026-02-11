@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct BrowserPool {
     browser: Arc<Browser>,
@@ -551,6 +551,7 @@ impl BrowserPool {
     /// It will:
     /// 1. Try to find an idle existing context
     /// 2. If none found and under max_contexts limit, create a new one
+    /// 2. If none found and under max_contexts limit, create a new one
     /// 3. If at max_contexts limit, return None (resource exhausted)
     ///
     /// # Parameters
@@ -561,33 +562,47 @@ impl BrowserPool {
         ray_id: &str,
         proxy_params: &ProxyParams,
     ) -> Result<Option<Arc<BrowserContext>>> {
-        // First, try to find an idle context
-        if let Some(context) = self.find_least_busy_context().await {
-            info!(ray_id = %ray_id, "Reusing idle context: {} (total_requests: {})", context.metadata.id, context.metadata.total_requests.load(std::sync::atomic::Ordering::SeqCst));
-            return Ok(Some(context));
+        // If request has proxy routing overrides (e.g. country_code), we must create
+        // a dedicated context because these params affect the proxy connection identity
+        // (exit IP, geo) and can't be changed on an existing context.
+        if !proxy_params.requires_dedicated_context() {
+            // No routing overrides - try to reuse an idle context
+            if let Some(context) = self.find_least_busy_context().await {
+                info!(ray_id = %ray_id, "Reusing idle context: {} (total_requests: {})", context.metadata.id, context.metadata.total_requests.load(std::sync::atomic::Ordering::SeqCst));
+                return Ok(Some(context));
+            }
+        } else {
+            debug!(
+                ray_id = %ray_id,
+                "Request has proxy routing overrides (country_code={:?}) - creating dedicated context",
+                proxy_params.country_code
+            );
         }
 
-        // No idle context found - check if we can create a new one
+        // No idle context available (or dedicated context required) - try to create a new one
         let mut contexts = self.contexts.write().await;
 
-        // Double-check after acquiring write lock (another task might have created one)
-        for context in contexts.iter() {
-            if !context
-                .metadata
-                .is_busy
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Ok(Some(context.clone()));
+        if !proxy_params.requires_dedicated_context() {
+            // Double-check after acquiring write lock (another task might have created one)
+            for context in contexts.iter() {
+                if !context
+                    .metadata
+                    .is_busy
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(Some(context.clone()));
+                }
             }
         }
 
-        // Still no idle context - check if we're under the limit
+        // Check if we're under the limit
         if contexts.len() < self.scope_config.max_contexts as usize {
             info!(
                 ray_id = %ray_id,
-                "Creating new context on-demand ({}/{})",
+                "Creating new context on-demand ({}/{}){}",
                 contexts.len() + 1,
-                self.scope_config.max_contexts
+                self.scope_config.max_contexts,
+                if proxy_params.requires_dedicated_context() { " [dedicated]" } else { "" }
             );
 
             let context = self.create_new_context(ray_id, proxy_params).await?;

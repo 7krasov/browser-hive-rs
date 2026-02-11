@@ -67,6 +67,20 @@ impl ProxyParams {
     pub fn has_overrides(&self) -> bool {
         self.country_code.is_some()
     }
+
+    /// Whether these params require a dedicated new browser context.
+    ///
+    /// Some proxy parameters (like country) affect the proxy connection identity
+    /// (exit IP, geo-location) and cannot be changed on an existing context.
+    /// When this returns true, the worker should create a new context instead
+    /// of reusing an idle one.
+    ///
+    /// This is checked in Reusable/ReusablePreinit modes to decide whether
+    /// to reuse an idle context or create a fresh one with the requested params.
+    pub fn requires_dedicated_context(&self) -> bool {
+        self.country_code.is_some()
+        // Future: || self.city.is_some() || self.asn.is_some()
+    }
 }
 
 /// Parameters affecting scraping behavior
@@ -198,6 +212,13 @@ mod tests {
         let params = ProxyParams::with_country("US");
         assert_eq!(params.country_code, Some("US".to_string()));
         assert!(params.has_overrides());
+        assert!(params.requires_dedicated_context());
+    }
+
+    #[test]
+    fn test_proxy_params_default_no_dedicated_context() {
+        let params = ProxyParams::default();
+        assert!(!params.requires_dedicated_context());
     }
 
     #[test]
