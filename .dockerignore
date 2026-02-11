@@ -1,0 +1,38 @@
+# Target directory (built artifacts)
+target/
+**/target/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+docs/
+
+# CI/CD
+.github/
+
+# Ops files (not needed in container)
+ops/
+
+# Aider
+.aider*
+
+# Rust backup files
+**/*.rs.bk
+
+# Lock files (Cargo.lock is needed for reproducible builds)
+# Keep Cargo.lock
+
+# Test artifacts
+*.pdb

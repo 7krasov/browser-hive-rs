@@ -1,0 +1,65 @@
+[package]
+name = "browser-hive"
+version = "0.1.0"
+edition = "2021"
+authors = ["Browser Hive Contributors"]
+description = "Distributed web scraping system with browser automation and proxy management"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/7krasov/browser-hive-rs"
+keywords = ["scraping", "browser", "automation", "proxy", "distributed"]
+categories = ["web-programming", "network-programming"]
+
+[lib]
+name = "browser_hive"
+path = "src/lib.rs"
+
+[workspace]
+members = [
+    "crates/coordinator",
+    "crates/worker",
+    "crates/proto",
+    "crates/common",
+    "crates/tokio-cancellation-ext",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+async-trait = "0.1"
+url = "2.5"
+
+# Kubernetes
+kube = { version = "0.95", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.23", features = ["latest"] }
+
+# Browser automation
+headless_chrome = "1.0"
+
+# Metrics
+prometheus = "0.13"
+
+# HTTP server for metrics
+axum = "0.7"
+
+
+# Root crate dependencies (facade pattern)
+[dependencies]
+browser-hive-common = { path = "crates/common" }
+browser-hive-worker = { path = "crates/worker" }
+browser-hive-proto = { path = "crates/proto" }
+
+[features]
+default = ["worker", "coordinator"]
+# Enable only worker functionality
+worker = []
+# Enable only coordinator functionality
+coordinator = []

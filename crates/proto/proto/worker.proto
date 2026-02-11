@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package scraper.worker;
+
+import "google/protobuf/empty.proto";
+
+// Worker service (internal, pod-to-pod communication)
+service WorkerService {
+  rpc ScrapePage(ScrapePageRequest) returns (ScrapePageResponse);
+  rpc GetStats(google.protobuf.Empty) returns (WorkerStatsResponse);
+  rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
+}
+
+// Error codes for scraping operations (worker-specific)
+enum ErrorCode {
+  ERROR_CODE_NONE = 0;                       // No error (success)
+
+  ERROR_CODE_BROWSER_ERROR = 5003;           // Browser crashed or failed
+  ERROR_CODE_NETWORK_ERROR = 5004;           // Network error during page load
+  ERROR_CODE_CONTEXT_CREATION_FAILED = 5005; // Failed to create browser context
+  ERROR_CODE_TERMINATING = 5006;             // Worker/Coordinator is terminating (graceful shutdown), retry later
+
+  ERROR_CODE_INVALID_URL = 4001;             // Invalid URL provided
+  ERROR_CODE_SESSION_NOT_FOUND = 4002;       // Session ID not found
+  ERROR_CODE_SCOPE_NOT_FOUND = 4003;         // Specified scope does not exist
+
+  ERROR_CODE_TIMEOUT_BROWSER = 4041;         // Browser timeout while loading page
+  ERROR_CODE_SELECTOR_NOT_FOUND = 4042;      // Browser has not found the requested CSS selector
+  ERROR_CODE_SKIP_SELECTOR_FOUND = 4043;     // Browser has found the selector to skip: don't parse this content
+
+  ERROR_CODE_UNKNOWN = 9999;                 // Unknown error
+}
+
+message ScrapePageRequest {
+  string url = 1;
+  uint32 timeout_seconds = 2;
+
+  // Specific context ID for session persistence
+  string context_id = 3;
+
+  // Wait strategy for page loading (e.g., "network_idle", "timeout")
+  // If not specified, uses default strategy ("network_idle")
+  string wait_strategy = 4;
+
+  // Timeout in milliseconds for wait strategy
+  // Max allowed: MAX_WAIT_TIMEOUT_MS - values above will be capped
+  // Default if not specified: DEFAULT_WAIT_TIMEOUT_MS
+  // See common/src/wait_strategy.rs for constant values
+  uint32 wait_timeout_ms = 5;
+
+  // CSS selector to wait for (uses "selector" wait strategy automatically if specified)
+  // If this element appears, scraping succeeds
+  string wait_selector = 6;
+
+  // CSS selector that indicates content should be skipped
+  // If this element appears, returns ERROR_CODE_SKIP_SELECTOR_FOUND but still returns content
+  string skip_selector = 7;
+
+  // Request tracing ID for log correlation
+  string ray_id = 8;
+
+  // ISO 3166-1 alpha-2 country code for proxy geo-targeting
+  // Examples: "US", "DE", "GB", "UA"
+  // If not specified, proxy provider uses its default behavior
+  string country_code = 9;
+}
+
+message ScrapePageResponse {
+  bool success = 1;
+  uint32 status_code = 2;
+  string content = 3;
+  string error_message = 4;
+  ErrorCode error_code = 5;
+  map<string, string> response_headers = 6;
+  uint64 execution_time_ms = 7;
+
+  // Return context ID for session
+  string context_id = 8;
+
+  // Request tracing ID for log correlation (same as in request)
+  string ray_id = 9;
+}
+
+message WorkerStatsResponse {
+  string scope_name = 1;
+  string pod_name = 2;
+  string pod_ip = 3;
+  uint32 total_contexts = 4;
+  uint32 available_slots = 5;
+  uint32 active_requests = 6;
+  uint64 total_requests = 7;
+  uint64 total_contexts_created = 8;
+  uint64 total_contexts_recycled = 9;
+  double success_rate = 10;
+}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string message = 2;
+}

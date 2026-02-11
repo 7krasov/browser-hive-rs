@@ -1,0 +1,23 @@
+[package]
+name = "browser-hive-coordinator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "coordinator"
+path = "src/main.rs"
+
+[dependencies]
+browser-hive-common = { path = "../common" }
+browser-hive-proto = { path = "../proto" }
+tokio-cancellation-ext = { path = "../tokio-cancellation-ext" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+uuid = { workspace = true }

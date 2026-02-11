@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  # Coordinator service - routes requests to workers
+  coordinator:
+    build:
+      context: .
+      dockerfile: ops/docker/local/coordinator.dockerfile
+    ports:
+      - "50051:50051"  # gRPC endpoint
+    environment:
+      - RUST_LOG=info
+      - COORDINATOR_MODE=local  # Use local mode (no K8s API)
+      - COORDINATOR_GRPC_PORT=50051
+      # For local dev: hardcoded worker endpoint (no K8s discovery)
+      - WORKER_ENDPOINT=worker:50052
+      - WORKER_SCOPE_NAME=local_dev
+    depends_on:
+      - worker
+    networks:
+      - browser-hive
+
+  # Worker service - runs Chrome and executes scraping
+  worker:
+    build:
+      context: .
+      dockerfile: ops/docker/local/worker.dockerfile
+    ports:
+      - "50052:50052"  # gRPC endpoint
+      - "9090:9090"    # Prometheus metrics
+    environment:
+      - RUST_LOG=debug
+      - WORKER_SCOPE_NAME=local_dev
+      - WORKER_GRPC_PORT=50052
+      - POD_NAME=worker-local
+      - POD_IP=0.0.0.0
+      - WORKER_HEADLESS=true  # true = headless (faster), false = headfull (better stealth, requires display)
+
+      # Context pool configuration
+      # Session modes:
+      #   always_new       - new context per request, destroyed after
+      #   reusable         - reusable contexts, recycled by lifecycle monitor (default)
+      #   reusable_preinit - like reusable but pre-creates min_contexts on startup
+      - WORKER_MIN_CONTEXTS=2           # Used by reusable_preinit mode
+      - WORKER_MAX_CONTEXTS=5           # Max concurrent contexts
+      - WORKER_SESSION_MODE=reusable    # Reusable contexts (default)
+      - WORKER_MAX_IDLE_TIME_SECS=1800  # 30 minutes idle timeout (contexts recycled after this)
+
+      # Alternative: AlwaysNew (one-shot scraping, no session reuse)
+      # - WORKER_SESSION_MODE=always_new
+      # - WORKER_MAX_CONTEXTS=5
+
+      # Alternative: ReusablePreinit (fast first request)
+      # - WORKER_SESSION_MODE=reusable_preinit
+      # - WORKER_MIN_CONTEXTS=3
+      # - WORKER_MAX_CONTEXTS=5
+
+      # Proxy configuration
+      # Option 1: No proxy (direct connection)
+      #- PROXY_TYPE=none
+      #
+      # Option 2: Generic proxy with full URL
+      # - PROXY_TYPE=generic
+      # - PROXY_URL=http://user:pass@proxy.example.com:8080
+      #
+      # Option 3: Generic proxy with components
+      # - PROXY_TYPE=generic
+      # - PROXY_ADDRESS=proxy.example.com
+      # - PROXY_PORT=8080
+      # - PROXY_USERNAME=user
+      # - PROXY_PASSWORD=pass
+      # - PROXY_SCHEME=http  # http, https, or socks5
+      - PROXY_TYPE=${PROXY_TYPE:-none}
+      - PROXY_URL=${PROXY_URL:-}
+    cap_add:
+      - SYS_ADMIN  # Required for Chrome sandbox
+    shm_size: '2gb'  # Shared memory for Chrome
+    networks:
+      - browser-hive
+
+networks:
+  browser-hive:
+    driver: bridge

@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+
+# Docker
+.docker/
