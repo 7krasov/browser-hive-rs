@@ -107,8 +107,27 @@ impl BrowserPool {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build launch options: {}", e))?;
 
+        // Pre-flight: verify browser binary exists and is executable
+        let browser_binary = scope_config
+            .browser_path
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("chromium"));
+        Self::verify_browser_binary(browser_binary);
+
         // Launch browser
-        let browser = Browser::new(launch_options)?;
+        info!("Attempting to launch browser process...");
+        let browser = Browser::new(launch_options).map_err(|e| {
+            tracing::error!(
+                "FATAL: Browser failed to launch. Error: {}. \
+                 Common causes: (1) --no-sandbox not set but running in a container without SYS_ADMIN capability, \
+                 (2) browser binary not found at specified path, \
+                 (3) missing shared libraries. \
+                 Check that the browser binary exists and has correct permissions.",
+                e
+            );
+            e
+        })?;
+        info!("Browser process launched successfully");
 
         let lifecycle_config = scope_config.lifecycle.clone();
 
@@ -177,6 +196,57 @@ impl BrowserPool {
         pool.start_lifecycle_monitor();
 
         Ok(pool)
+    }
+
+    /// Pre-flight check: verify browser binary exists and log useful diagnostics
+    fn verify_browser_binary(binary_path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !binary_path.exists() {
+            warn!(
+                "Browser binary not found at '{}'. \
+                 headless_chrome will attempt auto-detection.",
+                binary_path.display()
+            );
+            return;
+        }
+
+        match std::fs::metadata(binary_path) {
+            Ok(metadata) => {
+                let mode = metadata.permissions().mode();
+                let is_executable = mode & 0o111 != 0;
+                if !is_executable {
+                    warn!(
+                        "Browser binary '{}' exists but is NOT executable (mode: {:o})",
+                        binary_path.display(),
+                        mode
+                    );
+                } else {
+                    info!(
+                        "Browser binary verified: '{}' (mode: {:o})",
+                        binary_path.display(),
+                        mode
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot read metadata for browser binary '{}': {}",
+                    binary_path.display(),
+                    e
+                );
+            }
+        }
+
+        // Log current user — helps diagnose sandbox/permission issues
+        let uid = unsafe { libc::getuid() };
+        if uid != 0 {
+            info!(
+                "Running as non-root user (uid: {}). If browser fails to start, \
+                 verify that container security context and capabilities are configured correctly.",
+                uid
+            );
+        }
     }
 
     async fn populate_initial_contexts(&self) -> Result<()> {
