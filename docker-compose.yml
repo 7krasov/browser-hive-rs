@@ -72,8 +72,6 @@ services:
       # - PROXY_SCHEME=http  # http, https, or socks5
       - PROXY_TYPE=${PROXY_TYPE:-none}
       - PROXY_URL=${PROXY_URL:-}
-    cap_add:
-      - SYS_ADMIN  # Required for Chrome sandbox
     shm_size: '2gb'  # Shared memory for Chrome
     networks:
       - browser-hive

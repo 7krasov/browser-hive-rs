@@ -94,9 +94,8 @@ spec:
             cpu: "2000m"
 
         securityContext:
-          capabilities:
-            add:
-            - SYS_ADMIN  # Required for Chrome sandbox
+          allowPrivilegeEscalation: false
+          runAsUser: 1000
 
         volumeMounts:
         - name: dshm

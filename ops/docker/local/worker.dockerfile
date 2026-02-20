@@ -51,7 +51,14 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/target/release/worker /usr/local/bin/worker
 
 # Create directory for Chrome data
-RUN mkdir -p /chrome-data && chmod 777 /chrome-data
+RUN mkdir -p /chrome-data/cache && \
+    chmod -R 777 /chrome-data
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /chrome-data
+
+USER appuser
 
 EXPOSE 50052 9090
 

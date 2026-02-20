@@ -148,7 +148,7 @@ impl Clone for Box<dyn TabInitMiddleware> {
 /// Default implementation of BrowserBinaryParamsMiddleware for Chrome/Chromium
 ///
 /// This middleware adds the standard Chrome arguments for:
-/// - Docker compatibility (--no-sandbox, --disable-dev-shm-usage)
+/// - Docker compatibility (--disable-dev-shm-usage)
 /// - Anti-bot stealth (disable AutomationControlled, exclude automation switches)
 /// - Window size (1920x1080 for realistic desktop)
 /// - Performance optimization (disable throttling, first-run checks)
@@ -162,7 +162,6 @@ pub struct DefaultBinaryParamsMiddleware;
 impl BrowserBinaryParamsMiddleware for DefaultBinaryParamsMiddleware {
     fn apply_args(&self, args: &mut Vec<&'static OsStr>, headless: bool) {
         // Required for Docker
-        args.push(OsStr::new("--no-sandbox"));
         args.push(OsStr::new("--disable-dev-shm-usage"));
 
         // Anti-bot stealth (critical!)
@@ -224,7 +223,6 @@ pub struct BraveBinaryParamsMiddleware;
 impl BrowserBinaryParamsMiddleware for BraveBinaryParamsMiddleware {
     fn apply_args(&self, args: &mut Vec<&'static OsStr>, headless: bool) {
         // Required for Docker
-        args.push(OsStr::new("--no-sandbox"));
         args.push(OsStr::new("--disable-dev-shm-usage"));
 
         // Anti-bot stealth (critical!)
