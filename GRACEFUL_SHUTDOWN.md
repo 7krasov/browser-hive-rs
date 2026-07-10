@@ -29,7 +29,7 @@ When a Worker receives SIGTERM:
 3. **Graceful Wait** (t=0-60s)
    - Waits for all active requests to complete
    - Polls every 500ms and logs remaining count
-   - Terminates after all requests finish or 60s timeout
+   - There is no internal timeout: the process waits until all requests finish; the 60s limit comes from K8s `terminationGracePeriodSeconds` (SIGKILL)
 
 4. **K8s Integration**
    - Readiness probe removes pod from Service endpoints (2-5s propagation)
@@ -69,7 +69,7 @@ When a Coordinator receives SIGTERM:
 4. **Graceful Wait**
    - Waits for all active requests to complete
    - Active requests may include retries to other workers
-   - Terminates after all complete or 60s timeout
+   - No internal timeout: waits until all complete; K8s sends SIGKILL after `terminationGracePeriodSeconds` (60s)
 
 ## Error Codes
 

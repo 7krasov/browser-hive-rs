@@ -98,23 +98,25 @@ ops/
 Browser Hive supports session reuse for logged-in scraping:
 
 ```bash
-# 1. First request - returns context_id
+# 1. First request - returns session_id
 grpcurl -plaintext -d '{
   "scope_name": "local_dev",
   "url": "https://example.com/login"
 }' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
 
-# Response includes: "context_id": "ctx-abc123"
+# Response includes: "session_id": "worker-local:ctx-abc123"
 
 # 2. Subsequent requests - reuse session
 grpcurl -plaintext -d '{
   "scope_name": "local_dev",
   "url": "https://example.com/dashboard",
-  "context_id": "ctx-abc123"
+  "session_id": "worker-local:ctx-abc123"
 }' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
 ```
 
-The same browser context (with cookies) will be used! If you receive `ERROR_CODE_SESSION_NOT_FOUND` (4002), the session expired - retry without `context_id` to start a new session.
+The same browser context (with cookies) will be used! If you receive `ERROR_CODE_SESSION_NOT_FOUND` (4002), the session expired - retry without `session_id` to start a new session.
+
+**Session ID format**: `{worker_id}:{context_id}`. The response also returns `worker_id` and `context_id` as separate fields - these are the components of `session_id`, duplicated for logging/debugging. To reuse a session, always pass the whole `session_id`.
 
 ## Wait Strategies
 
@@ -122,9 +124,10 @@ Browser Hive supports flexible wait strategies to handle dynamic content:
 
 ### Available Strategies
 
-- **`network_idle`** (default) - Wait until network is idle (no requests for 500ms)
+- **`network_idle`** (default) - Wait until network is idle (no requests for ~500ms)
 - **`timeout`** - Wait for a fixed duration
-- **`selector`** - Wait for a specific CSS selector to appear
+
+Waiting for a CSS selector is not a separate strategy - use the `wait_selector` request field, which works on top of any strategy (wait for idle first, then search for the selector).
 
 ### Wait Selector
 
@@ -165,6 +168,24 @@ If the skip selector is found:
 
 This is **expected behavior**, not an error. Your client should handle this gracefully.
 
+## Proxy Geo-Targeting
+
+Use `country_code` (ISO 3166-1 alpha-2, e.g. `"US"`, `"DE"`, `"UA"`) to request a proxy exit IP from a specific country:
+
+```bash
+grpcurl -plaintext -d '{
+  "scope_name": "local_dev",
+  "url": "https://example.com",
+  "country_code": "DE"
+}' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
+```
+
+The proxy provider must support geo-targeting (see `ProxyProvider::build_config_with_params`). Because the proxy country affects connection identity, specifying `country_code` in `reusable`/`reusable_preinit` session modes always creates a **dedicated new context** instead of reusing an idle one. If `country_code` is omitted, the provider uses its default behavior.
+
+## Request Tracing
+
+Every request accepts an optional `ray_id` field for log correlation. If not provided, one is auto-generated (with a `ray_` prefix) and returned in the response. Pass your own `ray_id` to trace a request across client, coordinator, and worker logs.
+
 ## Error Handling
 
 Browser Hive uses a dual-layer error system:
@@ -184,6 +205,9 @@ Every response includes:
 - `error_message: string` - Human-readable error details
 - `execution_time_ms: uint64` - Request execution time
 - `content: string` - Page HTML (may be partial on errors)
+- `session_id: string` - Session ID for reuse in subsequent requests
+- `worker_id` / `context_id: string` - Components of `session_id` (for logging/debugging)
+- `ray_id: string` - Tracing ID (same as in request, or auto-generated)
 
 ### Common ErrorCodes
 

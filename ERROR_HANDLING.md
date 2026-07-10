@@ -76,6 +76,7 @@ These indicate issues with the worker/browser infrastructure.
 | Code | Value | Description | Retry? |
 |------|-------|-------------|--------|
 | `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | No workers available or all slots busy | ✅ Yes - retry after delay or scale workers |
+| `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | Worker pod not reachable from coordinator | ✅ Yes - retry after delay |
 | `ERROR_CODE_BROWSER_ERROR` | 5003 | Browser process crashed or internal failure | ✅ Yes - worker auto-recovers |
 | `ERROR_CODE_NETWORK_ERROR` | 5004 | Network error during page navigation | ✅ Yes |
 | `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | Failed to create browser context | ✅ Yes |
@@ -89,20 +90,25 @@ These indicate issues with the worker/browser infrastructure.
 
 ## Response Structure
 
-When an error occurs, `ScrapePageResponse` contains:
+The client-facing response (`scraper.coordinator.ScrapePageResponse`) contains:
 
 ```protobuf
 message ScrapePageResponse {
-  bool success = 1;              // false on error
-  uint32 status_code = 2;        // HTTP status or 0
-  string content = 3;            // Empty or partial content
-  string error_message = 4;      // Detailed human-readable error
-  ErrorCode error_code = 5;      // Machine-readable error code
+  bool success = 1;               // false on error
+  uint32 status_code = 2;         // HTTP status or 0
+  string content = 3;             // Empty or partial content
+  string error_message = 4;       // Detailed human-readable error
+  ErrorCode error_code = 5;       // Machine-readable error code
   map<string, string> response_headers = 6;
-  uint64 execution_time_ms = 7;  // Always present
-  string context_id = 8;         // Session ID (may be empty)
+  string session_id = 7;          // Session ID for reuse ("{worker_id}:{context_id}", may be empty)
+  string worker_id = 8;           // Worker pod ID (component of session_id, for debugging)
+  string context_id = 9;          // Browser context ID (component of session_id, for debugging)
+  uint64 execution_time_ms = 10;  // Always present
+  string ray_id = 11;             // Tracing ID (same as in request, or auto-generated)
 }
 ```
+
+To reuse a browser session, pass `session_id` in the next request. The internal worker-to-coordinator proto (`scraper.worker.ScrapePageResponse`) differs slightly (it returns only `context_id`); the examples below show the client-facing view.
 
 ### Error Message Format
 
@@ -199,7 +205,7 @@ Coordinator is shutting down, please retry
 {
   "scope_name": "my_scope",
   "url": "https://example.com",
-  "context_id": "ctx-expired-123"
+  "session_id": "worker-1:ctx-expired-123"
 }
 ```
 
@@ -209,14 +215,14 @@ Coordinator is shutting down, please retry
   "success": false,
   "status_code": 0,
   "content": "",
-  "error_message": "Context not found or expired: ctx-expired-123",
+  "error_message": "Session expired or worker unavailable. Please retry without session_id",
   "error_code": 4002,
   "execution_time_ms": 15,
-  "context_id": ""
+  "session_id": ""
 }
 ```
 
-**Client Action**: Retry without `context_id` to get a new session.
+**Client Action**: Retry without `session_id` to get a new session.
 
 ---
 
@@ -465,15 +471,15 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
 - `ERROR_CODE_SKIP_SELECTOR_FOUND` (4043) - expected behavior
 
 **Special handling**:
-- `ERROR_CODE_SESSION_NOT_FOUND` (4002) - retry without `context_id` to start new session
+- `ERROR_CODE_SESSION_NOT_FOUND` (4002) - retry without `session_id` to start new session
 - `ERROR_CODE_SELECTOR_NOT_FOUND` (4042) - check selector validity, content may still be useful
 
 ### Session Management
 
 When receiving `ERROR_CODE_SESSION_NOT_FOUND`:
-1. Clear the stored `context_id`
-2. Retry the request without `context_id`
-3. Store the new `context_id` from the response
+1. Clear the stored `session_id`
+2. Retry the request without `session_id`
+3. Store the new `session_id` from the response
 
 ### Partial Content
 
@@ -532,7 +538,7 @@ Monitor `browser_hive_worker_requests_failed` by `error_code` label.
 4. **Implement exponential backoff** - for 5xxx errors
 5. **Don't retry 4xxx errors** - except `SESSION_NOT_FOUND` and `TIMEOUT_BROWSER`
 6. **Handle `SKIP_SELECTOR_FOUND` gracefully** - this is expected behavior, not a failure
-7. **Log `context_id`** - helps trace session-specific issues
+7. **Log `session_id` and `ray_id`** - helps trace session-specific issues and correlate logs across coordinator/worker
 8. **Monitor error rates** - set alerts on unusual spikes
 
 ## FAQ

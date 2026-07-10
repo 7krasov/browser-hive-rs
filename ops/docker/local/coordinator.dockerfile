@@ -19,7 +19,7 @@ COPY src ./src
 RUN cargo build --release -p browser-hive-coordinator --bin coordinator
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:12.13-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

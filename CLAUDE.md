@@ -22,7 +22,7 @@ This is a Cargo workspace with 5 crates:
 
 **Session Management**: Sessions use the format `{worker_id}:{context_id}` to enable clients to reuse the same browser context across requests. The coordinator's `SessionManager` (defined in `common/src/session.rs`) tracks active sessions and routes subsequent requests to the correct worker+context.
 
-**Worker Discovery**: The coordinator can discover workers through various mechanisms (implemented in `coordinator/src/worker_discovery.rs::WorkerDiscovery`). In local mode, it uses hardcoded endpoints. Workers are organized by "scope" which defines proxy provider configuration and context lifecycle settings.
+**Worker Discovery**: The coordinator has two built-in discovery mechanisms selected by `COORDINATOR_MODE`: local mode (`coordinator/src/local_worker_discovery.rs::LocalWorkerDiscovery`) reads worker endpoints from env vars, while Kubernetes mode (`coordinator/src/worker_discovery.rs::WorkerDiscovery`, the default for any `COORDINATOR_MODE` value other than `local`) lists pods with label `app=browser-hive-worker` via the K8s API every 10 seconds. Workers are organized by "scope" which defines proxy provider configuration and context lifecycle settings.
 
 **Browser Context Lifecycle**: Workers maintain a pool of CDP BrowserContexts (managed by `worker/src/browser_pool.rs::BrowserPool`), each with configurable lifecycle based on time, request count, idle time, and cache size. Contexts are recycled according to `RotationStrategy` (enum defined in `common/src/config.rs`). Each context is created via `browser.new_tab()` for true isolation.
 
@@ -32,7 +32,7 @@ This is a Cargo workspace with 5 crates:
 
 **Resource Management**: Each context uses an `AtomicBool` (`is_busy`) to track availability (field in `BrowserContextMetadata` struct in `common/src/types.rs`). Workers report available slots to the coordinator, which uses this for load balancing.
 
-**Error Handling**: Browser Hive uses a dual-layer error system. gRPC Status is ALWAYS 0 (OK) if the system can return a response to the client. All operational errors (navigation failures, timeouts, selectors not found, browser crashes) are returned as gRPC OK responses with appropriate `ErrorCode` in the response body. Only true infrastructure failures (network partition, coordinator unreachable) use non-zero gRPC status codes. This allows clients to always parse responses uniformly and get detailed error context (execution_time_ms, context metadata, etc.). All error responses include `execution_time_ms` field. ErrorCode enum is defined in `crates/proto/proto/worker.proto` with codes: INVALID_URL (4001), SESSION_NOT_FOUND (4002), TIMEOUT_BROWSER (4041), SELECTOR_NOT_FOUND (4042), SKIP_SELECTOR_FOUND (4043), BROWSER_ERROR (5003), NETWORK_ERROR (5004), CONTEXT_CREATION_FAILED (5005), TERMINATING (5006). See ERROR_HANDLING.md for complete details.
+**Error Handling**: Browser Hive uses a dual-layer error system. gRPC Status is ALWAYS 0 (OK) if the system can return a response to the client. All operational errors (navigation failures, timeouts, selectors not found, browser crashes) are returned as gRPC OK responses with appropriate `ErrorCode` in the response body. Only true infrastructure failures (network partition, coordinator unreachable) use non-zero gRPC status codes. This allows clients to always parse responses uniformly and get detailed error context (execution_time_ms, context metadata, etc.). All error responses include `execution_time_ms` field. ErrorCode enum is defined in `crates/proto/proto/worker.proto` with codes: INVALID_URL (4001), SESSION_NOT_FOUND (4002), SCOPE_NOT_FOUND (4003), TIMEOUT_BROWSER (4041), SELECTOR_NOT_FOUND (4042), SKIP_SELECTOR_FOUND (4043), BROWSER_ERROR (5003), NETWORK_ERROR (5004), CONTEXT_CREATION_FAILED (5005), TERMINATING (5006), UNKNOWN (9999). The coordinator proto additionally defines NO_WORKERS_AVAILABLE (5001), WORKER_UNREACHABLE (5002), and TIMEOUT_GRPC (1, currently unused). See ERROR_HANDLING.md for complete details.
 
 **Wait Strategies**: The system supports flexible wait strategies via `WaitStrategy` trait (`common/src/wait_strategy.rs`). Default strategy: `network_idle` (two-phase: wait for idle → search for selector). Behavior depends on `wait_timeout_ms` and `wait_selector`: (1) No selector: wait for idle with timeout=effective_timeout(wait_timeout_ms), (2) Selector present: total timeout always `DEFAULT_WAIT_TIMEOUT_MS`, wait for idle then search selector for min(wait_timeout_ms, remaining time). Clients specify `wait_selector` (CSS selector to find after idle), `skip_selector` (returns ERROR_CODE_SKIP_SELECTOR_FOUND if found), `wait_timeout_ms` (0=default, max=`MAX_WAIT_TIMEOUT_MS`, values above are capped). Final selector check always performed before returning. Returns ERROR_CODE_SELECTOR_NOT_FOUND with full page content if not found.
 
@@ -223,17 +223,17 @@ Metrics are implemented in `worker/src/metrics.rs` and updated after each reques
 
 ### Deployment Modes
 
-The coordinator supports multiple deployment modes:
-- **Local mode**: Uses hardcoded worker endpoints (set `COORDINATOR_MODE=local`)
-- **Production mode**: Can be extended with custom worker discovery mechanisms
+The coordinator supports two deployment modes (selected via `COORDINATOR_MODE`):
+- **Local mode** (`COORDINATOR_MODE=local`): Worker endpoints come from env vars. Either a single worker via `WORKER_ENDPOINT` + `WORKER_SCOPE_NAME`, or multiple workers/scopes via `WORKER_ENDPOINTS=scope1:host1:port1,scope2:host2:port2,...` (takes precedence)
+- **Kubernetes mode** (default - any value other than `local`): Built-in discovery via the K8s API - lists pods labeled `app=browser-hive-worker` in the coordinator's namespace every 10 seconds. The scope is read from the pod's `scope` label; the worker gRPC port is assumed to be 50052. Requires RBAC access to pods (see K8S_DEPLOYMENT.md)
 
 ### Configuration
 
-**Worker configuration** is loaded from environment variables (via `load_config_from_env` function in `worker/src/main.rs`). Required variables:
-- `WORKER_SCOPE_NAME` - Scope identifier
-- `WORKER_GRPC_PORT` - gRPC server port
-- `WORKER_MAX_CONTEXTS` - Maximum concurrent browser contexts (= max concurrent requests)
-- Proxy settings (if using real proxy): `PROXY_TYPE`, credentials, etc.
+**Worker configuration** is loaded from environment variables (via `load_config_from_env` function in `worker/src/main.rs`). Main variables (all have defaults):
+- `WORKER_SCOPE_NAME` - Scope identifier (default: `local_dev`)
+- `WORKER_GRPC_PORT` - gRPC server port (default: `50052`)
+- `WORKER_MAX_CONTEXTS` - Maximum concurrent browser contexts (= max concurrent requests, default: `3`)
+- Proxy settings (see `worker/src/providers.rs`): `PROXY_TYPE` (`none` = direct connection, default; `generic` = HTTP/SOCKS5 proxy via `PROXY_URL` or `PROXY_ADDRESS`/`PROXY_PORT`/`PROXY_USERNAME`/`PROXY_PASSWORD`/`PROXY_SCHEME`)
 
 **Optional worker variables**:
 - `WORKER_MIN_CONTEXTS` - Minimum browser contexts pre-created on startup, used by `reusable_preinit` mode (default: `WORKER_MAX_CONTEXTS`)
@@ -271,9 +271,7 @@ Key behavior: In `reusable`/`reusable_preinit` modes, when `country_code` is spe
 
 **Sticky sessions** (if supported by proxy provider): The proxy provider uses the browser context ID as a session identifier in proxy credentials, ensuring the same proxy IP is assigned to all requests through that context. This is automatically enabled for `reusable`/`reusable_preinit` modes. Production proxy providers should accept a `use_session: bool` parameter and include session ID in proxy credentials when enabled.
 
-**Coordinator modes**:
-- Local mode: Set `COORDINATOR_MODE=local` to use hardcoded worker endpoint from `WORKER_ENDPOINT` env var
-- Production mode: Can be customized with different worker discovery implementations
+**Coordinator modes**: See "Deployment Modes" above (`COORDINATOR_MODE=local` for env-based endpoints, anything else for built-in K8s discovery).
 
 ### Session Management
 

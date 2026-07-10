@@ -34,7 +34,7 @@ Browser Hive has **two independent middleware systems** that run at different st
 
 **Example use cases**: Custom Chrome flags, feature toggles, performance tuning
 
-#### Group 2: Evaluate Middleware (`TabInitMiddleware`)
+#### Group 2: Tab Init Middleware (`TabInitMiddleware`)
 
 **Purpose**: Execute CDP protocol commands **after each tab creation**
 
@@ -80,7 +80,6 @@ use std::ffi::OsStr;
 #[derive(Debug, Clone)]
 pub struct CustomChromeArgs {
     pub disable_webrtc: bool,
-    pub custom_user_data_dir: Option<String>,
 }
 
 impl BrowserBinaryParamsMiddleware for CustomChromeArgs {
@@ -91,17 +90,13 @@ impl BrowserBinaryParamsMiddleware for CustomChromeArgs {
             args.push(OsStr::new("--disable-webrtc-encryption"));
         }
 
-        // Use custom user data directory (for profile persistence)
-        if let Some(ref data_dir) = self.custom_user_data_dir {
-            // Note: This is a simplified example - in production you'd need to
-            // use a dynamically allocated string with proper lifetime
-            args.push(OsStr::new(&format!("--user-data-dir={}", data_dir)));
-        }
-
         // Add headless-specific optimizations
         if headless {
             args.push(OsStr::new("--disable-gpu"));
         }
+
+        // Note: args require 'static lifetime, so only string literals work here.
+        // For dynamic values (e.g. --user-data-dir=<path>) see Best Practice #5 below.
     }
 
     fn name(&self) -> &str {
@@ -223,11 +218,13 @@ mod middleware;
 use browser_hive_common::{
     BrowserBinaryParamsMiddleware, TabInitMiddleware,
     DefaultBinaryParamsMiddleware, DefaultTabInitMiddleware,
-    ScopeConfig, WorkerConfig,
+    ContextIsolation, ScopeConfig, SessionMode,
 };
 use middleware::{CustomChromeArgs, TimezoneOverride, WebGLSpoof};
 
 fn create_scope_config() -> ScopeConfig {
+    let headless = true;
+
     // 1. Create binary params middlewares
     let binary_params_middlewares: Vec<Box<dyn BrowserBinaryParamsMiddleware>> = vec![
         // Start with default middleware (anti-bot args, cache, etc.)
@@ -236,11 +233,10 @@ fn create_scope_config() -> ScopeConfig {
         // Add custom Chrome arguments
         Box::new(CustomChromeArgs {
             disable_webrtc: true,
-            custom_user_data_dir: None,
         }),
     ];
 
-    // 2. Create evaluate middlewares
+    // 2. Create tab init middlewares
     let tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>> = vec![
         // Add default UA override (HeadlessChrome → Chrome)
         Box::new(DefaultTabInitMiddleware::new(headless)),
@@ -263,8 +259,9 @@ fn create_scope_config() -> ScopeConfig {
         min_contexts: 5,
         max_contexts: 20,
         session_mode: SessionMode::AlwaysNew, // One-shot scraping
-        headless: true,
+        headless,
         lifecycle: Default::default(),
+        browser_path: None, // Auto-detect Chrome/Chromium; Some("/usr/bin/brave-browser".into()) for Brave
         enable_browser_diagnostics: false,
         binary_params_middlewares,
         tab_init_middlewares,
@@ -298,15 +295,15 @@ let binary_params = vec![
     Box::new(CustomChromeArgs { ... }),             // Adds custom args
 ];
 
-// Evaluate: each middleware modifies the tab sequentially (runs per tab)
-let evaluate = vec![
+// Tab init: each middleware modifies the tab sequentially (runs per tab)
+let tab_init = vec![
     Box::new(DefaultTabInitMiddleware::new(headless)), // UA override (runs first)
     Box::new(TimezoneOverride { ... }),                 // Runs second
     Box::new(WebGLSpoof { ... }),                       // Runs third
 ];
 ```
 
-### 3. Keep Evaluate Middleware Fast (Critical!)
+### 3. Keep Tab Init Middleware Fast (Critical!)
 
 `TabInitMiddleware::apply()` is called for **EVERY new tab** (including recycled contexts). Keep operations lightweight:
 
@@ -364,7 +361,6 @@ mod tests {
     fn test_custom_args() {
         let middleware = CustomChromeArgs {
             disable_webrtc: true,
-            custom_user_data_dir: None,
         };
 
         let mut args = Vec::new();
@@ -389,12 +385,12 @@ You'll see logs like:
 INFO  Applying 2 binary params middleware(s)
 INFO    - Applying middleware: default_binary_params
 INFO    - Applying middleware: custom_chrome_args
-INFO  Browser initialized with 3 evaluate middleware(s)
+INFO  Browser initialized with 3 tab init middleware(s)
 INFO    - Registered middleware: default_user_agent_override
 INFO    - Registered middleware: timezone_override
 INFO    - Registered middleware: webgl_spoof
-DEBUG Successfully applied evaluate middleware 'default_user_agent_override'
-DEBUG Successfully applied evaluate middleware 'timezone_override'
+DEBUG Successfully applied tab init middleware 'default_user_agent_override'
+DEBUG Successfully applied tab init middleware 'timezone_override'
 ```
 
 ## Migration from Old Code

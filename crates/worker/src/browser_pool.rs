@@ -205,7 +205,7 @@ impl BrowserPool {
         if !binary_path.exists() {
             warn!(
                 "Browser binary not found at '{}'. \
-                 headless_chrome will attempt auto-detection.",
+                 Browser launch will likely fail.",
                 binary_path.display()
             );
             return;

@@ -19,7 +19,7 @@ COPY src ./src
 RUN cargo build --release -p browser-hive-worker --bin worker
 
 # Runtime stage with Chromium
-FROM debian:bookworm-slim
+FROM debian:12.13-slim
 
 # Install Chromium and dependencies
 RUN apt-get update && apt-get install -y \

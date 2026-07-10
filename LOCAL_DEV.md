@@ -46,14 +46,28 @@ docker-compose down
 
 ## Proxy Configuration (Optional)
 
-By default, worker uses example proxy configuration (won't work for real sites).
+By default, the worker connects directly without a proxy (`PROXY_TYPE=none`).
 
-To use a real proxy, you'll need to:
-1. Implement the `ProxyProvider` trait for your proxy service
-2. Update the worker binary to use your provider
-3. Configure environment variables in `docker-compose.yml`
+The base worker supports a generic HTTP/SOCKS5 proxy out of the box via environment variables (see `crates/worker/src/providers.rs`):
 
-See the project documentation for details on implementing custom proxy providers.
+```yaml
+# Option 1: No proxy (default)
+- PROXY_TYPE=none
+
+# Option 2: Generic proxy with full URL
+- PROXY_TYPE=generic
+- PROXY_URL=http://user:pass@proxy.example.com:8080
+
+# Option 3: Generic proxy with components
+- PROXY_TYPE=generic
+- PROXY_ADDRESS=proxy.example.com
+- PROXY_PORT=8080
+- PROXY_USERNAME=user
+- PROXY_PASSWORD=pass
+- PROXY_SCHEME=http  # http, https, or socks5
+```
+
+For provider-specific features (geo-targeting via `country_code`, sticky sessions), implement the `ProxyProvider` trait in your production crate and wire it into the worker binary.
 
 ## Testing
 
@@ -110,16 +124,16 @@ response=$(grpcurl -plaintext \
   localhost:50051 \
   scraper.coordinator.ScraperCoordinator/ScrapePage)
 
-# Extract context_id from response
-context_id=$(echo $response | jq -r '.context_id')
-echo "Session ID: $context_id"
+# Extract session_id from response (format: "{worker_id}:{context_id}")
+session_id=$(echo $response | jq -r '.session_id')
+echo "Session ID: $session_id"
 
 # Step 2: Reuse session for subsequent request
 grpcurl -plaintext \
   -d "{
     \"scope_name\": \"local_dev\",
     \"url\": \"https://example.com/dashboard\",
-    \"context_id\": \"$context_id\"
+    \"session_id\": \"$session_id\"
   }" \
   localhost:50051 \
   scraper.coordinator.ScraperCoordinator/ScrapePage
@@ -139,9 +153,14 @@ All responses include error information even when successful:
   "error_message": "",
   "error_code": 0,
   "execution_time_ms": 2341,
-  "context_id": "ctx-abc123"
+  "session_id": "worker-local:ctx-abc123",
+  "worker_id": "worker-local",
+  "context_id": "ctx-abc123",
+  "ray_id": "ray_1a2b3c"
 }
 ```
+
+Use `session_id` to reuse the same browser context in subsequent requests; `worker_id`/`context_id` are its components (for logging/debugging).
 
 **Important**: Check `success` field first, not just HTTP `status_code`.
 
@@ -181,8 +200,8 @@ curl http://localhost:9090/metrics
 ```
 
 **Local mode features:**
-- ✅ Coordinator uses hardcoded endpoint: `worker:50052`
-- ✅ Single scope: `local_dev`
+- ✅ Coordinator uses a fixed endpoint from env: `WORKER_ENDPOINT` (default `worker:50052`) + `WORKER_SCOPE_NAME` (default `local_dev`)
+- ✅ Multiple workers/scopes supported via `WORKER_ENDPOINTS=scope1:host1:port1,scope2:host2:port2,...` (takes precedence over `WORKER_ENDPOINT`)
 - ✅ Chromium runs in Docker container (Chrome and Brave also supported via `WORKER_BROWSER_PATH`)
 - ✅ Easy development and testing environment
 
