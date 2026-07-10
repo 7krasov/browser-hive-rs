@@ -528,7 +528,7 @@ Workers expose Prometheus metrics (see [METRICS.md](METRICS.md)):
 curl http://localhost:9090/metrics | grep browser_hive_worker_requests_failed
 ```
 
-Note: `browser_hive_worker_requests_failed` counts only gRPC-level (infrastructure) failures. Operational errors are returned as gRPC OK with an `error_code` in the response body and are not included in this counter - track them on the client side or via logs.
+Note: `browser_hive_worker_requests_failed` counts responses with 5xxx `error_code` values (server-side failures) and gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, selector not found, skip selector) are client-side conditions and are not counted - track those on the client side if needed.
 
 ## Best Practices
 

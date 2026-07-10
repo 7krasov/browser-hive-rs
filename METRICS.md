@@ -20,7 +20,7 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_active_contexts` | Gauge | Busy contexts (= requests currently being processed) |
 | `browser_hive_worker_available_slots` | Gauge | Free capacity: `total_slots - active_contexts` |
 | `browser_hive_worker_requests_total` | Counter | Total scraping requests received |
-| `browser_hive_worker_requests_failed` | Counter | Requests that failed with a gRPC-level (infrastructure) error. Operational errors (selector not found, browser timeout, etc.) are returned as gRPC OK with an `error_code` in the body and are NOT counted here - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
+| `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, selector not found, skip selector) are client-side conditions and are NOT counted - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
 
 **Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). Counters are incremented in the request path.
 

@@ -188,6 +188,19 @@ impl WorkerService {
         self.browser_pool.clone()
     }
 
+    /// Count a response with a 5xxx operational error code as a failed request.
+    /// 4xxx codes are client-side conditions (invalid URL, selector not found)
+    /// and are not counted. Infrastructure gRPC errors are counted separately.
+    fn record_failed_if_5xxx(&self, response: &ScrapePageResponse) {
+        if (5000..6000).contains(&response.error_code) {
+            self.failed_requests.fetch_add(1, Ordering::SeqCst);
+            self.metrics
+                .requests_failed
+                .with_label_values(&[&self.config.scope.name])
+                .inc();
+        }
+    }
+
     /// Recreate the browser pool when the browser process has died.
     ///
     /// This can happen when:
@@ -1629,7 +1642,10 @@ impl WorkerServiceTrait for WorkerService {
                 .await
             {
                 Ok(ctx) => ctx,
-                Err(response) => return Ok(response),
+                Err(response) => {
+                    self.record_failed_if_5xxx(response.get_ref());
+                    return Ok(response);
+                }
             }
         };
 
@@ -1652,6 +1668,7 @@ impl WorkerServiceTrait for WorkerService {
         match &result {
             Ok(response) => {
                 // Pool gauges (contexts/slots) are refreshed on each Prometheus scrape
+                self.record_failed_if_5xxx(response);
                 let hash = content_hash(&response.content);
 
                 info!(

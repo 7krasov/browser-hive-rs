@@ -218,7 +218,7 @@ Workers expose Prometheus metrics on port 9090 at `/metrics` (implemented in `wo
 - `browser_hive_worker_active_contexts{scope}` - Busy contexts processing requests, gauge
 - `browser_hive_worker_available_slots{scope}` - Free slots (total_slots - active), gauge
 - `browser_hive_worker_requests_total{scope}` - Total requests processed, counter
-- `browser_hive_worker_requests_failed{scope}` - Requests failed with gRPC-level errors (operational errors returned with `error_code` in body are not counted), counter
+- `browser_hive_worker_requests_failed{scope}` - Failed requests: responses with 5xxx `error_code` + gRPC-level errors (4xxx client-side codes are not counted), counter
 
 Pool gauges are refreshed from live `BrowserPool` state on every Prometheus scrape (see `Metrics::refresh_pool_gauges`); counters are incremented in the request path. The coordinator can also query worker stats via gRPC `GetStats` endpoint. See METRICS.md for full semantics and KEDA autoscaling guidance.
 
