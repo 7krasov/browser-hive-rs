@@ -247,7 +247,7 @@ INFO  Attempt 2: Forwarding to worker worker-2 (timeout: 55s, ...)
 
 ### Metrics
 
-Workers expose metrics on port 9090:
+Workers expose Prometheus metrics on port 9090 (see [METRICS.md](METRICS.md)). During shutdown:
 - `browser_hive_worker_active_contexts{scope}` - Should decrease to 0 before shutdown
 - `browser_hive_worker_requests_total{scope}` - Total processed
 

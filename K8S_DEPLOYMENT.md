@@ -301,12 +301,7 @@ This ensures graceful shutdown completes before spot termination.
 
 ## Monitoring
 
-Workers expose Prometheus metrics on port 9090:
-- `browser_hive_worker_total_contexts{scope}` - Total contexts
-- `browser_hive_worker_active_contexts{scope}` - Busy contexts
-- `browser_hive_worker_available_slots{scope}` - Free slots
-- `browser_hive_worker_requests_total{scope}` - Total requests
-- `browser_hive_worker_requests_failed{scope}` - Failed requests
+Workers expose Prometheus metrics on port 9090 at `/metrics`. See [METRICS.md](METRICS.md) for the full metric list and a KEDA-based autoscaling guide (scaling on busy/free browser context slots instead of CPU/RAM).
 
 ## Testing Graceful Shutdown
 

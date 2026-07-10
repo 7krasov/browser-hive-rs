@@ -522,13 +522,13 @@ All error responses include `execution_time_ms`. High values may indicate:
 
 ### Error Rate Monitoring
 
-Workers expose Prometheus metrics:
+Workers expose Prometheus metrics (see [METRICS.md](METRICS.md)):
 
 ```bash
 curl http://localhost:9090/metrics | grep browser_hive_worker_requests_failed
 ```
 
-Monitor `browser_hive_worker_requests_failed` by `error_code` label.
+Note: `browser_hive_worker_requests_failed` counts only gRPC-level (infrastructure) failures. Operational errors are returned as gRPC OK with an `error_code` in the response body and are not included in this counter - track them on the client side or via logs.
 
 ## Best Practices
 

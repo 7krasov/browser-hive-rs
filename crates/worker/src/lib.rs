@@ -72,11 +72,12 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
         WorkerService::new(config.clone(), metrics.clone(), cancellation_token.clone()).await?;
     let active_requests = worker_service.active_requests();
     let is_ready = worker_service.is_ready_flag();
+    let browser_pool = worker_service.browser_pool_handle();
 
     // Start metrics HTTP server in background
     let metrics_port = 9090;
     let metrics_handle = tokio::spawn(async move {
-        if let Err(e) = metrics.start_server(metrics_port).await {
+        if let Err(e) = metrics.start_server(metrics_port, browser_pool).await {
             tracing::error!("Metrics server error: {}", e);
         }
     });

@@ -269,12 +269,7 @@ See [`src/lib.rs`](src/lib.rs) for the public API facade and re-exports.
 
 ### Metrics
 
-Workers expose Prometheus metrics on port `9090`:
-- `browser_hive_worker_total_contexts{scope}`
-- `browser_hive_worker_active_contexts{scope}`
-- `browser_hive_worker_available_slots{scope}`
-- `browser_hive_worker_requests_total{scope}`
-- `browser_hive_worker_requests_failed{scope}`
+Workers expose Prometheus metrics on port `9090` at `/metrics`: pool capacity and busy/free slots (gauges refreshed on every scrape) plus request counters. See [METRICS.md](METRICS.md) for the full metric list, semantics, and a KEDA autoscaling guide.
 
 ## Development
 

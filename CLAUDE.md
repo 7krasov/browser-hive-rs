@@ -211,15 +211,16 @@ The browser configuration is entirely controlled through middleware, allowing fu
 
 ### Metrics and Monitoring
 
-Workers expose Prometheus metrics on port 9090 at `/metrics`:
+Workers expose Prometheus metrics on port 9090 at `/metrics` (implemented in `worker/src/metrics.rs`):
 
-- `browser_hive_worker_total_contexts{scope}` - Total browser contexts in pool
-- `browser_hive_worker_active_contexts{scope}` - Busy contexts processing requests
-- `browser_hive_worker_available_slots{scope}` - Available tab slots
-- `browser_hive_worker_requests_total{scope}` - Total requests processed
-- `browser_hive_worker_requests_failed{scope}` - Failed requests
+- `browser_hive_worker_total_slots{scope}` - Configured capacity (max_contexts), gauge
+- `browser_hive_worker_total_contexts{scope}` - Contexts currently in pool, gauge
+- `browser_hive_worker_active_contexts{scope}` - Busy contexts processing requests, gauge
+- `browser_hive_worker_available_slots{scope}` - Free slots (total_slots - active), gauge
+- `browser_hive_worker_requests_total{scope}` - Total requests processed, counter
+- `browser_hive_worker_requests_failed{scope}` - Requests failed with gRPC-level errors (operational errors returned with `error_code` in body are not counted), counter
 
-Metrics are implemented in `worker/src/metrics.rs` and updated after each request. The coordinator can also query worker stats via gRPC `GetStats` endpoint.
+Pool gauges are refreshed from live `BrowserPool` state on every Prometheus scrape (see `Metrics::refresh_pool_gauges`); counters are incremented in the request path. The coordinator can also query worker stats via gRPC `GetStats` endpoint. See METRICS.md for full semantics and KEDA autoscaling guidance.
 
 ### Deployment Modes
 

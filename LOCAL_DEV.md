@@ -182,6 +182,8 @@ See [ERROR_HANDLING.md](ERROR_HANDLING.md) for complete error handling guide.
 curl http://localhost:9090/metrics
 ```
 
+See [METRICS.md](METRICS.md) for the metric list and semantics.
+
 ## Local Mode Architecture
 
 ```

@@ -182,6 +182,12 @@ impl WorkerService {
         self.is_ready.clone()
     }
 
+    /// Shared handle to the browser pool (used by the metrics server to
+    /// refresh pool gauges on each Prometheus scrape)
+    pub fn browser_pool_handle(&self) -> Arc<RwLock<BrowserPool>> {
+        self.browser_pool.clone()
+    }
+
     /// Recreate the browser pool when the browser process has died.
     ///
     /// This can happen when:
@@ -1550,6 +1556,10 @@ impl WorkerServiceTrait for WorkerService {
         info!(ray_id = %ray_id, "Received scraping request for URL: {}", req.url);
 
         self.total_requests.fetch_add(1, Ordering::SeqCst);
+        self.metrics
+            .requests_total
+            .with_label_values(&[&self.config.scope.name])
+            .inc();
 
         // Validate URL by extracting domain
         // NOTE: Invalid URL is not a gRPC error - we return response with error code
@@ -1641,7 +1651,7 @@ impl WorkerServiceTrait for WorkerService {
         // Update metrics
         match &result {
             Ok(response) => {
-                // Success - metrics will be updated in get_stats
+                // Pool gauges (contexts/slots) are refreshed on each Prometheus scrape
                 let hash = content_hash(&response.content);
 
                 info!(
