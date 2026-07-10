@@ -55,7 +55,19 @@ spec:
     name: browser-hive-worker   # worker Deployment
   minReplicaCount: 1
   maxReplicaCount: 10
-  cooldownPeriod: 300           # conservative scale-down (see caveats below)
+  # cooldownPeriod only applies to scale-to-zero (minReplicaCount: 0) - it is
+  # inert while min replicas >= 1. Anti-flapping for N->M scale-down is the
+  # HPA stabilization window below (default 300s).
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        # scaleUp is intentionally left at HPA defaults (immediate, 0s window):
+        # a delayed scale-up means all contexts are busy and clients get errors
+        # while new pods start. Only scale-down needs damping.
+        scaleDown:
+          # Scale down only to the max replica count needed during the last
+          # window. Use 600+ when workers hold sessions (see caveats below).
+          stabilizationWindowSeconds: 600
   triggers:
   - type: prometheus
     metadata:
@@ -81,6 +93,6 @@ sum(browser_hive_worker_total_slots{scope="my_scope"})
 
 ### Scale-down caveats
 
-- **Sessions are lost on pod termination.** Session IDs have the form `{worker_id}:{context_id}` - when KEDA removes a pod, every session living on it dies. Clients get `ERROR_CODE_SESSION_NOT_FOUND` (4002) on the next request and must start a new session. If clients rely on long-lived sessions (login flows), scale down conservatively: increase `cooldownPeriod` and/or set an HPA `scaleDown` stabilization window via `spec.advanced.horizontalPodAutoscalerConfig.behavior`.
+- **Sessions are lost on pod termination.** Session IDs have the form `{worker_id}:{context_id}` - when KEDA removes a pod, every session living on it dies. Clients get `ERROR_CODE_SESSION_NOT_FOUND` (4002) on the next request and must start a new session. If clients rely on long-lived sessions (login flows), scale down conservatively: increase `scaleDown.stabilizationWindowSeconds` (via `spec.advanced.horizontalPodAutoscalerConfig.behavior`, HPA default 300s). KEDA's `cooldownPeriod` does not help here - it only applies to scale-to-zero.
 - **In-flight requests are safe.** Graceful shutdown (SIGTERM → wait for active requests, coordinator retries on healthy workers) handles pod removal cleanly - see [GRACEFUL_SHUTDOWN.md](GRACEFUL_SHUTDOWN.md). Ensure `terminationGracePeriodSeconds` covers your longest request timeout.
 - **Prometheus must scrape the workers.** The metrics port (9090) must be reachable by Prometheus (ServiceMonitor / scrape annotations) - see [K8S_DEPLOYMENT.md](K8S_DEPLOYMENT.md) for the Service definition.
