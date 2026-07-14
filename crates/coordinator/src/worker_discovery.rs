@@ -30,9 +30,18 @@ impl WorkerDiscovery {
         let pods: Api<Pod> = Api::default_namespaced(self.kube_client.clone());
         let workers = self.workers.clone();
 
+        // Whether to log "failed to get stats" warnings for terminating pods.
+        // Terminating pods (deletionTimestamp set) routinely fail GetStats during
+        // graceful shutdown / rollout churn, producing expected, non-actionable
+        // noise. Read once at startup (env vars don't change at runtime).
+        let log_terminating_pod_warnings =
+            std::env::var("COORDINATOR_ENABLE_TERMINATING_POD_WARNINGS")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
         tokio::spawn(async move {
             loop {
-                match Self::discover_workers(&pods).await {
+                match Self::discover_workers(&pods, log_terminating_pod_warnings).await {
                     Ok(discovered_workers) => {
                         let total_workers: usize =
                             discovered_workers.values().map(|v| v.len()).sum();
@@ -65,7 +74,10 @@ impl WorkerDiscovery {
         });
     }
 
-    async fn discover_workers(pods: &Api<Pod>) -> Result<HashMap<String, Vec<WorkerEndpoint>>> {
+    async fn discover_workers(
+        pods: &Api<Pod>,
+        log_terminating_pod_warnings: bool,
+    ) -> Result<HashMap<String, Vec<WorkerEndpoint>>> {
         // List all pods with label app=browser-hive-worker
         let list_params = ListParams::default().labels("app=browser-hive-worker");
         let pod_list = pods.list(&list_params).await?;
@@ -77,6 +89,16 @@ impl WorkerDiscovery {
             if !Self::is_pod_running(&pod.status) {
                 continue;
             }
+
+            // A pod with deletionTimestamp set is terminating (SIGTERM in flight),
+            // but K8s can still report phase=Running until the process exits. Such
+            // pods frequently fail GetStats because their gRPC server is already
+            // gone. We keep discovering them (they may still serve until removed on
+            // the next round), but downgrade the stats-error log to debug so routine
+            // shutdown churn does not spam warnings. Set
+            // COORDINATOR_ENABLE_TERMINATING_POD_WARNINGS=true to surface these
+            // warnings for debugging.
+            let is_terminating = pod.metadata.deletion_timestamp.is_some();
 
             // Extract pod metadata
             let pod_name = pod
@@ -111,6 +133,7 @@ impl WorkerDiscovery {
                         port,
                         scope_name: scope_name.clone(),
                         stats,
+                        is_terminating,
                     };
 
                     workers_by_scope
@@ -121,13 +144,25 @@ impl WorkerDiscovery {
                     tracing::debug!("Discovered worker: {} ({}:{})", pod_name, pod_ip, port);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get stats from worker {} ({}:{}): {}",
-                        pod_name,
-                        pod_ip,
-                        port,
-                        e
-                    );
+                    // Suppress the warning for terminating pods (expected churn),
+                    // unless explicitly enabled for debugging via the env var.
+                    if is_terminating && !log_terminating_pod_warnings {
+                        tracing::debug!(
+                            "Failed to get stats from terminating worker {} ({}:{}): {}",
+                            pod_name,
+                            pod_ip,
+                            port,
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Failed to get stats from worker {} ({}:{}): {}",
+                            pod_name,
+                            pod_ip,
+                            port,
+                            e
+                        );
+                    }
                     // Continue to next pod instead of failing entire discovery
                     continue;
                 }

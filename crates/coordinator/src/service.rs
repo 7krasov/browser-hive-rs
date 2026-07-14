@@ -213,6 +213,17 @@ impl CoordinatorService {
         let healthy_workers = self.healthy_workers.clone();
         let cancellation_token = self.cancellation_token.clone();
 
+        // Whether to log connect/health-check warnings for terminating pods.
+        // Terminating pods (deletionTimestamp set) routinely fail to answer during
+        // graceful shutdown / rollout churn; those failures are expected and not
+        // actionable. The `is_terminating` flag is carried on each WorkerEndpoint by
+        // the discovery loop, so this adds no extra K8s API calls. Shares the env var
+        // with worker discovery. Read once at startup (env vars don't change at runtime).
+        let log_terminating_pod_warnings =
+            std::env::var("COORDINATOR_ENABLE_TERMINATING_POD_WARNINGS")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
         tokio::spawn(async move {
             info!("Starting health monitor task");
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -250,12 +261,24 @@ impl CoordinatorService {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("Health check failed for worker {}: {}", worker_id, e);
+                                                // Suppress expected churn noise for terminating pods
+                                                // unless explicitly enabled for debugging.
+                                                if worker.is_terminating && !log_terminating_pod_warnings {
+                                                    debug!("Health check failed for terminating worker {}: {}", worker_id, e);
+                                                } else {
+                                                    warn!("Health check failed for worker {}: {}", worker_id, e);
+                                                }
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Failed to connect to worker {} at {}: {}", worker_id, endpoint, e);
+                                        // Suppress expected churn noise for terminating pods
+                                        // unless explicitly enabled for debugging.
+                                        if worker.is_terminating && !log_terminating_pod_warnings {
+                                            debug!("Failed to connect to terminating worker {} at {}: {}", worker_id, endpoint, e);
+                                        } else {
+                                            warn!("Failed to connect to worker {} at {}: {}", worker_id, endpoint, e);
+                                        }
                                     }
                                 }
                             }
@@ -781,6 +804,7 @@ mod tests {
                 total_contexts_recycled: 10,
                 success_rate: 0.95,
             },
+            is_terminating: false,
         }
     }
 

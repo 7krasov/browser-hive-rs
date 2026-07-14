@@ -53,6 +53,8 @@ impl LocalWorkerDiscovery {
                         total_contexts_recycled: 0,
                         success_rate: 1.0,
                     },
+                    // Local mode has no pod lifecycle / termination.
+                    is_terminating: false,
                 };
 
                 workers_map
@@ -107,6 +109,8 @@ impl LocalWorkerDiscovery {
                     total_contexts_recycled: 0,
                     success_rate: 1.0,
                 },
+                // Local mode has no pod lifecycle / termination.
+                is_terminating: false,
             };
 
             workers_map.insert(worker_scope, vec![endpoint]);

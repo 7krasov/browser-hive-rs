@@ -228,6 +228,9 @@ The coordinator supports two deployment modes (selected via `COORDINATOR_MODE`):
 - **Local mode** (`COORDINATOR_MODE=local`): Worker endpoints come from env vars. Either a single worker via `WORKER_ENDPOINT` + `WORKER_SCOPE_NAME`, or multiple workers/scopes via `WORKER_ENDPOINTS=scope1:host1:port1,scope2:host2:port2,...` (takes precedence)
 - **Kubernetes mode** (default - any value other than `local`): Built-in discovery via the K8s API - lists pods labeled `app=browser-hive-worker` in the coordinator's namespace every 10 seconds. The scope is read from the pod's `scope` label; the worker gRPC port is assumed to be 50052. Requires RBAC access to pods (see K8S_DEPLOYMENT.md)
 
+**Optional coordinator variables**:
+- `COORDINATOR_ENABLE_TERMINATING_POD_WARNINGS` - Controls logging of connect/stats/health-check errors for **terminating** pods (default: `false`). Terminating pods (`metadata.deletionTimestamp` set) keep `phase=Running` until the process exits, so their gRPC server is often already gone during shutdown churn, producing expected warnings (`Failed to get stats from worker`, `Failed to connect to worker`, `Health check failed for worker`). When `false`/unset, these are downgraded to DEBUG for terminating pods only; when `true`, they are emitted at WARN (for debugging). The terminating state is detected from the `deletionTimestamp` already present in the K8s pod list (no extra API calls) and carried on `WorkerEndpoint::is_terminating` (`common/src/types.rs`); it is a log-level gate only and never affects routing or health decisions. Warnings for non-terminating pods are always logged at WARN. Read once at startup in `worker_discovery.rs::start_discovery` and `service.rs::start_health_monitor`.
+
 ### Configuration
 
 **Worker configuration** is loaded from environment variables (via `load_config_from_env` function in `worker/src/main.rs`). Main variables (all have defaults):

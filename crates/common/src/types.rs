@@ -15,6 +15,12 @@ pub struct WorkerEndpoint {
     pub port: u16,
     pub scope_name: String,
     pub stats: WorkerStats,
+    /// True when the pod is terminating (K8s `deletionTimestamp` is set) as of the
+    /// last discovery round. Used only to downgrade routine connect/stats-error logs
+    /// during graceful shutdown; never affects routing or health decisions. May be
+    /// up to one discovery interval stale, which is harmless for a log-level gate.
+    #[serde(default)]
+    pub is_terminating: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

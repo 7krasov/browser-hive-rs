@@ -184,6 +184,11 @@ spec:
           value: "50051"
         - name: RUST_LOG
           value: "info"
+        # Optional: set to "true" to surface (as WARN) the connect/stats/health-check
+        # errors for terminating pods. Default (unset/"false") downgrades them to DEBUG
+        # to avoid routine shutdown-churn noise. See "Terminating pod log noise" below.
+        # - name: COORDINATOR_ENABLE_TERMINATING_POD_WARNINGS
+        #   value: "false"
 
         resources:
           requests:
@@ -206,6 +211,30 @@ spec:
     targetPort: 50051
     name: grpc
 ```
+
+### Terminating pod log noise
+
+During normal pod churn (scaling, rolling updates, spot reclaim), the coordinator
+periodically logs warnings about workers it cannot reach:
+
+- `Failed to get stats from worker ...` (worker discovery loop, every 10s)
+- `Failed to connect to worker ...` / `Health check failed for worker ...` (health monitor, every 1s)
+
+These are expected: a pod that has received SIGTERM keeps `phase=Running` (with
+`metadata.deletionTimestamp` set) until its process exits, so its gRPC server may
+already be gone while the coordinator still has it in the discovered set.
+
+To keep logs clean, the coordinator detects terminating pods via the
+`deletionTimestamp` already present in the K8s pod list (**no extra API calls**) and
+**downgrades these warnings to DEBUG** for such pods. This is purely a log-level
+change — it never affects routing or health decisions.
+
+**`COORDINATOR_ENABLE_TERMINATING_POD_WARNINGS`** (optional, default `false`):
+- `false` / unset: suppress the above warnings for terminating pods (log at DEBUG).
+- `true`: emit them at WARN as before (useful for debugging shutdown/discovery issues).
+
+Note: warnings for **non-terminating** pods are always logged at WARN, since those may
+indicate a real problem.
 
 ### Service Account (for Coordinator K8s API Access)
 
