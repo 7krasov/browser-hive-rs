@@ -219,6 +219,7 @@ Workers expose Prometheus metrics on port 9090 at `/metrics` (implemented in `wo
 - `browser_hive_worker_available_slots{scope}` - Free slots (total_slots - active), gauge
 - `browser_hive_worker_requests_total{scope}` - Total requests processed, counter
 - `browser_hive_worker_requests_failed{scope}` - Failed requests: responses with 5xxx `error_code` + gRPC-level errors (4xxx client-side codes are not counted), counter
+- `browser_hive_worker_request_duration_seconds{scope}` - End-to-end `scrape_page` duration, histogram (observed via `RequestTimer` RAII guard on every return path). Enables Little's Law concurrency sizing (`rate(_sum)` = avg in-flight requests, immune to scrape sampling) and latency quantiles
 
 Pool gauges are refreshed from live `BrowserPool` state on every Prometheus scrape (see `Metrics::refresh_pool_gauges`); counters are incremented in the request path. The coordinator can also query worker stats via gRPC `GetStats` endpoint. See METRICS.md for full semantics and KEDA autoscaling guidance.
 

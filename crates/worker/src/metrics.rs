@@ -1,6 +1,8 @@
 use crate::browser_pool::BrowserPool;
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
-use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -13,6 +15,7 @@ pub struct Metrics {
     pub total_slots: IntGaugeVec,
     pub requests_total: IntCounterVec,
     pub requests_failed: IntCounterVec,
+    pub request_duration_seconds: HistogramVec,
     scope_name: String,
 }
 
@@ -81,6 +84,23 @@ impl Metrics {
         )?;
         registry.register(Box::new(requests_failed.clone()))?;
 
+        // Request duration histogram - end-to-end scrape_page latency in seconds.
+        // Enables robust concurrency sizing via Little's Law
+        // (sum(rate(_sum)) = average in-flight requests, immune to scrape sampling)
+        // and latency SLOs (p50/p95/p99 via histogram_quantile).
+        // Buckets are tuned for browser scraping (sub-second to ~1 minute).
+        let request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "browser_hive_worker_request_duration_seconds",
+                "End-to-end scrape request duration in seconds",
+            )
+            .buckets(vec![
+                0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 60.0,
+            ]),
+            &["scope"],
+        )?;
+        registry.register(Box::new(request_duration_seconds.clone()))?;
+
         // Initialize all metrics with scope label so they are exposed immediately
         total_contexts.with_label_values(&[scope_name]).set(0);
         active_contexts.with_label_values(&[scope_name]).set(0);
@@ -88,6 +108,7 @@ impl Metrics {
         total_slots.with_label_values(&[scope_name]).set(0);
         requests_total.with_label_values(&[scope_name]);
         requests_failed.with_label_values(&[scope_name]);
+        request_duration_seconds.with_label_values(&[scope_name]);
 
         Ok(Self {
             registry,
@@ -97,6 +118,7 @@ impl Metrics {
             total_slots,
             requests_total,
             requests_failed,
+            request_duration_seconds,
             scope_name: scope_name.to_string(),
         })
     }

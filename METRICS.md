@@ -21,6 +21,7 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_available_slots` | Gauge | Free capacity: `total_slots - active_contexts` |
 | `browser_hive_worker_requests_total` | Counter | Total scraping requests received |
 | `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, selector not found, skip selector) are client-side conditions and are NOT counted - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
+| `browser_hive_worker_request_duration_seconds` | Histogram | End-to-end `scrape_page` duration in seconds (observed on every return path, including early returns). Buckets: 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 60. Exposes `_bucket`, `_sum`, `_count` |
 
 **Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). Counters are incremented in the request path.
 
@@ -31,6 +32,41 @@ cluster capacity = sum(total_slots)   = pods × WORKER_MAX_CONTEXTS
 cluster load     = sum(active_contexts)
 utilization      = sum(active_contexts) / sum(total_slots)
 ```
+
+## Sizing `maxReplicaCount` per scope
+
+To pick the maximum replicas a scope needs, look at the **peak concurrent load over
+time**, not a single aggregate number. The concurrency unit is a context, so:
+
+```
+maxReplicas(scope) = ceil( peak_busy_contexts / WORKER_MAX_CONTEXTS x (1 + headroom) )
+```
+
+Two ways to measure `peak_busy_contexts`, with different robustness:
+
+1. **Gauge (simple, sampling-sensitive)** - the instantaneous busy-context count.
+   `active_contexts` is only computed at scrape time, so requests shorter than the
+   scrape interval can be missed and the peak under-counted:
+   ```promql
+   max_over_time( sum by (scope) (browser_hive_worker_active_contexts) [1d:] )
+   ```
+   Keep the worker scrape interval small (~10-15s) if you rely on this.
+
+2. **Little's Law (robust, from the histogram)** - average in-flight requests derived
+   from throughput x latency, immune to scrape sampling because it integrates the `_sum`
+   counter:
+   ```promql
+   sum by (scope) (rate(browser_hive_worker_request_duration_seconds_sum[5m]))
+   ```
+   This equals the average number of concurrently-running requests over the window. Use
+   its `max_over_time(...[1d:])` for the busy peak. Pair with p95 latency for SLOs:
+   ```promql
+   histogram_quantile(0.95,
+     sum by (scope, le) (rate(browser_hive_worker_request_duration_seconds_bucket[5m])))
+   ```
+
+The gauge and Little's Law numbers should agree; if the gauge peak is consistently lower,
+your scrape interval is too coarse to catch the true peak.
 
 ## Coordinator Stats (gRPC)
 

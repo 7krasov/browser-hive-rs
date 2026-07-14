@@ -104,6 +104,29 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
+/// RAII guard that observes the end-to-end request duration into a histogram on
+/// drop, so every return path of `scrape_page` (including early returns) is
+/// covered uniformly.
+struct RequestTimer {
+    start: Instant,
+    histogram: prometheus::Histogram,
+}
+
+impl RequestTimer {
+    fn new(histogram: prometheus::Histogram) -> Self {
+        Self {
+            start: Instant::now(),
+            histogram,
+        }
+    }
+}
+
+impl Drop for RequestTimer {
+    fn drop(&mut self) {
+        self.histogram.observe(self.start.elapsed().as_secs_f64());
+    }
+}
+
 /// RAII guard that automatically sets context is_busy flag
 struct ContextBusyGuard {
     is_busy: Arc<std::sync::atomic::AtomicBool>,
@@ -1546,6 +1569,13 @@ impl WorkerServiceTrait for WorkerService {
 
         // Track active request (automatically decrements on drop)
         let _active_guard = ActiveRequestGuard::new(self.active_requests.clone());
+
+        // Observe end-to-end request duration on every return path (drop).
+        let _duration_timer = RequestTimer::new(
+            self.metrics
+                .request_duration_seconds
+                .with_label_values(&[&self.config.scope.name]),
+        );
 
         let start_time = Instant::now();
 
