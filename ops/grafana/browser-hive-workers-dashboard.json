@@ -1,0 +1,194 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-24h", "to": "now" },
+  "timezone": "",
+  "title": "Browser Hive - Workers per Scope",
+  "uid": "browser-hive-workers",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "scope",
+        "label": "Scope",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(browser_hive_worker_total_slots, scope)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Workers per scope",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Running workers per scope",
+      "description": "Each worker instance exports exactly one browser_hive_worker_total_slots series, so count = live scraped workers (in K8s: pods). A gap means no worker of that scope was scraped (0 workers or scrape failure), not zero on the axis.",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 1 },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 15, "showPoints": "never", "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "mean", "lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"})",
+          "legendFormat": "{{scope}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Peak workers (selected range)",
+      "description": "Maximum simultaneous workers per scope over the dashboard time range.",
+      "gridPos": { "h": 9, "w": 4, "x": 16, "y": 1 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "max_over_time( count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"})[$__range:] )",
+          "legendFormat": "{{scope}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Avg workers (selected range)",
+      "description": "Average simultaneous workers per scope over the dashboard time range. avg_workers x range_hours = worker-hours (cost estimate). Averaged only over moments when at least one worker existed.",
+      "gridPos": { "h": 9, "w": 4, "x": 20, "y": 1 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "avg_over_time( count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"})[$__range:] )",
+          "legendFormat": "{{scope}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Headless / Headful (hl/hf extracted from scope name)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Running workers by browser mode",
+      "description": "Workers aggregated by hl/hf extracted from the scope name (pattern .*_(hl|hf)_.*). Headful workers consume more RAM/CPU - this drives node pool sizing. Scopes not matching the pattern land in an unnamed series.",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 11 },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 15, "showPoints": "never", "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "mean", "lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (browser_mode) (label_replace(count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"}), \"browser_mode\", \"$1\", \"scope\", \".*_(hl|hf)_.*\"))",
+          "legendFormat": "{{browser_mode}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Peak workers by mode (range)",
+      "gridPos": { "h": 9, "w": 4, "x": 16, "y": 11 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "max_over_time( sum by (browser_mode) (label_replace(count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"}), \"browser_mode\", \"$1\", \"scope\", \".*_(hl|hf)_.*\"))[$__range:] )",
+          "legendFormat": "{{browser_mode}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Avg workers by mode (range)",
+      "gridPos": { "h": 9, "w": 4, "x": 20, "y": 11 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "avg_over_time( sum by (browser_mode) (label_replace(count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"}), \"browser_mode\", \"$1\", \"scope\", \".*_(hl|hf)_.*\"))[$__range:] )",
+          "legendFormat": "{{browser_mode}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Total capacity (slots) by browser mode",
+      "description": "sum(total_slots) by mode = workers x WORKER_MAX_CONTEXTS. Complements worker counts: hl and hf run different contexts-per-worker, so slots show the actual scraping capacity each mode contributes.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "mean", "lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (browser_mode) (label_replace(sum by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"}), \"browser_mode\", \"$1\", \"scope\", \".*_(hl|hf)_.*\"))",
+          "legendFormat": "{{browser_mode}}"
+        }
+      ]
+    }
+  ]
+}

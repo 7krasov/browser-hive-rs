@@ -103,8 +103,8 @@
     },
     {
       "type": "stat",
-      "title": "Running pods per scope",
-      "description": "One series per scraped worker pod, so the count = current replicas.",
+      "title": "Running workers per scope",
+      "description": "One series per scraped worker instance (in K8s: pod), so the count = current replicas.",
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 4 },
       "datasource": "${datasource}",
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "purple", "value": null } ] } }, "overrides": [] },
