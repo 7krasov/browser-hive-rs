@@ -164,6 +164,10 @@ See `MIDDLEWARE_EXAMPLES.md` for detailed usage examples and production patterns
 
 The browser pool starts a background task (via `BrowserPool::start_lifecycle_monitor` in `worker/src/browser_pool.rs`) that periodically checks contexts against lifecycle thresholds and recycles them when needed. Contexts are only recycled when no active pages are running.
 
+**AlwaysNew mode is exempt from recycling.** In `SessionMode::AlwaysNew` a context belongs to exactly one request and is removed from the pool when that request's scope ends, so any idle context found in the pool is a leak — the monitor **removes** it instead of recycling it. Recycling would replace the leaked context with a fresh one that keeps occupying the slot, turning a one-off leak into a permanently full pool (`No available slots - max contexts limit (N) reached` with no request in flight).
+
+**AlwaysNew context ownership**: contexts are pre-marked `is_busy = true` inside `BrowserPool::create_always_new_context` while the pool write lock is held, and `ContextBusyGuard::adopt` takes over clearing the flag. This is what makes leak reclamation safe — a context that was handed out but has not started processing yet is already busy and can never be purged by a concurrent request. Removal is driven by `AlwaysNewContextGuard` (RAII, in `worker/src/service.rs`) rather than by an explicit call at the end of the handler, so it still runs when the gRPC handler future is dropped mid-request (client disconnect, coordinator deadline) or panics. The early destroy inside `scrape_page_internal` remains as a latency optimization; `destroy_context` is idempotent.
+
 ### Browser Pool Recovery
 
 The system automatically recovers from two types of failures:

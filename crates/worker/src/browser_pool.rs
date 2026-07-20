@@ -29,6 +29,22 @@ pub struct BrowserPool {
     total_contexts_recycled: Arc<AtomicU64>,
 }
 
+/// Remove leaked contexts from an `AlwaysNew` pool, returning how many were removed.
+///
+/// In `SessionMode::AlwaysNew` a context is owned by exactly one request: it is created
+/// pre-marked busy and removed from the pool when that request's scope ends. A context that
+/// is neither busy nor removed can therefore only be a leak — for example when the request
+/// future was dropped mid-flight. Such a context is never reused (AlwaysNew always creates
+/// fresh ones), so without reclamation it consumes a slot until the worker restarts.
+///
+/// Pre-marking at creation is what makes this safe: a context that was handed out but has
+/// not started processing yet is already busy, so a concurrent request can never collect it.
+fn reclaim_leaked_always_new_contexts(contexts: &mut Vec<Arc<BrowserContext>>) -> usize {
+    let before = contexts.len();
+    contexts.retain(|c| c.metadata.is_busy.load(Ordering::SeqCst));
+    before - contexts.len()
+}
+
 pub struct BrowserContext {
     pub metadata: BrowserContextMetadata,
     pub tab: Arc<Mutex<Option<Arc<Tab>>>>, // Reusable tab for session persistence
@@ -393,12 +409,31 @@ impl BrowserPool {
         let proxy_provider = self.proxy_provider.clone();
         let tab_init_middlewares = self.tab_init_middlewares.clone();
         let context_isolation = self.scope_config.context_isolation;
+        let session_mode = self.scope_config.session_mode;
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
                 let mut contexts_guard = contexts.write().await;
+
+                // AlwaysNew: contexts are owned by a single request and removed when it ends,
+                // so an idle context here is a leak. Drop it instead of recycling it —
+                // recycling would replace it with a fresh context that keeps holding the slot,
+                // which is what previously turned a one-off leak into a permanently full pool.
+                if session_mode == SessionMode::AlwaysNew {
+                    let removed = reclaim_leaked_always_new_contexts(&mut contexts_guard);
+                    if removed > 0 {
+                        warn!(
+                            ray_id = "lifecycle-monitor",
+                            "Removed {} leaked idle context(s) in AlwaysNew mode ({} remaining)",
+                            removed,
+                            contexts_guard.len()
+                        );
+                    }
+                    continue;
+                }
+
                 let mut to_recycle = Vec::new();
 
                 for (idx, context) in contexts_guard.iter().enumerate() {
@@ -712,6 +747,17 @@ impl BrowserPool {
     ) -> Result<Option<Arc<BrowserContext>>> {
         let mut contexts = self.contexts.write().await;
 
+        // Reclaim leaked contexts before measuring capacity, so a leak cannot consume a slot
+        // until the lifecycle monitor's next tick.
+        let purged = reclaim_leaked_always_new_contexts(&mut contexts);
+        if purged > 0 {
+            warn!(
+                ray_id = %ray_id,
+                "Purged {} leaked idle context(s) in AlwaysNew mode before creating a new one",
+                purged
+            );
+        }
+
         // Check if we're under the limit
         if contexts.len() < self.scope_config.max_contexts as usize {
             info!(
@@ -723,6 +769,12 @@ impl BrowserPool {
             );
 
             let context = self.create_new_context(ray_id, proxy_params).await?;
+
+            // Pre-mark as busy while still holding the write lock, so the context is never
+            // visible to the purge above as an idle (and therefore collectable) context.
+            // ContextBusyGuard adopts this flag instead of setting it.
+            context.metadata.is_busy.store(true, Ordering::SeqCst);
+
             let context_arc = Arc::new(context);
             contexts.push(context_arc.clone());
 
@@ -933,4 +985,76 @@ pub struct BrowserPoolStats {
     pub total_requests: u64,
     pub total_contexts_created: u64,
     pub total_contexts_recycled: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a context without touching a browser: an AlwaysNew pool slot is fully described
+    /// by its metadata, so `tab`/`cdp_context_id` may stay empty for reclamation tests.
+    fn make_context(busy: bool) -> Arc<BrowserContext> {
+        let metadata = BrowserContextMetadata::new();
+        metadata.is_busy.store(busy, Ordering::SeqCst);
+        Arc::new(BrowserContext {
+            metadata,
+            tab: Arc::new(Mutex::new(None)),
+            cdp_context_id: None,
+        })
+    }
+
+    #[test]
+    fn reclaims_idle_contexts_and_keeps_busy_ones() {
+        let busy = make_context(true);
+        let mut contexts = vec![make_context(false), busy.clone(), make_context(false)];
+
+        let removed = reclaim_leaked_always_new_contexts(&mut contexts);
+
+        assert_eq!(removed, 2);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].metadata.id, busy.metadata.id);
+    }
+
+    #[test]
+    fn reclaims_nothing_while_all_contexts_are_busy() {
+        let mut contexts = vec![make_context(true), make_context(true)];
+
+        assert_eq!(reclaim_leaked_always_new_contexts(&mut contexts), 0);
+        assert_eq!(contexts.len(), 2);
+    }
+
+    /// The race that pre-marking at creation exists to prevent: a context is in the pool and
+    /// handed to a request that has not started processing yet. It must survive a concurrent
+    /// request's reclamation pass, otherwise reclamation would destroy live work.
+    #[test]
+    fn keeps_context_handed_out_but_not_yet_processing() {
+        let just_created = make_context(true); // pre-marked busy under the pool write lock
+        let mut contexts = vec![just_created.clone()];
+
+        assert_eq!(reclaim_leaked_always_new_contexts(&mut contexts), 0);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].metadata.id, just_created.metadata.id);
+    }
+
+    /// Regression: a request whose future was dropped mid-flight leaves its context idle in
+    /// the pool. Before reclamation this permanently consumed a slot, and the lifecycle
+    /// monitor made it worse by replacing the leaked context with a fresh one.
+    #[test]
+    fn frees_the_slot_after_a_request_leaks_its_context() {
+        let leaked = make_context(true);
+        let mut contexts = vec![leaked.clone()];
+        let max_contexts = 1;
+
+        // Request scope ends: the busy guard clears the flag, but removal never ran.
+        leaked.metadata.is_busy.store(false, Ordering::SeqCst);
+        assert!(
+            contexts.len() >= max_contexts,
+            "slot is occupied by the leak"
+        );
+
+        let removed = reclaim_leaked_always_new_contexts(&mut contexts);
+
+        assert_eq!(removed, 1);
+        assert!(contexts.len() < max_contexts, "slot is available again");
+    }
 }

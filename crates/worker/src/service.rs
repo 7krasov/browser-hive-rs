@@ -133,6 +133,16 @@ struct ContextBusyGuard {
 }
 
 impl ContextBusyGuard {
+    /// Adopt a context that was already marked busy at creation time (AlwaysNew mode).
+    ///
+    /// AlwaysNew contexts are pre-marked busy inside `create_always_new_context` while the
+    /// pool write lock is held, so that leak reclamation can never collect a context that
+    /// was handed out but has not started processing yet. The flag is already set here —
+    /// this guard only takes over clearing it on drop.
+    fn adopt(is_busy: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { is_busy }
+    }
+
     fn new(is_busy: Arc<std::sync::atomic::AtomicBool>) -> Result<Self, ()> {
         // Try to set busy flag (compare-and-swap from false to true)
         match is_busy.compare_exchange(
@@ -151,6 +161,44 @@ impl Drop for ContextBusyGuard {
     fn drop(&mut self) {
         self.is_busy
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// RAII guard that removes an AlwaysNew context from the pool when the request scope ends.
+///
+/// Destruction must not depend on control flow reaching a cleanup statement. If the gRPC
+/// handler future is dropped mid-flight (client disconnect, coordinator deadline, connection
+/// reset) or panics, any explicit cleanup at the end of the handler never runs. In AlwaysNew
+/// mode that leaks the context into the pool permanently — it is never reused and never
+/// reclaimed by the request path, so the slot is lost until the worker restarts.
+///
+/// Destruction is idempotent, so this composes with the early destroy that releases the slot
+/// as soon as content is retrieved.
+struct AlwaysNewContextGuard {
+    browser_pool: Arc<RwLock<BrowserPool>>,
+    context_id: uuid::Uuid,
+    ray_id: String,
+}
+
+impl Drop for AlwaysNewContextGuard {
+    fn drop(&mut self) {
+        // Drop may run in a non-async context, so the removal is spawned. If no runtime is
+        // available (worker shutting down) the whole pool is going away anyway.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let browser_pool = self.browser_pool.clone();
+        let context_id = self.context_id;
+        let ray_id = std::mem::take(&mut self.ray_id);
+
+        handle.spawn(async move {
+            browser_pool
+                .read()
+                .await
+                .destroy_context(&context_id, &ray_id)
+                .await;
+        });
     }
 }
 
@@ -567,8 +615,18 @@ impl WorkerService {
     ) -> Result<ScrapePageResponse, Status> {
         let start_time = Instant::now();
 
-        // Set context as busy (RAII guard will clear on drop)
-        let _busy_guard = match ContextBusyGuard::new(context.metadata.is_busy.clone()) {
+        // Set context as busy (RAII guard will clear on drop).
+        // In AlwaysNew mode the context was already marked busy at creation (see
+        // BrowserPool::create_always_new_context), so the guard adopts the flag instead of
+        // setting it — otherwise the compare-and-swap would fail on a perfectly valid context.
+        let is_always_new = self.config.scope.session_mode == SessionMode::AlwaysNew;
+        let busy_guard_result = if is_always_new {
+            Ok(ContextBusyGuard::adopt(context.metadata.is_busy.clone()))
+        } else {
+            ContextBusyGuard::new(context.metadata.is_busy.clone())
+        };
+
+        let _busy_guard = match busy_guard_result {
             Ok(guard) => guard,
             Err(_) => {
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -1679,20 +1737,23 @@ impl WorkerServiceTrait for WorkerService {
             }
         };
 
-        // Save context_id for fallback cleanup (AlwaysNew mode)
-        let context_id = context.metadata.id;
+        // Guaranteed cleanup (AlwaysNew mode): tie the context's removal to this scope's
+        // lifetime rather than to control flow, so it also runs when the handler future is
+        // dropped mid-request or panics. Idempotent with the early destroy below.
+        let _always_new_guard = if is_always_new {
+            Some(AlwaysNewContextGuard {
+                browser_pool: self.browser_pool.clone(),
+                context_id: context.metadata.id,
+                ray_id: ray_id.clone(),
+            })
+        } else {
+            None
+        };
 
         // Execute scraping
         // NOTE: In AlwaysNew mode, context is destroyed inside scrape_page_internal
         // immediately after getting content (before diagnostics) for faster slot release
         let result = self.scrape_page_internal(&req, context, &ray_id).await;
-
-        // Fallback destroy: ensure context is destroyed even if scrape_page_internal returned early
-        // This is idempotent - if context was already destroyed inside, this is a no-op
-        if is_always_new {
-            let browser_pool = self.browser_pool.read().await;
-            browser_pool.destroy_context(&context_id, &ray_id).await;
-        }
 
         // Update metrics
         match &result {
@@ -1775,5 +1836,35 @@ impl WorkerServiceTrait for WorkerService {
             total_contexts_recycled: stats.total_contexts_recycled,
             success_rate,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn busy_guard_rejects_a_context_that_is_already_busy() {
+        let is_busy = Arc::new(AtomicBool::new(true));
+
+        assert!(ContextBusyGuard::new(is_busy).is_err());
+    }
+
+    /// AlwaysNew contexts arrive pre-marked busy from `create_always_new_context`, so the
+    /// guard must adopt the flag. Using `new` here would reject a perfectly valid context.
+    #[test]
+    fn busy_guard_adopts_a_pre_marked_context_and_clears_it_on_drop() {
+        let is_busy = Arc::new(AtomicBool::new(true));
+
+        {
+            let _guard = ContextBusyGuard::adopt(is_busy.clone());
+            assert!(is_busy.load(Ordering::SeqCst), "stays busy while in scope");
+        }
+
+        assert!(
+            !is_busy.load(Ordering::SeqCst),
+            "adopted flag is cleared on drop, so the context becomes reclaimable"
+        );
     }
 }
