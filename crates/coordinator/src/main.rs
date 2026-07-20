@@ -80,6 +80,14 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
+    // Logged before anything can fail, so the running revision is always identifiable.
+    // The coordinator image is built from base `main` unpinned, so this is the only
+    // in-process record of which build is actually serving.
+    info!(
+        "Browser Hive library version: {}",
+        env!("CARGO_PKG_VERSION")
+    );
+
     // Load configuration
     let config = CoordinatorConfig::default();
 

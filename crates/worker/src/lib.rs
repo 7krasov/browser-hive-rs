@@ -21,6 +21,12 @@ use tracing::{info, warn};
 
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
 
+/// Version of the Browser Hive library this worker was built against.
+///
+/// Downstream binaries pin this crate by git tag, so the value identifies exactly which
+/// library revision is running. Logged at startup — see the note in `run_worker` for why.
+pub const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Run the worker service with given configuration
 ///
 /// This is the main entry point for running a Browser Hive worker.
@@ -59,6 +65,12 @@ const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
 /// }
 /// ```
 pub async fn run_worker(config: WorkerConfig) -> Result<()> {
+    // Logged first, before anything can fail: identifying which library revision a pod runs
+    // must never depend on reaching later startup steps. A deployment can silently keep
+    // serving an old binary (stale image, a pod that was never recreated), and without this
+    // line the only way to tell is inspecting the binary inside the container.
+    info!("Browser Hive library version: {}", LIBRARY_VERSION);
+
     info!(
         "Starting worker for scope: {} on {}:{} (session_mode: {:?})",
         config.scope.name, config.pod_ip, config.grpc_port, config.scope.session_mode
