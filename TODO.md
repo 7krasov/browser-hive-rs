@@ -56,3 +56,30 @@ neither the pool nor the guard can be constructed in a test.
 leak still *occurred*, which means `AlwaysNewContextGuard` did not run. If those appear,
 investigate what aborts the request (client vs. coordinator timeouts against the worker's
 `DEFAULT_WAIT_TIMEOUT_MS`).
+
+## A busy-stuck AlwaysNew context is invisible to leak reclamation
+
+**Status**: known gap, no production evidence yet, deferred (raised 2026-07-20)
+
+Both reclamation paths (`reclaim_leaked_always_new_contexts`, called from
+`create_always_new_context` and from the lifecycle monitor) only collect contexts whose
+`is_busy` is false. A context stuck with `is_busy = true` and no request behind it is
+therefore never reclaimed and permanently consumes a slot.
+
+Known window: `create_always_new_context` pre-marks the context busy and inserts it into the
+pool, but `AlwaysNewContextGuard` (which removes it) is only constructed after
+`acquire_context_with_recovery` returns to `scrape_page`. A future dropped inside that window
+leaves a busy context with no owner. The window is very small, and no production occurrence
+has been confirmed — the 2026-07-20 incident logs were produced by a pre-fix binary
+(the deploy had built from a branch without the version bump, so Docker reused the cached
+`COPY Cargo.toml Cargo.lock` layer and shipped the old worker).
+
+**Diagnostic that would confirm it**: `at max capacity (N/N)` in an `always_new` pod with no
+preceding `Purged N leaked idle context(s)` / `Removed N leaked idle context(s)` line, while
+`browser_hive_worker_active_contexts` stays at N with no request in flight.
+
+**Proposed fix if confirmed**: in the lifecycle monitor, also remove contexts that have been
+busy longer than any possible request (`last_used_at.elapsed()` beyond a hard ceiling, e.g.
+5 minutes). Removing a context from the pool does not abort its request — the `Arc` keeps it
+alive — so a false positive only over-subscribes slots temporarily instead of locking the
+pod out permanently.
