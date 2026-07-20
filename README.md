@@ -168,6 +168,23 @@ If the skip selector is found:
 
 This is **expected behavior**, not an error. Your client should handle this gracefully.
 
+#### Combining `skip_selector` with `wait_selector`
+
+`skip_selector` has no separate timeout — it is polled for as long as the wait strategy
+runs, and that duration comes from `wait_timeout_ms` and `wait_selector`. On every poll it
+is checked *before* `wait_selector`, so if it appears first the request returns immediately
+with `ERROR_CODE_SKIP_SELECTOR_FOUND`, without waiting for `wait_selector`.
+
+If `wait_selector` appears first, behavior depends on the strategy:
+
+| Strategy | `wait_selector` found first |
+|----------|-----------------------------|
+| `network_idle` (default) | Returns success immediately. A `skip_selector` rendered afterwards is **not** detected — the strategy is optimized for fast retrieval. |
+| `timeout` | Keeps polling until `wait_timeout_ms` expires, so a later `skip_selector` still wins. |
+
+Use the `timeout` strategy when a CAPTCHA or login wall may render *after* your target
+content and skip detection must be exhaustive.
+
 ## Proxy Geo-Targeting
 
 Use `country_code` (ISO 3166-1 alpha-2, e.g. `"US"`, `"DE"`, `"UA"`) to request a proxy exit IP from a specific country:
