@@ -129,9 +129,19 @@ pub trait WaitStrategy: Send + Sync {
     ///
     /// # Selector Priority
     /// If both selectors are provided:
-    /// 1. `skip_selector` is always checked first (highest priority)
+    /// 1. `skip_selector` is always checked first (highest priority) - finding it returns
+    ///    immediately, without waiting for `wait_selector`
     /// 2. Then `wait_selector` is checked
     /// 3. Final check performed even after timeout
+    ///
+    /// `skip_selector` has no timeout budget of its own: it is polled for as long as the
+    /// strategy keeps running, and that duration is derived from `timeout_ms`/`wait_selector`.
+    ///
+    /// Strategies differ in what happens when `wait_selector` is found first:
+    /// - `network_idle`: returns `Success` immediately (optimized for fast content retrieval;
+    ///   a `skip_selector` appearing later is not detected)
+    /// - `timeout`: keeps polling until the timeout expires so a later `skip_selector` still
+    ///   wins (only when `skip_selector` is set)
     ///
     /// # Returns
     /// * `Ok(WaitResult::Success)` - Page loaded successfully and wait_selector found (if specified)
@@ -456,6 +466,22 @@ impl WaitStrategy for NetworkIdleStrategy {
             }
         }
 
+        // Phase 1.5 is not interruptible, so skip_selector may have appeared while we were
+        // waiting for the 'load' event. Re-check it before any Success return: without this,
+        // a skip_selector rendered after network idle would never be detected when
+        // wait_selector is absent (Phase 2 is skipped entirely in that case).
+        if let Some(selector) = skip_selector {
+            if check_selector_exists(tab, selector, ray_id)? {
+                tracing::info!(
+                    ray_id = %ray_id,
+                    "Skip selector '{}' found after document ready check ({:?})",
+                    selector,
+                    start.elapsed()
+                );
+                return Ok(WaitResult::SkipSelectorFound);
+            }
+        }
+
         // After Phase 1.5, check if we exceeded total timeout
         if start.elapsed() >= total_timeout {
             tracing::warn!(ray_id = %ray_id, "Total timeout exceeded after Phase 1.5 - skipping selector search");
@@ -583,8 +609,12 @@ impl WaitStrategy for NetworkIdleStrategy {
 ///
 /// **With wait_selector**:
 /// - Polls for selector every 500ms for effective_timeout(timeout_ms) duration
-/// - Returns immediately when selector is found
+/// - Returns immediately when selector is found, *unless* skip_selector is also set
 /// - Returns WaitSelectorNotFound if timeout expires without finding selector
+///
+/// **With both selectors**: finding wait_selector does NOT end the wait. Polling continues
+/// until the timeout expires so that a skip_selector appearing later still takes priority.
+/// This is the difference from network_idle, which returns on the first wait_selector hit.
 ///
 /// **All cases**: Performs final selector check before returning
 ///
@@ -620,6 +650,12 @@ impl WaitStrategy for TimeoutStrategy {
             skip_selector
         );
 
+        // Tracks whether wait_selector was seen at any point during polling.
+        // When skip_selector is also set we cannot return as soon as wait_selector appears -
+        // a skip_selector rendering slightly later must still win. So we remember the hit and
+        // keep polling until the timeout expires, giving skip_selector the full budget.
+        let mut wait_selector_seen = false;
+
         loop {
             // Check for cancellation at the start of each iteration
             check_cancellation(cancellation_token, "wait_strategy:timeout")?;
@@ -639,14 +675,24 @@ impl WaitStrategy for TimeoutStrategy {
 
             // Check wait_selector
             if let Some(selector) = wait_selector {
-                if check_selector_exists(tab, selector, ray_id)? {
+                if !wait_selector_seen && check_selector_exists(tab, selector, ray_id)? {
+                    wait_selector_seen = true;
                     tracing::info!(
                         ray_id = %ray_id,
                         "Wait selector '{}' found after {:?}",
                         selector,
                         start.elapsed()
                     );
-                    return Ok(WaitResult::Success);
+
+                    // No skip_selector to guard against - return as soon as we have a hit
+                    if skip_selector.is_none() {
+                        return Ok(WaitResult::Success);
+                    }
+
+                    tracing::debug!(
+                        ray_id = %ray_id,
+                        "skip_selector is set - continuing to poll until timeout before returning success"
+                    );
                 }
             }
 
@@ -656,7 +702,7 @@ impl WaitStrategy for TimeoutStrategy {
 
                 // Final check before returning
                 if let Some(selector) = wait_selector {
-                    if check_selector_exists(tab, selector, ray_id)? {
+                    if wait_selector_seen || check_selector_exists(tab, selector, ray_id)? {
                         tracing::info!(ray_id = %ray_id, "Wait selector '{}' found on final check", selector);
                         return Ok(WaitResult::Success);
                     }
