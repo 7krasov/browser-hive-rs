@@ -30,7 +30,8 @@ services:
       - "50052:50052"  # gRPC endpoint
       - "9090:9090"    # Prometheus metrics
     environment:
-      - RUST_LOG=debug
+      # DEBUG only for our own code; third-party crates (h2/tonic/hyper) stay at warn+.
+      - RUST_LOG=warn,browser_hive_worker=debug,browser_hive_common=debug,worker=debug
       - LOG_FORMAT=pretty  # Human-readable logs for local dev (unset/json = structured JSON for Loki)
       - WORKER_SCOPE_NAME=local_dev
       - WORKER_GRPC_PORT=50052
