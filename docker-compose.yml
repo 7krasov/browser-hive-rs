@@ -9,7 +9,8 @@ services:
     ports:
       - "50051:50051"  # gRPC endpoint
     environment:
-      - RUST_LOG=info
+      # DEBUG only for our own code; third-party crates (h2/tonic/hyper/kube) stay at warn+.
+      - RUST_LOG=warn,coordinator=debug,browser_hive_common=debug
       - LOG_FORMAT=pretty  # Human-readable logs for local dev (unset/json = structured JSON for Loki)
       - COORDINATOR_MODE=local  # Use local mode (no K8s API)
       - COORDINATOR_GRPC_PORT=50051
