@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 /// Calculate SHA256 hash of content for compact logging
 fn content_hash(content: &str) -> String {
@@ -1302,6 +1302,11 @@ impl WorkerService {
         // Save strategy name before moving strategy into closure
         let strategy_name = strategy.name().to_string();
 
+        // Enrich the request span now that the wait configuration is resolved.
+        let span = tracing::Span::current();
+        span.record("wait_strategy", strategy_name.as_str());
+        span.record("wait_timeout_ms", wait_timeout as u64);
+
         // Log selector configuration
         info!(
             ray_id = %ray_id,
@@ -1622,6 +1627,33 @@ impl WorkerServiceTrait for WorkerService {
     ) -> Result<Response<ScrapePageResponse>, Status> {
         let req = request.into_inner();
 
+        // Per-request span: every log line emitted while handling this request inherits
+        // this context, so in JSON logs it lands under the `span` object (Loki: span_ray_id,
+        // span_url, …) while the message stays clean. Optional fields start Empty and are
+        // either recorded below (when present in the request) or later once known
+        // (context_id, wait_strategy, wait_timeout_ms); Empty fields are omitted from output.
+        let span = tracing::info_span!(
+            "scrape_page",
+            ray_id = %req.ray_id,
+            url = %req.url,
+            wait_selector = tracing::field::Empty,
+            skip_selector = tracing::field::Empty,
+            country_code = tracing::field::Empty,
+            wait_strategy = tracing::field::Empty,
+            wait_timeout_ms = tracing::field::Empty,
+            context_id = tracing::field::Empty,
+        );
+        if !req.wait_selector.is_empty() {
+            span.record("wait_selector", req.wait_selector.as_str());
+        }
+        if !req.skip_selector.is_empty() {
+            span.record("skip_selector", req.skip_selector.as_str());
+        }
+        if !req.country_code.is_empty() {
+            span.record("country_code", req.country_code.as_str());
+        }
+
+        async move {
         // Get ray_id from request (coordinator generates it if not provided by client)
         let ray_id = req.ray_id.clone();
 
@@ -1737,6 +1769,10 @@ impl WorkerServiceTrait for WorkerService {
             }
         };
 
+        // Now that a context is bound to the request, add it to the request span so every
+        // subsequent log line carries it.
+        tracing::Span::current().record("context_id", context.metadata.id.to_string().as_str());
+
         // Guaranteed cleanup (AlwaysNew mode): tie the context's removal to this scope's
         // lifetime rather than to control flow, so it also runs when the handler future is
         // dropped mid-request or panics. Idempotent with the early destroy below.
@@ -1786,6 +1822,9 @@ impl WorkerServiceTrait for WorkerService {
         }
 
         result.map(Response::new)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn health_check(

@@ -12,8 +12,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio_cancellation_ext::CancellationToken;
 use tonic::transport::Server;
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
 
 // gRPC server timeout - maximum time for a single request
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
@@ -74,18 +73,17 @@ async fn shutdown_signal(active_requests: Arc<AtomicUsize>, cancellation_token: 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // Initialize tracing (format via LOG_FORMAT, level via RUST_LOG)
+    browser_hive_common::init_logging()?;
 
     // Logged before anything can fail, so the running revision is always identifiable.
     // The coordinator image is built from base `main` unpinned, so this is the only
     // in-process record of which build is actually serving.
+    // Single literal, so the same pattern finds the version in the logs and in the binary:
+    //   grep -a -o 'Browser Hive library version=[0-9.]*' /usr/local/bin/coordinator
     info!(
-        "Browser Hive library version: {}",
-        env!("CARGO_PKG_VERSION")
+        "{}",
+        concat!("Browser Hive library version=", env!("CARGO_PKG_VERSION"))
     );
 
     // Load configuration

@@ -215,6 +215,15 @@ The system is designed to bypass anti-bot systems naturally through browser midd
 
 The browser configuration is entirely controlled through middleware, allowing full customization while keeping core code clean.
 
+### Logging
+
+All binaries (base worker, base coordinator, downstream production workers) initialize logging via the single shared entry point `browser_hive_common::init_logging()` (`common/src/logging.rs`) — no binary builds its own subscriber. Two env vars control it:
+
+- `LOG_FORMAT` - output format. **Unset or `json` (default) → structured JSON**, one object per line, for Grafana Loki. `pretty`/`text`/`plain`/`human` → human-readable format for local dev (set in `docker-compose.yml`). JSON is the default so production pods are Loki-friendly with no deployment change.
+- `RUST_LOG` - standard `EnvFilter` syntax, defaults to `info`.
+
+**Per-request context is carried on a `tracing` span, not baked into each message.** `scrape_page` (`worker/src/service.rs`) opens an `info_span!("scrape_page", …)` covering the whole handler, so every log line within a request inherits the context. Fields: `ray_id`, `url` (always); `wait_selector`, `skip_selector`, `country_code` (recorded only when non-empty — empty values are omitted); `context_id`, `wait_strategy`, `wait_timeout_ms` (start as `tracing::field::Empty`, recorded later once known). In JSON mode the formatter uses `with_current_span(true)` + `flatten_event(true)`, so span fields land under a `span` object (Loki exposes them as `span_ray_id`, `span_url`, … for per-field filtering) while the event's `message` stays clean at the top level. The JSON shape is pinned by a test in `common/src/logging.rs`. Log calls that run **outside** the request span — the `AlwaysNewContextGuard` Drop (spawned task) and background pool recreation — still pass `ray_id` explicitly as an event field, since spans do not propagate across `tokio::spawn`.
+
 ### Metrics and Monitoring
 
 Workers expose Prometheus metrics on port 9090 at `/metrics` (implemented in `worker/src/metrics.rs`):

@@ -8,16 +8,11 @@ mod providers;
 
 use anyhow::Result;
 use browser_hive_worker::run_worker;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // Initialize tracing (format via LOG_FORMAT, level via RUST_LOG)
+    browser_hive_common::init_logging()?;
 
     // Create proxy provider from environment variables
     let provider = providers::create_from_env()?;

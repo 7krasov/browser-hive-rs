@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "browser-hive-common",
  "browser-hive-proto",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-common"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "headless_chrome",
@@ -257,13 +257,14 @@ dependencies = [
  "tokio",
  "tokio-cancellation-ext",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
 
 [[package]]
 name = "browser-hive-coordinator"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "browser-hive-common",
@@ -280,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-proto"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "prost",
  "tonic",
@@ -289,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-worker"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2602,6 +2603,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2611,12 +2622,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

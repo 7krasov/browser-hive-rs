@@ -103,6 +103,9 @@ pub mod prelude {
     // Session management
     pub use crate::common::SessionManager;
 
+    // Logging initialization (shared by all binaries)
+    pub use crate::common::init_logging;
+
     // Wait strategy types
     pub use crate::common::{
         NetworkIdleStrategy, TimeoutStrategy, WaitStrategy, WaitStrategyRegistry,

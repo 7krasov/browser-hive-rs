@@ -1,5 +1,6 @@
 pub mod browser_middleware;
 pub mod config;
+pub mod logging;
 pub mod proxy;
 pub mod request_context;
 pub mod session;
@@ -12,6 +13,7 @@ pub use browser_middleware::{
     DefaultTabInitMiddleware, TabInitMiddleware,
 };
 pub use config::*;
+pub use logging::init_logging;
 pub use proxy::{ProxyConfig, ProxyProvider, ProxyScheme};
 pub use request_context::{ProxyParams, RequestContext, ScrapeParams};
 pub use session::*;

@@ -27,6 +27,18 @@ const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
 /// library revision is running. Logged at startup — see the note in `run_worker` for why.
 pub const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The startup banner, built as a single string literal so that the same pattern finds the
+/// version in a running pod's logs *and* in the binary of a pod that has not been restarted:
+///
+/// ```text
+/// grep -a -o 'Browser Hive library version=[0-9.]*' /usr/local/bin/worker
+/// ```
+///
+/// Formatting the version in at runtime instead would store it as a separate, unidentifiable
+/// literal — which is why this is `concat!` rather than a format argument.
+pub const LIBRARY_VERSION_BANNER: &str =
+    concat!("Browser Hive library version=", env!("CARGO_PKG_VERSION"));
+
 /// Run the worker service with given configuration
 ///
 /// This is the main entry point for running a Browser Hive worker.
@@ -69,7 +81,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     // must never depend on reaching later startup steps. A deployment can silently keep
     // serving an old binary (stale image, a pod that was never recreated), and without this
     // line the only way to tell is inspecting the binary inside the container.
-    info!("Browser Hive library version: {}", LIBRARY_VERSION);
+    info!("{}", LIBRARY_VERSION_BANNER);
 
     info!(
         "Starting worker for scope: {} on {}:{} (session_mode: {:?})",
