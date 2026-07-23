@@ -25,6 +25,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
+url = { workspace = true }
+psl = { workspace = true }
 
 headless_chrome = { workspace = true }
 prometheus = { workspace = true }

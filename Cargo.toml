@@ -24,7 +24,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -40,6 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 async-trait = "0.1"
 url = "2.5"
+# Public Suffix List (compiled-in) for registrable-domain (eTLD+1) comparison
+psl = "2"
 
 # Kubernetes
 kube = { version = "0.95", features = ["runtime", "derive"] }

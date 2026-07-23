@@ -28,6 +28,9 @@ enum ErrorCode {
   ERROR_CODE_SELECTOR_NOT_FOUND = 4042;      // Browser has not found the requested CSS selector
   ERROR_CODE_SKIP_SELECTOR_FOUND = 4043;     // Browser has found the selector to skip: don't parse this content
 
+
+  ERROR_CODE_REDIRECT_TO_ANOTHER_DOMAIN = 4050; // Navigation was redirected to a different registrable domain
+
   ERROR_CODE_UNKNOWN = 9999;                 // Unknown error
 }
 
@@ -71,6 +74,9 @@ message ScrapePageResponse {
   string content = 3;
   string error_message = 4;
   ErrorCode error_code = 5;
+  // HTTP response headers of the MAIN document (the top-level navigation to `url`),
+  // not sub-resources or iframes. Captured via CDP. Empty when unavailable
+  // (capture disabled/failed, or an error path). See RESPONSE_OBSERVERS.md.
   map<string, string> response_headers = 6;
   uint64 execution_time_ms = 7;
 

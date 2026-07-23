@@ -34,6 +34,61 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn, Instrument};
 
+/// RAII guard that removes a CDP event listener from a tab on drop.
+///
+/// Tabs are reused across requests in reusable session modes, so a listener
+/// registered per request must be removed afterwards to avoid unbounded
+/// accumulation on the shared tab. Removal only touches the tab's in-memory
+/// listener vector (no CDP call), so it is safe even if the tab's CDP session
+/// is already gone (e.g. a timeout/cancel closed it).
+struct EventListenerGuard {
+    remove: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for EventListenerGuard {
+    fn drop(&mut self) {
+        if let Some(remove) = self.remove.take() {
+            remove();
+        }
+    }
+}
+
+/// Wire-level facts of the main navigation captured by the response observer from the
+/// top-level document `Network.responseReceived` event. See RESPONSE_OBSERVERS.md.
+///
+/// This is a small struct rather than a `ResponseObserver` trait on purpose: two fixed
+/// fields (status + headers) do not justify an abstraction. Extract a trait only when
+/// signals become pluggable/per-scope or numerous (exit-IP, redirect chain, protocol…).
+#[derive(Default)]
+struct MainDocumentResponse {
+    /// HTTP status of the final main-document response (0 if unknown/uncaptured).
+    status: u32,
+    /// Response headers of the final main-document response.
+    headers: std::collections::HashMap<String, String>,
+    /// URL of the final main-document response (empty if uncaptured). Used to detect
+    /// off-domain redirects — this is the authoritative landing URL from the network layer.
+    url: String,
+}
+
+/// Detect a redirect that landed on a **different registrable domain** (eTLD+1) than the one
+/// requested. Returns `Some(final_registrable_domain)` for an off-domain redirect, or `None`
+/// when it is the same site (e.g. `www.example.com` → `shop.example.com`) or when either
+/// URL/host/eTLD+1 cannot be determined. It errs toward `None`, so an odd-but-valid
+/// navigation is never mislabelled as an off-domain redirect.
+fn cross_site_redirect_target(requested_url: &str, final_url: &str) -> Option<String> {
+    let host_of = |u: &str| -> Option<String> {
+        url::Url::parse(u)
+            .ok()?
+            .host_str()
+            .map(str::to_ascii_lowercase)
+    };
+    let requested_host = host_of(requested_url)?;
+    let final_host = host_of(final_url)?;
+    let requested_domain = psl::domain_str(&requested_host)?;
+    let final_domain = psl::domain_str(&final_host)?;
+    (requested_domain != final_domain).then(|| final_domain.to_string())
+}
+
 /// Calculate SHA256 hash of content for compact logging
 fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -1094,6 +1149,85 @@ impl WorkerService {
         }
         drop(browser_pool_guard); // Release read lock
 
+        // Response Observer: main-document HTTP response headers.
+        //
+        // This is the first (and currently only) "response observer" — a per-request hook
+        // that extracts wire-level facts of the top-level navigation that the DOM/JS cannot
+        // see (see RESPONSE_OBSERVERS.md for the concept and the planned trait-based
+        // generalization to status/exit-IP/redirects/protocol/etc.).
+        //
+        // Mechanism: enable the CDP Network domain and record the response for the top-level
+        // frame (main frame id == target id). The Performance API cannot expose headers, and
+        // CDP also carries the authoritative HTTP status, so both are read from this single
+        // event. The listener is removed on drop so it does not accumulate on reused tabs.
+        // Failure to enable is non-fatal: the request falls back to the Performance-API
+        // status and empty headers.
+        let main_response_holder: Arc<std::sync::Mutex<Option<MainDocumentResponse>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let _header_capture_guard: Option<EventListenerGuard> = {
+            use headless_chrome::protocol::cdp::types::Event;
+            use headless_chrome::protocol::cdp::Network;
+
+            match tab.call_method(Network::Enable {
+                max_total_buffer_size: None,
+                max_resource_buffer_size: None,
+                max_post_data_size: None,
+            }) {
+                Err(e) => {
+                    debug!(ray_id = %ray_id, "Failed to enable Network domain for response capture: {}", e);
+                    None
+                }
+                Ok(_) => {
+                    let main_frame_id = tab.get_target_id().clone();
+                    let holder = main_response_holder.clone();
+                    let listener: Arc<
+                        dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync,
+                    > = Arc::new(move |event: &Event| {
+                        if let Event::NetworkResponseReceived(ev) = event {
+                            // Only the top-level document response (main frame == target id).
+                            if matches!(ev.params.Type, Network::ResourceType::Document)
+                                && ev.params.frame_id.as_deref() == Some(main_frame_id.as_str())
+                            {
+                                let headers = match &ev.params.response.headers.0 {
+                                    Some(serde_json::Value::Object(map)) => map
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            let val = match v {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                other => other.to_string(),
+                                            };
+                                            (k.clone(), val)
+                                        })
+                                        .collect(),
+                                    _ => std::collections::HashMap::new(),
+                                };
+                                // Last matching response wins (final URL after redirects).
+                                *holder.lock().unwrap() = Some(MainDocumentResponse {
+                                    status: ev.params.response.status,
+                                    headers,
+                                    url: ev.params.response.url.clone(),
+                                });
+                            }
+                        }
+                    });
+                    match tab.add_event_listener(listener) {
+                        Ok(weak) => {
+                            let tab_for_remove = tab.clone();
+                            Some(EventListenerGuard {
+                                remove: Some(Box::new(move || {
+                                    let _ = tab_for_remove.remove_event_listener(&weak);
+                                })),
+                            })
+                        }
+                        Err(e) => {
+                            debug!(ray_id = %ray_id, "Failed to add response header listener: {}", e);
+                            None
+                        }
+                    }
+                }
+            }
+        };
+
         // Navigate to URL (reusing existing tab!)
         // NOTE: Navigation errors are NOT critical - we still try to get content (chrome error page)
         // Wrap in spawn_blocking to avoid blocking tokio runtime + support cancellation + hard timeout
@@ -1527,10 +1661,27 @@ impl WorkerService {
             }
         }
 
-        // Get HTTP status code from the main document request
-        // Returns 0 if status code cannot be determined
-        let status_code = tab
-            .evaluate(
+        // DO NOT close tab - keep it for session reuse!
+
+        // Drain the captured main-document response (status + headers + final URL).
+        let MainDocumentResponse {
+            status: observed_status,
+            headers: response_headers,
+            url: observed_url,
+        } = main_response_holder
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
+
+        // HTTP status code: prefer the authoritative value from the CDP response observer.
+        // Fall back to the Performance API only when the observer captured nothing — the
+        // Network domain could not be enabled, or the navigation produced no response such
+        // as a chrome-error:// page. Returns 0 if it still cannot be determined.
+        let status_code = if observed_status > 0 {
+            observed_status
+        } else {
+            tab.evaluate(
                 r#"
                 (() => {
                     try {
@@ -1557,20 +1708,53 @@ impl WorkerService {
             )
             .ok()
             .and_then(|result| result.value.and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        // DO NOT close tab - keep it for session reuse!
+            .unwrap_or(0) as u32
+        };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
-        // Build response based on navigation result and wait result
-        // Priority: navigation error > wait result
+        // Off-domain redirect detection. The final landing URL comes from the response
+        // observer (authoritative network-layer URL); fall back to the committed tab URL if
+        // the observer captured nothing. Only meaningful when navigation succeeded.
+        let final_url = if observed_url.is_empty() {
+            tab.get_url()
+        } else {
+            observed_url
+        };
+        let redirect_target = if navigation_result.is_ok() {
+            cross_site_redirect_target(&req.url, &final_url)
+        } else {
+            None
+        };
+        if let Some(target_domain) = &redirect_target {
+            debug!(
+                ray_id = %ray_id,
+                "Off-domain redirect detected: {} -> {} (registrable domain '{}')",
+                req.url, final_url, target_domain
+            );
+        }
+
+        // Build response based on navigation result and wait result.
+        // Priority: navigation error > off-domain redirect > wait result.
         let (success, error_message, error_code) = if let Err(e) = navigation_result {
             // Navigation failed - this is a network/browser error
             (
                 false,
                 format!("Failed to navigate to URL: {}", e),
                 ErrorCode::NetworkError,
+            )
+        } else if redirect_target.is_some() {
+            // Redirected to another domain. wait_selector/skip_selector were evaluated
+            // against a foreign page, so their outcome is meaningless — discard it and report
+            // the redirect instead. This deliberately suppresses any "wait selector not found"
+            // / "skip selector found" message.
+            (
+                false,
+                format!(
+                    "Redirected to another domain: {} (from {})",
+                    final_url, req.url
+                ),
+                ErrorCode::RedirectToAnotherDomain,
             )
         } else {
             // Navigation succeeded - check wait result
@@ -1611,7 +1795,7 @@ impl WorkerService {
             content,
             error_message,
             error_code: error_code as i32,
-            response_headers: std::collections::HashMap::new(),
+            response_headers,
             execution_time_ms,
             context_id,
             ray_id: ray_id.to_string(),
@@ -1905,5 +2089,44 @@ mod tests {
             !is_busy.load(Ordering::SeqCst),
             "adopted flag is cleared on drop, so the context becomes reclaimable"
         );
+    }
+
+    #[test]
+    fn cross_site_redirect_is_flagged_only_across_registrable_domains() {
+        // Same host / same page → not a redirect.
+        assert_eq!(
+            cross_site_redirect_target("https://example.com/a", "https://example.com/b"),
+            None
+        );
+        // Subdomains of the same eTLD+1 are the SAME site → allowed.
+        assert_eq!(
+            cross_site_redirect_target("https://www.example.com/", "https://shop.example.com/"),
+            None
+        );
+        assert_eq!(
+            cross_site_redirect_target("https://example.com/", "https://www.example.com/"),
+            None
+        );
+        // Different registrable domain → flagged, returning the landing domain.
+        assert_eq!(
+            cross_site_redirect_target("https://example.com/", "https://evil.org/login"),
+            Some("evil.org".to_string())
+        );
+        // Multi-label public suffix (eTLD) must not be mis-split: these are the SAME site.
+        assert_eq!(
+            cross_site_redirect_target("https://www.example.co.uk/", "https://shop.example.co.uk/"),
+            None
+        );
+        // …but a different eTLD+1 under the same ccTLD is still cross-site.
+        assert_eq!(
+            cross_site_redirect_target("https://example.co.uk/", "https://other.co.uk/"),
+            Some("other.co.uk".to_string())
+        );
+        // Unparseable / hostless inputs err toward "not a redirect".
+        assert_eq!(
+            cross_site_redirect_target("not a url", "https://example.com/"),
+            None
+        );
+        assert_eq!(cross_site_redirect_target("https://example.com/", ""), None);
     }
 }

@@ -68,6 +68,7 @@ These indicate issues with the request itself.
 | `ERROR_CODE_TIMEOUT_BROWSER` | 4041 | Browser timeout during page load | ✅ Yes - increase timeout |
 | `ERROR_CODE_SELECTOR_NOT_FOUND` | 4042 | Wait selector not found within timeout | ⚠️ Maybe - check selector |
 | `ERROR_CODE_SKIP_SELECTOR_FOUND` | 4043 | Skip selector found (content should be ignored) | ❌ No - expected behavior |
+| `ERROR_CODE_REDIRECT_TO_ANOTHER_DOMAIN` | 4050 | Navigation was redirected to a different registrable domain (eTLD+1); `wait_selector`/`skip_selector` are not applied to the foreign page. `status_code` is the landing page's status; `response_headers` are the landing page's | ❌ No - target site redirected off-domain |
 
 ### Server Errors (5xxx)
 

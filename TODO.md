@@ -2,6 +2,47 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## Generalize the response observer into a `ResponseObserver` trait
+
+**Status**: deferred by design; inline struct is fine for now (raised 2026-07-23)
+
+The response observer in `worker/src/service.rs::scrape_page_internal` (CDP `Network` domain →
+main-document `responseReceived`) currently captures two fields into a `MainDocumentResponse`
+struct: HTTP `status` and `response_headers`. This is intentionally **not** abstracted into a
+trait yet — two fixed fields do not justify one (YAGNI). See RESPONSE_OBSERVERS.md.
+
+**Trigger to act**: when signals become **pluggable per-scope** or numerous. Candidates:
+proxy exit IP (`response.remote_ip_address`, replacing the ~1s JS `check_proxy_exit_ip`
+probe), redirect chain (see next item), negotiated protocol (h2/h3), response cookies,
+cache-provenance flags, anti-bot headers (`cf-ray`, `server`), response bodies for non-HTML
+endpoints.
+
+**Then**: extract a `ResponseObserver` trait (parallel to `WaitStrategy` and the middleware
+vectors), hold `Vec<Box<dyn ResponseObserver>>` on `ScopeConfig`, and fan the single
+`Network.enable` + listener out to all observers. Sketch in RESPONSE_OBSERVERS.md.
+
+## Redirect follow-ups (off-domain detection is DONE)
+
+**Status**: off-domain detection shipped 2026-07-23; two optional follow-ups remain
+
+Off-domain redirect detection is implemented: the worker returns
+`ERROR_CODE_REDIRECT_TO_ANOTHER_DOMAIN` (4050) when the main navigation lands on a different
+registrable domain (eTLD+1 via the `psl` crate), overriding the wait result so no selector
+error surfaces. Returns the landing page's status. See RESPONSE_OBSERVERS.md.
+
+Remaining, both optional:
+
+1. **Avoid wasting the wait budget on the foreign page.** The check currently runs *after*
+   the wait strategy, so a request with a `wait_selector` that redirects off-domain still
+   polls for the selector on the foreign page until timeout before being overridden. Moving
+   the check *before* the selector phase (inside `NetworkIdleStrategy` Phase 1→2) avoids the
+   waste but couples `common` to the observer / requested URL (change of the `WaitStrategy`
+   signature). Only worth it if this waste shows up in practice.
+2. **Full redirect chain.** Capture every hop (`Location` + per-hop status) via a
+   `requestWillBeSent.redirectResponse` observer — a superset of the off-domain check, useful
+   for the recurring "why was the selector not found?" debugging (answer is often: redirected
+   off-site) and to optionally return the 3xx status instead of the landing status.
+
 ## Possible false-positive selector match on the previous page (wait_strategy)
 
 **Status**: needs verification, deferred (raised 2026-07-20)
