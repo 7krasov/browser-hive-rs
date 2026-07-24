@@ -1463,8 +1463,15 @@ impl WorkerService {
             let wait_selector_for_closure = wait_selector_owned.clone();
             let skip_selector_for_closure = skip_selector_owned.clone();
             let ray_id_for_closure = ray_id.to_string();
+            // spawn_blocking runs on a separate thread, so the current tracing span
+            // (opened in `scrape_page` and carried via `.instrument(span)`) is NOT active
+            // there. Capture it and re-enter inside the closure so all wait-strategy logs
+            // (target = browser_hive_common::wait_strategy) inherit the request context
+            // (url, context_id, wait_strategy, wait_timeout_ms, …).
+            let wait_span = tracing::Span::current();
 
             let wait_handle = tokio::task::spawn_blocking(move || {
+                let _span_guard = wait_span.enter();
                 let wait_sel_ref = wait_selector_for_closure.as_deref();
                 let skip_sel_ref = skip_selector_for_closure.as_deref();
                 strategy_clone.wait(
