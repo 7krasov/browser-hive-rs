@@ -247,13 +247,15 @@ impl Drop for AlwaysNewContextGuard {
         let context_id = self.context_id;
         let ray_id = std::mem::take(&mut self.ray_id);
 
-        handle.spawn(async move {
-            browser_pool
-                .read()
-                .await
-                .destroy_context(&context_id, &ray_id)
-                .await;
-        });
+        // Drop runs in a freshly spawned task, so the request span does not propagate here.
+        // Open a span carrying ray_id so destroy_context's logs stay correlated (span_ray_id).
+        let span = tracing::info_span!("always_new_context_drop", ray_id = %ray_id);
+        handle.spawn(
+            async move {
+                browser_pool.read().await.destroy_context(&context_id).await;
+            }
+            .instrument(span),
+        );
     }
 }
 
@@ -372,18 +374,16 @@ impl WorkerService {
     ///
     /// # Parameters
     /// * `pool` - The browser pool to acquire context from
-    /// * `ray_id` - Request tracing ID for logging
     /// * `proxy_params` - Proxy parameters (country_code, etc.) for context creation
     async fn acquire_context(
         &self,
         pool: &BrowserPool,
-        ray_id: &str,
         proxy_params: &ProxyParams,
     ) -> anyhow::Result<Option<Arc<BrowserContext>>> {
         match self.config.scope.session_mode {
-            SessionMode::AlwaysNew => pool.create_always_new_context(ray_id, proxy_params).await,
+            SessionMode::AlwaysNew => pool.create_always_new_context(proxy_params).await,
             SessionMode::Reusable | SessionMode::ReusablePreinit => {
-                pool.get_or_create_context(ray_id, proxy_params).await
+                pool.get_or_create_context(proxy_params).await
             }
         }
     }
@@ -409,12 +409,12 @@ impl WorkerService {
             SessionMode::ReusablePreinit => "reusable_preinit",
         };
 
-        debug!(ray_id = %ray_id, "Acquiring context ({} mode) with country_code={:?}", mode_name, proxy_params.country_code);
+        debug!("Acquiring context ({} mode) with country_code={:?}", mode_name, proxy_params.country_code);
 
         let browser_pool_guard = self.browser_pool.read().await;
 
         match self
-            .acquire_context(&browser_pool_guard, ray_id, proxy_params)
+            .acquire_context(&browser_pool_guard, proxy_params)
             .await
         {
             Ok(Some(ctx)) => Ok(ctx),
@@ -449,7 +449,6 @@ impl WorkerService {
                 // Check if browser process is dead - attempt recovery
                 if Self::is_dead_browser_error(&error_msg) {
                     warn!(
-                        ray_id = %ray_id,
                         "Browser process appears dead during context creation ({} mode) - attempting recovery: {}",
                         mode_name, error_msg
                     );
@@ -478,11 +477,11 @@ impl WorkerService {
                     // Retry with new pool
                     let new_pool_guard = self.browser_pool.read().await;
                     match self
-                        .acquire_context(&new_pool_guard, ray_id, proxy_params)
+                        .acquire_context(&new_pool_guard, proxy_params)
                         .await
                     {
                         Ok(Some(ctx)) => {
-                            debug!(ray_id = %ray_id, "Successfully acquired context after browser pool recovery");
+                            debug!("Successfully acquired context after browser pool recovery");
                             Ok(ctx)
                         }
                         Ok(None) => {
@@ -554,44 +553,44 @@ impl WorkerService {
     /// This method runs diagnostics in a separate blocking task with a timeout to prevent
     /// blocking the response. If diagnostics take too long, they are abandoned (but may
     /// continue running in the background).
-    async fn collect_browser_diagnostics(
-        tab: Arc<headless_chrome::Tab>,
-        timeout: Duration,
-        ray_id: &str,
-    ) {
-        let ray_id_owned = ray_id.to_string();
+    async fn collect_browser_diagnostics(tab: Arc<headless_chrome::Tab>, timeout: Duration) {
+        // spawn_blocking runs on a separate thread, so the current request span does not
+        // propagate there. Capture and re-enter it so diagnostics logs inherit the request
+        // context (ray_id, url, …) from the span.
+        let diag_span = tracing::Span::current();
 
         let diagnostics_result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                Self::run_diagnostics_sync(&tab, &ray_id_owned);
+                let _span_guard = diag_span.enter();
+                Self::run_diagnostics_sync(&tab);
             }),
         )
         .await;
 
         match diagnostics_result {
             Ok(Ok(())) => {
-                info!(ray_id = %ray_id, "Browser diagnostics completed successfully");
+                info!("Browser diagnostics completed successfully");
             }
             Ok(Err(e)) => {
-                warn!(ray_id = %ray_id, "Browser diagnostics task failed: {}", e);
+                warn!("Browser diagnostics task failed: {}", e);
             }
             Err(_) => {
-                warn!(ray_id = %ray_id, "Browser diagnostics timed out after {:?} - skipping to return response faster", timeout);
+                warn!("Browser diagnostics timed out after {:?} - skipping to return response faster", timeout);
             }
         }
     }
 
     /// Synchronous diagnostics collection (runs in blocking task).
-    fn run_diagnostics_sync(tab: &headless_chrome::Tab, ray_id: &str) {
+    fn run_diagnostics_sync(tab: &headless_chrome::Tab) {
         // Collect console logs
         if let Err(e) = Self::collect_console_logs_sync(tab) {
-            warn!(ray_id = %ray_id, "Failed to collect console logs: {}", e);
+            warn!("Failed to collect console logs: {}", e);
         }
 
         // Collect page diagnostics
         if let Err(e) = Self::collect_page_diagnostics_sync(tab) {
-            warn!(ray_id = %ray_id, "Failed to collect page diagnostics: {}", e);
+            warn!("Failed to collect page diagnostics: {}", e);
         }
     }
 
@@ -783,7 +782,6 @@ impl WorkerService {
 
         if tab_guard.is_none() {
             debug!(
-                ray_id = %ray_id,
                 "Tab not found in context {} - creating new tab (likely after recycling)",
                 context.metadata.id
             );
@@ -799,7 +797,6 @@ impl WorkerService {
                     // Check if this is a "browser process dead" error
                     if Self::is_dead_browser_error(&error_msg) {
                         warn!(
-                            ray_id = %ray_id,
                             "Browser process appears dead - attempting to recreate browser pool: {}",
                             error_msg
                         );
@@ -835,7 +832,7 @@ impl WorkerService {
                         match browser.new_tab() {
                             Ok(new_tab) => {
                                 *tab_guard = Some(new_tab);
-                                debug!(ray_id = %ray_id, "Successfully created tab after browser pool recreation");
+                                debug!("Successfully created tab after browser pool recreation");
                             }
                             Err(e) => {
                                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -894,7 +891,6 @@ impl WorkerService {
                 // We can recover by creating a new tab in the same CDP context (preserving cookies/storage).
                 if Self::is_dead_tab_error(&error_msg) {
                     warn!(
-                        ray_id = %ray_id,
                         "Tab CDP session dead ('No session with given id') - recreating tab for context {} (cdp_context_id: {:?})",
                         context.metadata.id,
                         context.cdp_context_id
@@ -904,7 +900,7 @@ impl WorkerService {
                     let new_tab = if let Some(cdp_ctx_id) = &context.cdp_context_id {
                         // Isolated context - recreate tab in the same CDP BrowserContext
                         // This preserves cookies and storage from previous requests
-                        match browser_pool_guard.create_tab_in_context(cdp_ctx_id, ray_id) {
+                        match browser_pool_guard.create_tab_in_context(cdp_ctx_id) {
                             Ok(t) => t,
                             Err(e) => {
                                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -926,7 +922,7 @@ impl WorkerService {
                         }
                     } else {
                         // Shared context - recreate tab in default browser context
-                        match browser_pool_guard.create_tab_shared(ray_id) {
+                        match browser_pool_guard.create_tab_shared() {
                             Ok(t) => t,
                             Err(e) => {
                                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -971,7 +967,6 @@ impl WorkerService {
                     }
 
                     info!(
-                        ray_id = %ray_id,
                         "Successfully recreated tab after dead session for context {} (cdp_context_id: {:?})",
                         context.metadata.id,
                         context.cdp_context_id
@@ -980,7 +975,6 @@ impl WorkerService {
                 // Check if this is a "connection closed" error (WebSocket timeout or dead browser)
                 else if error_msg.contains("connection is closed") {
                     warn!(
-                        ray_id = %ray_id,
                         "Tab WebSocket connection closed - attempting tab recreation for context {}",
                         context.metadata.id
                     );
@@ -1015,7 +1009,7 @@ impl WorkerService {
 
                             // Browser process is dead - recreate entire pool
                             if Self::is_dead_browser_error(&tab_error) {
-                                warn!(ray_id = %ray_id, "Browser process appears dead during tab recreation - recreating pool");
+                                warn!("Browser process appears dead during tab recreation - recreating pool");
 
                                 drop(browser_pool_guard);
                                 drop(tab_guard);
@@ -1086,7 +1080,7 @@ impl WorkerService {
                                     });
                                 }
 
-                                debug!(ray_id = %ray_id, "Successfully recreated pool and enabled fetch");
+                                debug!("Successfully recreated pool and enabled fetch");
                             } else {
                                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                                 return Ok(ScrapePageResponse {
@@ -1145,7 +1139,7 @@ impl WorkerService {
                 });
             }
 
-            debug!(ray_id = %ray_id, "Enabled proxy authentication for tab before navigation");
+            debug!("Enabled proxy authentication for tab before navigation");
         }
         drop(browser_pool_guard); // Release read lock
 
@@ -1174,7 +1168,7 @@ impl WorkerService {
                 max_post_data_size: None,
             }) {
                 Err(e) => {
-                    debug!(ray_id = %ray_id, "Failed to enable Network domain for response capture: {}", e);
+                    debug!("Failed to enable Network domain for response capture: {}", e);
                     None
                 }
                 Ok(_) => {
@@ -1220,7 +1214,7 @@ impl WorkerService {
                             })
                         }
                         Err(e) => {
-                            debug!(ray_id = %ray_id, "Failed to add response header listener: {}", e);
+                            debug!("Failed to add response header listener: {}", e);
                             None
                         }
                     }
@@ -1257,7 +1251,6 @@ impl WorkerService {
             _ = tokio::time::sleep(Duration::from_secs(NAVIGATION_TIMEOUT_SECS)) => {
                 // Hard timeout on navigation - close tab to abort CDP call
                 warn!(
-                    ray_id = %ray_id,
                     "Navigation hard timeout after {}s - closing tab to abort",
                     NAVIGATION_TIMEOUT_SECS
                 );
@@ -1301,13 +1294,13 @@ impl WorkerService {
         };
 
         if let Err(ref e) = navigation_result {
-            error!(ray_id = %ray_id, "Navigation failed: {} - will still try to get content", e);
+            error!("Navigation failed: {} - will still try to get content", e);
         }
 
         // Inject console logger and check headless markers (only if browser diagnostics enabled)
         // These are optional diagnostics that add overhead but help with debugging
         if self.config.scope.enable_browser_diagnostics && navigation_result.is_ok() {
-            debug!(ray_id = %ray_id, "Injecting console logger to capture JavaScript errors...");
+            debug!("Injecting console logger to capture JavaScript errors...");
             let inject_console_logger = || -> Result<(), anyhow::Error> {
                 tab.evaluate(
                     r#"
@@ -1345,13 +1338,13 @@ impl WorkerService {
             };
 
             if let Err(e) = inject_console_logger() {
-                warn!(ray_id = %ray_id, "Failed to inject console logger: {}", e);
+                warn!("Failed to inject console logger: {}", e);
             } else {
-                debug!(ray_id = %ray_id, "Console logger injected successfully");
+                debug!("Console logger injected successfully");
             }
 
             // Check for headless detection markers
-            info!(ray_id = %ray_id, "Checking for headless detection markers...");
+            info!("Checking for headless detection markers...");
             let check_headless = || -> Result<(), anyhow::Error> {
                 let result = tab.evaluate(
                     r#"
@@ -1376,14 +1369,14 @@ impl WorkerService {
 
                 if let Some(value) = result.value {
                     if let Some(json_str) = value.as_str() {
-                        info!(ray_id = %ray_id, "Headless detection markers: {}", json_str);
+                        info!("Headless detection markers: {}", json_str);
                     }
                 }
                 Ok(())
             };
 
             if let Err(e) = check_headless() {
-                warn!(ray_id = %ray_id, "Failed to check headless markers: {}", e);
+                warn!("Failed to check headless markers: {}", e);
             }
 
             // Uncomment to check proxy exit IP (adds ~1sec overhead per request)
@@ -1443,7 +1436,6 @@ impl WorkerService {
 
         // Log selector configuration
         info!(
-            ray_id = %ray_id,
             "Wait strategy config: strategy={},  wait_timeout={}ms, wait_selector={:?}, skip_selector={:?}",
             strategy_name,
             wait_timeout,
@@ -1462,12 +1454,11 @@ impl WorkerService {
             let cancellation_token = self.cancellation_token.clone();
             let wait_selector_for_closure = wait_selector_owned.clone();
             let skip_selector_for_closure = skip_selector_owned.clone();
-            let ray_id_for_closure = ray_id.to_string();
             // spawn_blocking runs on a separate thread, so the current tracing span
             // (opened in `scrape_page` and carried via `.instrument(span)`) is NOT active
             // there. Capture it and re-enter inside the closure so all wait-strategy logs
             // (target = browser_hive_common::wait_strategy) inherit the request context
-            // (url, context_id, wait_strategy, wait_timeout_ms, …).
+            // (ray_id, url, context_id, wait_strategy, wait_timeout_ms, …) from the span.
             let wait_span = tracing::Span::current();
 
             let wait_handle = tokio::task::spawn_blocking(move || {
@@ -1480,7 +1471,6 @@ impl WorkerService {
                     wait_sel_ref,
                     skip_sel_ref,
                     &cancellation_token,
-                    &ray_id_for_closure,
                 )
             });
 
@@ -1507,7 +1497,6 @@ impl WorkerService {
                 _ = tokio::time::sleep(Duration::from_millis(hard_timeout_ms)) => {
                     // Hard timeout - close tab to abort CDP call
                     warn!(
-                        ray_id = %ray_id,
                         "Wait strategy hard timeout after {}ms (internal timeout was {}ms) - closing tab to abort",
                         hard_timeout_ms, wait_timeout
                     );
@@ -1581,7 +1570,6 @@ impl WorkerService {
             _ = tokio::time::sleep(Duration::from_secs(GET_CONTENT_TIMEOUT_SECS)) => {
                 // Hard timeout on get_content - close tab to abort CDP call
                 warn!(
-                    ray_id = %ray_id,
                     "get_content hard timeout after {}s - closing tab to abort",
                     GET_CONTENT_TIMEOUT_SECS
                 );
@@ -1643,10 +1631,9 @@ impl WorkerService {
         if self.config.scope.session_mode == SessionMode::AlwaysNew {
             let browser_pool = self.browser_pool.read().await;
             browser_pool
-                .destroy_context(&context.metadata.id, ray_id)
+                .destroy_context(&context.metadata.id)
                 .await;
             info!(
-                ray_id = %ray_id,
                 "Early context destroy completed (AlwaysNew mode): {}",
                 context.metadata.id
             );
@@ -1659,12 +1646,12 @@ impl WorkerService {
             let remaining_time = total_timeout.saturating_sub(elapsed);
 
             if remaining_time > Duration::from_secs(MIN_TIME_FOR_DIAGNOSTICS_SECS) {
-                info!(ray_id = %ray_id, "Collecting browser diagnostics (remaining time: {:?})...", remaining_time);
+                info!("Collecting browser diagnostics (remaining time: {:?})...", remaining_time);
                 // Use remaining_time minus 1 second as safety margin
                 let diagnostics_timeout = remaining_time.saturating_sub(Duration::from_secs(1));
-                Self::collect_browser_diagnostics(tab.clone(), diagnostics_timeout, ray_id).await;
+                Self::collect_browser_diagnostics(tab.clone(), diagnostics_timeout).await;
             } else {
-                info!(ray_id = %ray_id, "Skipping browser diagnostics - not enough time remaining ({:?})", remaining_time);
+                info!("Skipping browser diagnostics - not enough time remaining ({:?})", remaining_time);
             }
         }
 
@@ -1735,7 +1722,6 @@ impl WorkerService {
         };
         if let Some(target_domain) = &redirect_target {
             debug!(
-                ray_id = %ray_id,
                 "Off-domain redirect detected: {} -> {} (registrable domain '{}')",
                 req.url, final_url, target_domain
             );
@@ -1877,7 +1863,7 @@ impl WorkerServiceTrait for WorkerService {
             }));
         }
 
-        info!(ray_id = %ray_id, "Received scraping request for URL: {}", req.url);
+        info!("Received scraping request for URL: {}", req.url);
 
         self.total_requests.fetch_add(1, Ordering::SeqCst);
         self.metrics
@@ -1926,7 +1912,7 @@ impl WorkerServiceTrait for WorkerService {
             // Session persistence (Reusable session mode only) - try to find existing context
             // Note: For existing sessions, we reuse the context's assigned proxy
             // (country_code in request is ignored for session continuation)
-            info!(ray_id = %ray_id, "Looking for existing context: {}", req.context_id);
+            info!("Looking for existing context: {}", req.context_id);
             match browser_pool_guard.find_context_by_id(&req.context_id).await {
                 Some(ctx) => ctx,
                 None => {
@@ -1990,7 +1976,6 @@ impl WorkerServiceTrait for WorkerService {
                 let hash = content_hash(&response.content);
 
                 info!(
-                    ray_id = %ray_id,
                     "Request OK: ScrapePageResponse {{ success: {}, status_code: {}, content_sha256: {}, content_length: {}, error_message: {:?}, error_code: {}, execution_time_ms: {}, context_id: {} }}",
                     response.success,
                     response.status_code,
@@ -2008,7 +1993,7 @@ impl WorkerServiceTrait for WorkerService {
                     .requests_failed
                     .with_label_values(&[&self.config.scope.name])
                     .inc();
-                error!(ray_id = %ray_id, "Request FAILED: {:?}", status);
+                error!("Request FAILED: {:?}", status);
             }
         }
 

@@ -49,7 +49,7 @@ struct SelectorCheckResult {
 ///
 /// Returns true if at least one element matching the selector is found.
 /// Returns an error if the JavaScript execution failed or returned unexpected format.
-fn check_selector_exists(tab: &Arc<Tab>, selector: &str, ray_id: &str) -> Result<bool> {
+fn check_selector_exists(tab: &Arc<Tab>, selector: &str) -> Result<bool> {
     // Use JavaScript to check if selector exists with proper error handling
     // This is more reliable than CDP's querySelector which can have timing issues
     let script = format!(
@@ -76,9 +76,9 @@ fn check_selector_exists(tab: &Arc<Tab>, selector: &str, ray_id: &str) -> Result
                 .map_err(|e| anyhow::anyhow!("Failed to parse selector check result: {}", e))?;
 
             if let Some(error) = &check_result.selector_search_error {
-                tracing::warn!(ray_id = %ray_id, "Selector '{}' search error: {}", selector, error);
+                tracing::warn!("Selector '{}' search error: {}", selector, error);
             } else if !check_result.is_selector_found {
-                tracing::debug!(ray_id = %ray_id, "Selector '{}' not found", selector);
+                tracing::debug!("Selector '{}' not found", selector);
             }
 
             return Ok(check_result.is_selector_found);
@@ -155,7 +155,6 @@ pub trait WaitStrategy: Send + Sync {
         wait_selector: Option<&str>,
         skip_selector: Option<&str>,
         cancellation_token: &CancellationToken,
-        ray_id: &str,
     ) -> Result<WaitResult>;
 
     /// Get the name of this strategy (for logging and identification)
@@ -196,7 +195,6 @@ impl WaitStrategy for NetworkIdleStrategy {
         wait_selector: Option<&str>,
         skip_selector: Option<&str>,
         cancellation_token: &CancellationToken,
-        ray_id: &str,
     ) -> Result<WaitResult> {
         use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
@@ -239,9 +237,8 @@ impl WaitStrategy for NetworkIdleStrategy {
 
             // Always check skip_selector first (highest priority)
             if let Some(selector) = skip_selector {
-                if check_selector_exists(tab, selector, ray_id)? {
+                if check_selector_exists(tab, selector)? {
                     tracing::info!(
-                        ray_id = %ray_id,
                         "Skip selector '{}' found after {:?}",
                         selector,
                         start.elapsed()
@@ -256,7 +253,7 @@ impl WaitStrategy for NetworkIdleStrategy {
                 if guard.0 {
                     match guard.1.as_ref().unwrap() {
                         Ok(_) => {
-                            tracing::debug!(ray_id = %ray_id, "Network idle reached after {:?}", start.elapsed());
+                            tracing::debug!("Network idle reached after {:?}", start.elapsed());
                             break; // Exit Phase 1, proceed to Phase 2
                         }
                         Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -274,7 +271,6 @@ impl WaitStrategy for NetworkIdleStrategy {
 
                     if status_u32 > 0 && EARLY_EXIT_STATUS_CODES.contains(&status_u32) {
                         tracing::info!(
-                            ray_id = %ray_id,
                             "Early exit: HTTP {} detected after {:?}",
                             status_u32,
                             start.elapsed()
@@ -289,12 +285,12 @@ impl WaitStrategy for NetworkIdleStrategy {
 
             // Check total timeout
             if start.elapsed() >= total_timeout {
-                tracing::warn!(ray_id = %ray_id, "Total timeout reached while waiting for network idle");
+                tracing::warn!("Total timeout reached while waiting for network idle");
 
                 // If wait_selector specified, perform final check
                 if let Some(selector) = wait_selector {
-                    if check_selector_exists(tab, selector, ray_id)? {
-                        tracing::info!(ray_id = %ray_id, "Wait selector '{}' found on final check", selector);
+                    if check_selector_exists(tab, selector)? {
+                        tracing::info!("Wait selector '{}' found on final check", selector);
                         return Ok(WaitResult::Success);
                     }
                     return Ok(WaitResult::WaitSelectorNotFound);
@@ -308,7 +304,6 @@ impl WaitStrategy for NetworkIdleStrategy {
             if remaining < poll_interval {
                 // Not enough time left for another sleep - check one more time and exit
                 tracing::debug!(
-                    ray_id = %ray_id,
                     "Skipping sleep - only {:?} remaining (poll_interval: {:?})",
                     remaining,
                     poll_interval
@@ -334,7 +329,6 @@ impl WaitStrategy for NetworkIdleStrategy {
         if max_ready_wait.as_millis() < 100 {
             // Less than 100ms remaining - skip ready check
             tracing::warn!(
-                ray_id = %ray_id,
                 "Skipping document ready check - only {:?} remaining until total timeout",
                 remaining_total
             );
@@ -390,20 +384,17 @@ impl WaitStrategy for NetworkIdleStrategy {
                                     match load_result.state.as_str() {
                                         "already-complete" => {
                                             tracing::debug!(
-                                                ray_id = %ray_id,
                                                 "Document was already complete when Phase 1.5 started"
                                             );
                                         }
                                         "load-complete" => {
                                             tracing::debug!(
-                                                ray_id = %ray_id,
                                                 "Document 'load' event fired after {}ms in Phase 1.5",
                                                 load_result.time_ms
                                             );
                                         }
                                         "timeout-interactive" => {
                                             tracing::warn!(
-                                                ray_id = %ray_id,
                                                 "Document still 'interactive' after {}ms - 'load' event never fired! Proceeding anyway",
                                                 load_result.time_ms
                                             );
@@ -426,7 +417,7 @@ impl WaitStrategy for NetworkIdleStrategy {
                                                 if let Ok(result) = tab.evaluate(script, false) {
                                                     if let Some(value) = result.value {
                                                         if let Some(json) = value.as_str() {
-                                                            tracing::warn!(ray_id = %ray_id, "Blocked resources diagnostics: {}", json);
+                                                            tracing::warn!("Blocked resources diagnostics: {}", json);
                                                         }
                                                     }
                                                 }
@@ -437,7 +428,6 @@ impl WaitStrategy for NetworkIdleStrategy {
                                         }
                                         _ => {
                                             tracing::warn!(
-                                                ray_id = %ray_id,
                                                 "Unknown load result state: '{}' - proceeding",
                                                 load_result.state
                                             );
@@ -446,7 +436,6 @@ impl WaitStrategy for NetworkIdleStrategy {
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        ray_id = %ray_id,
                                         "Failed to parse load result JSON '{}': {} - proceeding anyway",
                                         json_str,
                                         e
@@ -458,7 +447,6 @@ impl WaitStrategy for NetworkIdleStrategy {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        ray_id = %ray_id,
                         "Failed to execute load event listener: {} - proceeding anyway",
                         e
                     );
@@ -471,9 +459,8 @@ impl WaitStrategy for NetworkIdleStrategy {
         // a skip_selector rendered after network idle would never be detected when
         // wait_selector is absent (Phase 2 is skipped entirely in that case).
         if let Some(selector) = skip_selector {
-            if check_selector_exists(tab, selector, ray_id)? {
+            if check_selector_exists(tab, selector)? {
                 tracing::info!(
-                    ray_id = %ray_id,
                     "Skip selector '{}' found after document ready check ({:?})",
                     selector,
                     start.elapsed()
@@ -484,7 +471,7 @@ impl WaitStrategy for NetworkIdleStrategy {
 
         // After Phase 1.5, check if we exceeded total timeout
         if start.elapsed() >= total_timeout {
-            tracing::warn!(ray_id = %ray_id, "Total timeout exceeded after Phase 1.5 - skipping selector search");
+            tracing::warn!("Total timeout exceeded after Phase 1.5 - skipping selector search");
             // If wait_selector was specified, this is a failure; otherwise success
             return if wait_selector.is_some() {
                 Ok(WaitResult::WaitSelectorNotFound)
@@ -509,7 +496,6 @@ impl WaitStrategy for NetworkIdleStrategy {
             };
 
             tracing::info!(
-                ray_id = %ray_id,
                 "Searching for selector '{}' for {:?} (total elapsed: {:?})",
                 selector,
                 selector_timeout,
@@ -524,16 +510,15 @@ impl WaitStrategy for NetworkIdleStrategy {
 
                 // Check skip_selector
                 if let Some(skip_sel) = skip_selector {
-                    if check_selector_exists(tab, skip_sel, ray_id)? {
-                        tracing::info!(ray_id = %ray_id, "Skip selector '{}' found", skip_sel);
+                    if check_selector_exists(tab, skip_sel)? {
+                        tracing::info!("Skip selector '{}' found", skip_sel);
                         return Ok(WaitResult::SkipSelectorFound);
                     }
                 }
 
                 // Check wait_selector
-                if check_selector_exists(tab, selector, ray_id)? {
+                if check_selector_exists(tab, selector)? {
                     tracing::info!(
-                        ray_id = %ray_id,
                         "Wait selector '{}' found after {:?} (total: {:?})",
                         selector,
                         selector_start.elapsed(),
@@ -545,14 +530,13 @@ impl WaitStrategy for NetworkIdleStrategy {
                 // Check selector timeout
                 if selector_start.elapsed() >= selector_timeout {
                     tracing::warn!(
-                        ray_id = %ray_id,
                         "Selector search timeout reached after {:?}",
                         selector_start.elapsed()
                     );
 
                     // Final check before returning
-                    if check_selector_exists(tab, selector, ray_id)? {
-                        tracing::info!(ray_id = %ray_id, "Wait selector '{}' found on final check", selector);
+                    if check_selector_exists(tab, selector)? {
+                        tracing::info!("Wait selector '{}' found on final check", selector);
                         return Ok(WaitResult::Success);
                     }
 
@@ -562,8 +546,8 @@ impl WaitStrategy for NetworkIdleStrategy {
                 // Check total timeout (safety net)
                 if start.elapsed() >= total_timeout {
                     // Final check
-                    if check_selector_exists(tab, selector, ray_id)? {
-                        tracing::info!(ray_id = %ray_id, "Wait selector '{}' found on final timeout check", selector);
+                    if check_selector_exists(tab, selector)? {
+                        tracing::info!("Wait selector '{}' found on final timeout check", selector);
                         return Ok(WaitResult::Success);
                     }
                     return Ok(WaitResult::WaitSelectorNotFound);
@@ -574,7 +558,6 @@ impl WaitStrategy for NetworkIdleStrategy {
                 if remaining < poll_interval {
                     // Not enough time left for another sleep - check one more time and exit
                     tracing::debug!(
-                        ray_id = %ray_id,
                         "Skipping sleep in selector search - only {:?} remaining (poll_interval: {:?})",
                         remaining,
                         poll_interval
@@ -631,7 +614,6 @@ impl WaitStrategy for TimeoutStrategy {
         wait_selector: Option<&str>,
         skip_selector: Option<&str>,
         cancellation_token: &CancellationToken,
-        ray_id: &str,
     ) -> Result<WaitResult> {
         // First wait for initial navigation to complete
         tab.wait_until_navigated()?;
@@ -643,7 +625,6 @@ impl WaitStrategy for TimeoutStrategy {
         let timeout_duration = Duration::from_millis(effective_timeout(timeout_ms) as u64);
 
         tracing::debug!(
-            ray_id = %ray_id,
             "Timeout strategy: waiting {:?}, wait_selector={:?}, skip_selector={:?}",
             timeout_duration,
             wait_selector,
@@ -662,9 +643,8 @@ impl WaitStrategy for TimeoutStrategy {
 
             // Always check skip_selector first (highest priority)
             if let Some(selector) = skip_selector {
-                if check_selector_exists(tab, selector, ray_id)? {
+                if check_selector_exists(tab, selector)? {
                     tracing::info!(
-                        ray_id = %ray_id,
                         "Skip selector '{}' found after {:?}",
                         selector,
                         start.elapsed()
@@ -675,10 +655,9 @@ impl WaitStrategy for TimeoutStrategy {
 
             // Check wait_selector
             if let Some(selector) = wait_selector {
-                if !wait_selector_seen && check_selector_exists(tab, selector, ray_id)? {
+                if !wait_selector_seen && check_selector_exists(tab, selector)? {
                     wait_selector_seen = true;
                     tracing::info!(
-                        ray_id = %ray_id,
                         "Wait selector '{}' found after {:?}",
                         selector,
                         start.elapsed()
@@ -690,7 +669,6 @@ impl WaitStrategy for TimeoutStrategy {
                     }
 
                     tracing::debug!(
-                        ray_id = %ray_id,
                         "skip_selector is set - continuing to poll until timeout before returning success"
                     );
                 }
@@ -698,12 +676,12 @@ impl WaitStrategy for TimeoutStrategy {
 
             // Check if timeout period has elapsed
             if start.elapsed() >= timeout_duration {
-                tracing::info!(ray_id = %ray_id, "Timeout reached after {:?}", start.elapsed());
+                tracing::info!("Timeout reached after {:?}", start.elapsed());
 
                 // Final check before returning
                 if let Some(selector) = wait_selector {
-                    if wait_selector_seen || check_selector_exists(tab, selector, ray_id)? {
-                        tracing::info!(ray_id = %ray_id, "Wait selector '{}' found on final check", selector);
+                    if wait_selector_seen || check_selector_exists(tab, selector)? {
+                        tracing::info!("Wait selector '{}' found on final check", selector);
                         return Ok(WaitResult::Success);
                     }
                     return Ok(WaitResult::WaitSelectorNotFound);

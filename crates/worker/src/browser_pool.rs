@@ -277,7 +277,7 @@ impl BrowserPool {
         let default_params = ProxyParams::default();
 
         for _ in 0..self.scope_config.min_contexts {
-            let context = self.create_new_context("startup", &default_params).await?;
+            let context = self.create_new_context(&default_params).await?;
             contexts.push(Arc::new(context));
         }
 
@@ -300,7 +300,6 @@ impl BrowserPool {
 
     async fn create_new_context(
         &self,
-        ray_id: &str,
         proxy_params: &ProxyParams,
     ) -> Result<BrowserContext> {
         let start_time = std::time::Instant::now();
@@ -314,7 +313,6 @@ impl BrowserPool {
                 .get_context_proxy_with_params(&metadata.id.to_string(), proxy_params)
             {
                 info!(
-                    ray_id = %ray_id,
                     "Assigning context-specific proxy to context {} (country_code: {:?})",
                     metadata.id,
                     proxy_params.country_code
@@ -340,7 +338,6 @@ impl BrowserPool {
                 })?;
 
                 info!(
-                    ray_id = %ray_id,
                     "Created ISOLATED CDP context {} with tab",
                     context_id
                 );
@@ -362,14 +359,12 @@ impl BrowserPool {
         for middleware in &self.tab_init_middlewares {
             if let Err(e) = middleware.apply(&new_tab) {
                 warn!(
-                    ray_id = %ray_id,
                     "Failed to apply tab init middleware '{}': {}",
                     middleware.name(),
                     e
                 );
             } else {
                 tracing::debug!(
-                    ray_id = %ray_id,
                     "Successfully applied tab init middleware '{}'",
                     middleware.name()
                 );
@@ -384,7 +379,6 @@ impl BrowserPool {
         };
 
         info!(
-            ray_id = %ray_id,
             "Created browser context ({}) for metadata id: {} in {}ms",
             isolation_mode,
             metadata.id,
@@ -660,11 +654,9 @@ impl BrowserPool {
     /// 3. If at max_contexts limit, return None (resource exhausted)
     ///
     /// # Parameters
-    /// * `ray_id` - Request tracing ID for logging
     /// * `proxy_params` - Proxy parameters (country_code, etc.) for context creation
     pub async fn get_or_create_context(
         &self,
-        ray_id: &str,
         proxy_params: &ProxyParams,
     ) -> Result<Option<Arc<BrowserContext>>> {
         // If request has proxy routing overrides (e.g. country_code), we must create
@@ -673,12 +665,11 @@ impl BrowserPool {
         if !proxy_params.requires_dedicated_context() {
             // No routing overrides - try to reuse an idle context
             if let Some(context) = self.find_least_busy_context().await {
-                info!(ray_id = %ray_id, "Reusing idle context: {} (total_requests: {})", context.metadata.id, context.metadata.total_requests.load(std::sync::atomic::Ordering::SeqCst));
+                info!("Reusing idle context: {} (total_requests: {})", context.metadata.id, context.metadata.total_requests.load(std::sync::atomic::Ordering::SeqCst));
                 return Ok(Some(context));
             }
         } else {
             debug!(
-                ray_id = %ray_id,
                 "Request has proxy routing overrides (country_code={:?}) - creating dedicated context",
                 proxy_params.country_code
             );
@@ -703,14 +694,13 @@ impl BrowserPool {
         // Check if we're under the limit
         if contexts.len() < self.scope_config.max_contexts as usize {
             info!(
-                ray_id = %ray_id,
                 "Creating new context on-demand ({}/{}){}",
                 contexts.len() + 1,
                 self.scope_config.max_contexts,
                 if proxy_params.requires_dedicated_context() { " [dedicated]" } else { "" }
             );
 
-            let context = self.create_new_context(ray_id, proxy_params).await?;
+            let context = self.create_new_context(proxy_params).await?;
             let context_arc = Arc::new(context);
             contexts.push(context_arc.clone());
 
@@ -718,7 +708,6 @@ impl BrowserPool {
         } else {
             // At maximum capacity
             info!(
-                ray_id = %ray_id,
                 "Cannot create new context - at max capacity ({}/{})",
                 contexts.len(),
                 self.scope_config.max_contexts
@@ -733,7 +722,6 @@ impl BrowserPool {
     /// without session_id should get a fresh context.
     ///
     /// # Parameters
-    /// * `ray_id` - Request tracing ID for logging
     /// * `proxy_params` - Proxy parameters (country_code, etc.) for context creation
     ///
     /// Returns:
@@ -742,7 +730,6 @@ impl BrowserPool {
     /// - Err - Failed to create context
     pub async fn create_always_new_context(
         &self,
-        ray_id: &str,
         proxy_params: &ProxyParams,
     ) -> Result<Option<Arc<BrowserContext>>> {
         let mut contexts = self.contexts.write().await;
@@ -752,7 +739,6 @@ impl BrowserPool {
         let purged = reclaim_leaked_always_new_contexts(&mut contexts);
         if purged > 0 {
             warn!(
-                ray_id = %ray_id,
                 "Purged {} leaked idle context(s) in AlwaysNew mode before creating a new one",
                 purged
             );
@@ -761,14 +747,13 @@ impl BrowserPool {
         // Check if we're under the limit
         if contexts.len() < self.scope_config.max_contexts as usize {
             info!(
-                ray_id = %ray_id,
                 "Creating new context (AlwaysNew mode) ({}/{}) with proxy params: country_code={:?}",
                 contexts.len() + 1,
                 self.scope_config.max_contexts,
                 proxy_params.country_code
             );
 
-            let context = self.create_new_context(ray_id, proxy_params).await?;
+            let context = self.create_new_context(proxy_params).await?;
 
             // Pre-mark as busy while still holding the write lock, so the context is never
             // visible to the purge above as an idle (and therefore collectable) context.
@@ -782,7 +767,6 @@ impl BrowserPool {
         } else {
             // At maximum capacity
             info!(
-                ray_id = %ray_id,
                 "Cannot create new context (AlwaysNew mode) - at max capacity ({}/{})",
                 contexts.len(),
                 self.scope_config.max_contexts
@@ -799,7 +783,7 @@ impl BrowserPool {
     /// Note: For isolated contexts, Chrome will automatically clean up the
     /// CDP BrowserContext when all tabs in it are closed (which happens when
     /// the BrowserContext is dropped).
-    pub async fn destroy_context(&self, context_id: &uuid::Uuid, ray_id: &str) {
+    pub async fn destroy_context(&self, context_id: &uuid::Uuid) {
         let mut contexts = self.contexts.write().await;
         let initial_len = contexts.len();
 
@@ -815,7 +799,6 @@ impl BrowserPool {
         if contexts.len() < initial_len {
             let isolation_info = if was_isolated { " (isolated)" } else { "" };
             info!(
-                ray_id = %ray_id,
                 "Destroyed context (AlwaysNew mode) {}{} ({} contexts remaining)",
                 context_id,
                 isolation_info,
@@ -879,14 +862,12 @@ impl BrowserPool {
     ///
     /// # Parameters
     /// * `cdp_context_id` - The CDP BrowserContext ID to create the tab in
-    /// * `ray_id` - Request tracing ID for logging
     ///
     /// # Returns
     /// * `Ok(Arc<Tab>)` - The newly created tab
     /// * `Err` - Failed to create tab (context may be invalid)
-    pub fn create_tab_in_context(&self, cdp_context_id: &str, ray_id: &str) -> Result<Arc<Tab>> {
+    pub fn create_tab_in_context(&self, cdp_context_id: &str) -> Result<Arc<Tab>> {
         info!(
-            ray_id = %ray_id,
             "Recreating tab in existing CDP context: {}",
             cdp_context_id
         );
@@ -917,7 +898,6 @@ impl BrowserPool {
         for middleware in &self.tab_init_middlewares {
             if let Err(e) = middleware.apply(&new_tab) {
                 warn!(
-                    ray_id = %ray_id,
                     "Failed to apply tab init middleware '{}' to recreated tab: {}",
                     middleware.name(),
                     e
@@ -926,7 +906,6 @@ impl BrowserPool {
         }
 
         info!(
-            ray_id = %ray_id,
             "Successfully recreated tab in CDP context: {}",
             cdp_context_id
         );
@@ -939,14 +918,12 @@ impl BrowserPool {
     /// This is used to recreate a tab when the previous one died in shared mode.
     ///
     /// # Parameters
-    /// * `ray_id` - Request tracing ID for logging
     ///
     /// # Returns
     /// * `Ok(Arc<Tab>)` - The newly created tab
     /// * `Err` - Failed to create tab
-    pub fn create_tab_shared(&self, ray_id: &str) -> Result<Arc<Tab>> {
+    pub fn create_tab_shared(&self) -> Result<Arc<Tab>> {
         info!(
-            ray_id = %ray_id,
             "Recreating tab in shared browser context"
         );
 
@@ -959,7 +936,6 @@ impl BrowserPool {
         for middleware in &self.tab_init_middlewares {
             if let Err(e) = middleware.apply(&new_tab) {
                 warn!(
-                    ray_id = %ray_id,
                     "Failed to apply tab init middleware '{}' to recreated tab: {}",
                     middleware.name(),
                     e
@@ -968,7 +944,6 @@ impl BrowserPool {
         }
 
         info!(
-            ray_id = %ray_id,
             "Successfully recreated tab in shared context"
         );
 
