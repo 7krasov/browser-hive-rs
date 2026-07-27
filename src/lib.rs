@@ -90,8 +90,8 @@ pub mod prelude {
 
     // Configuration types
     pub use crate::common::{
-        ContextIsolation, ContextLifecycleConfig, CoordinatorConfig, RotationStrategy, ScopeConfig,
-        SessionMode, WorkerConfig,
+        ContextIsolation, ContextLifecycleConfig, CoordinatorConfig, DiagnosticsConfig,
+        DiagnosticsMode, RotationStrategy, ScopeConfig, SessionMode, WorkerConfig,
     };
 
     // Worker functionality
