@@ -1,4 +1,5 @@
 mod browser_pool;
+mod diagnostics;
 mod metrics;
 mod service;
 
@@ -63,7 +64,7 @@ pub const LIBRARY_VERSION_BANNER: &str =
 ///             session_mode: SessionMode::ReusablePreinit, // Pre-initialize contexts on startup
 ///             headless: true,
 ///             lifecycle: ContextLifecycleConfig::default(),
-///             enable_browser_diagnostics: false, // Disable for faster response
+///             diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
 ///             binary_params_middlewares: vec![],
 ///             tab_init_middlewares: vec![],
 ///             context_isolation: ContextIsolation::Isolated,

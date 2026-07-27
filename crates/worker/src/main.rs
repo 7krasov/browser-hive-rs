@@ -65,10 +65,10 @@ fn load_config_from_env(
         .and_then(|s| s.parse().ok())
         .unwrap_or(true);
 
-    let enable_browser_diagnostics = env::var("WORKER_ENABLE_BROWSER_DIAGNOSTICS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(false); // Default: disabled for faster response
+    // Browser diagnostics: all knobs in one call so downstream binaries, which have their own
+    // main.rs, do not have to re-implement the parsing. Disabled unless
+    // WORKER_ENABLE_BROWSER_DIAGNOSTICS is set.
+    let diagnostics = browser_hive_common::DiagnosticsConfig::from_env();
 
     // Context isolation mode: "shared" or "isolated"
     // Default is defined by ContextIsolation's #[default] attribute (Isolated)
@@ -115,7 +115,7 @@ fn load_config_from_env(
             rotation_strategy: browser_hive_common::RotationStrategy::Hybrid,
         },
         browser_path,
-        enable_browser_diagnostics,
+        diagnostics,
         binary_params_middlewares,
         tab_init_middlewares,
         context_isolation,

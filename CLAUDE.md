@@ -162,6 +162,42 @@ Browser Hive uses a middleware system to customize browser behavior without modi
 
 See `MIDDLEWARE_EXAMPLES.md` for detailed usage examples and production patterns.
 
+### Browser Diagnostics
+
+The returned `content` shows *what* a page ended up as, never *why*. A page whose JS bundle was blocked by the proxy and a page whose JS threw are indistinguishable in the HTML — both return an unrendered template. Diagnostics (`worker/src/diagnostics.rs`, config in `common/src/diagnostics.rs`) capture the difference.
+
+**Signals** (all appended to a bounded in-memory buffer — nothing is logged per event):
+
+| Signal | CDP source | Extra cost |
+|---|---|---|
+| Uncaught JS errors, HTTP 4xx/5xx on sub-resources | `Log.entryAdded` | `Log.enable` |
+| Failed/blocked/aborted loads, with URL | `Network.loadingFailed` + `Network.requestWillBeSent` | none — `Network` is already enabled for the response observer |
+| `console.*`, uncaught exceptions with stack | `Runtime.consoleAPICalled`, `Runtime.exceptionThrown` | `Runtime.enable` — **opt-in**, see the warning below |
+| Final page state (readyState, node counts, title) | one `Runtime.evaluate` | one round-trip, bounded by `PAGE_STATE_BUDGET` (3s) |
+
+**Two independent gates.** *Capture* is decided **before navigation** (listeners must exist before the page loads, which is when the interesting failures happen), so it can only use configuration: `enabled` + `mode` + `domains`. *Logging* is decided **after** the request, from the outcome + entry caps + rate limit — this is what actually controls log volume, since almost all requests succeed.
+
+**Env variables** (parsed by `DiagnosticsConfig::from_env()`, which downstream workers with their own `main.rs` should call rather than re-implementing):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WORKER_ENABLE_BROWSER_DIAGNOSTICS` | `false` | master switch |
+| `WORKER_DIAGNOSTICS_MODE` | `on_error` | `off` / `on_error` / `always` |
+| `WORKER_DIAGNOSTICS_DOMAINS` | empty = all | comma-separated; matches the host **and its subdomains** on a label boundary (`egorealestate.com` matches `x.ep.egorealestate.com` but not `notegorealestate.com`) |
+| `WORKER_DIAGNOSTICS_MAX_ENTRIES` | `20` | cap per category; duplicates collapse to `msg (xN)` without consuming the cap, overflow is counted |
+| `WORKER_DIAGNOSTICS_MAX_PER_MINUTE` | `10` | requests per minute that may emit; `0` = unlimited; suppressed count is reported with the next line |
+| `WORKER_DIAGNOSTICS_CONSOLE` | `false` | enable the `Runtime` domain for `console.*` capture |
+
+⚠️ **`WORKER_DIAGNOSTICS_CONSOLE` is off by default on purpose**: enabling the CDP `Runtime` domain is a known anti-bot fingerprinting vector (vendors detect that the browser serialises exception objects for a listening debugger). Turning it on fleet-wide can raise the block rate and confound the very problem being debugged. Pair it with `WORKER_DIAGNOSTICS_DOMAINS`. Without it, JS errors and failed loads are still captured via `Log`/`Network`, which carry no such signal.
+
+**`on_error` semantics**: a found `skip_selector` counts as **success** — the client asked for that check, so it is an expected outcome, not a malfunction. Failures that do emit: navigation errors, `wait_selector` not found, off-domain redirects, hard timeouts.
+
+**Emission is RAII** (`DiagnosticsSession::drop`), not an explicit call, so the hard-timeout / cancellation / panic paths — which `return` early from the handler and are the most interesting failures — are covered without a call at every return. The default outcome is therefore "failed"; the success path calls `mark_success()`.
+
+⚠️ **Domains stay enabled on a reused tab.** The event *listener* is removed on drop (`EventListenerGuard`), but `Log.enable` / `Runtime.enable` are not undone — removal must not make a CDP call, since the tab may already be gone. In `AlwaysNew` this is moot (the context dies with the request). In `reusable`/`reusable_preinit`, once a tab has served one diagnostics-active request, those domains remain enabled for its later requests to other domains — which for `Runtime` means carrying the fingerprinting surface beyond the configured domain list. Prefer `AlwaysNew` scopes for `WORKER_DIAGNOSTICS_CONSOLE`.
+
+**Budget**: the page-state snapshot uses its own `PAGE_STATE_BUDGET` constant rather than "whatever is left of the wait timeout". The wait strategy may consume the entire request budget, so a leftover-based budget is zero exactly when the request timed out — the case diagnostics exist for. It is taken **before** the AlwaysNew early destroy, which tears down the CDP context.
+
 ### Context Lifecycle Monitoring
 
 The browser pool starts a background task (via `BrowserPool::start_lifecycle_monitor` in `worker/src/browser_pool.rs`) that periodically checks contexts against lifecycle thresholds and recycles them when needed. Contexts are only recycled when no active pages are running.
@@ -262,7 +298,7 @@ The coordinator supports two deployment modes (selected via `COORDINATOR_MODE`):
 **Optional worker variables**:
 - `WORKER_MIN_CONTEXTS` - Minimum browser contexts pre-created on startup, used by `reusable_preinit` mode (default: `WORKER_MAX_CONTEXTS`)
 - `WORKER_SESSION_MODE` - Session management mode (see table below)
-- `WORKER_ENABLE_BROWSER_DIAGNOSTICS` - Enable console logs and page diagnostics collection (default: `false`, disable for faster response)
+- `WORKER_ENABLE_BROWSER_DIAGNOSTICS` - Master switch for browser diagnostics (default: `false`). See "Browser Diagnostics" below for the other `WORKER_DIAGNOSTICS_*` knobs
 - `WORKER_HEADLESS` - Run browser in headless mode (default: `true`)
 - `WORKER_MAX_IDLE_TIME_SECS` - Max idle time before context recycling (default: 300)
 - `WORKER_CONTEXT_ISOLATION` - Context isolation mode: `shared` or `isolated` (default: `isolated`)

@@ -262,7 +262,7 @@ fn create_scope_config() -> ScopeConfig {
         headless,
         lifecycle: Default::default(),
         browser_path: None, // Auto-detect Chrome/Chromium; Some("/usr/bin/brave-browser".into()) for Brave
-        enable_browser_diagnostics: false,
+        diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
         binary_params_middlewares,
         tab_init_middlewares,
         context_isolation: ContextIsolation::Isolated,

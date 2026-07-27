@@ -44,7 +44,7 @@
 //!             session_mode: SessionMode::Reusable, // Reusable contexts (recycled by lifecycle)
 //!             headless: true,
 //!             lifecycle: Default::default(),
-//!             enable_browser_diagnostics: false, // Disable for faster response
+//!             diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
 //!             binary_params_middlewares: vec![],
 //!             tab_init_middlewares: vec![],
 //!             context_isolation: ContextIsolation::Isolated, // Each context has isolated cookies/storage

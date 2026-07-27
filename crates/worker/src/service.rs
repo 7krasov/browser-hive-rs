@@ -1,15 +1,12 @@
 use crate::browser_pool::{BrowserContext, BrowserPool};
+use crate::diagnostics::DiagnosticsLimiter;
 use crate::metrics::Metrics;
 use anyhow::Result;
 use browser_hive_common::{
     effective_timeout, utils, validate_timeout, ProxyParams, SessionMode, WaitResult,
-    WaitStrategyRegistry, WorkerConfig, DEFAULT_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS,
+    WaitStrategyRegistry, WorkerConfig, MAX_WAIT_TIMEOUT_MS,
 };
 use std::time::Duration;
-
-/// Minimum time (in seconds) required to run browser diagnostics
-/// If remaining time is less than this, diagnostics are skipped to ensure timely response
-const MIN_TIME_FOR_DIAGNOSTICS_SECS: u64 = 2;
 
 /// Hard timeout for get_content operation (seconds)
 /// If Chrome hangs during content retrieval, we bail out after this time
@@ -41,8 +38,16 @@ use tracing::{debug, error, info, warn, Instrument};
 /// accumulation on the shared tab. Removal only touches the tab's in-memory
 /// listener vector (no CDP call), so it is safe even if the tab's CDP session
 /// is already gone (e.g. a timeout/cancel closed it).
-struct EventListenerGuard {
+pub(crate) struct EventListenerGuard {
     remove: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl EventListenerGuard {
+    pub(crate) fn new(remove: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            remove: Some(Box::new(remove)),
+        }
+    }
 }
 
 impl Drop for EventListenerGuard {
@@ -269,6 +274,8 @@ pub struct WorkerService {
     wait_strategy_registry: WaitStrategyRegistry,
     cancellation_token: tokio_cancellation_ext::CancellationToken,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Worker-wide cap on how often diagnostics may be logged (see `diagnostics` module).
+    diagnostics_limiter: Arc<DiagnosticsLimiter>,
 }
 
 impl WorkerService {
@@ -284,6 +291,13 @@ impl WorkerService {
 
         let browser_pool = BrowserPool::new(config.scope.clone()).await?;
 
+        if config.scope.diagnostics.enabled {
+            info!("Browser diagnostics: {:?}", config.scope.diagnostics);
+        }
+        let diagnostics_limiter = Arc::new(DiagnosticsLimiter::new(
+            config.scope.diagnostics.max_per_minute,
+        ));
+
         Ok(Self {
             browser_pool: Arc::new(RwLock::new(browser_pool)),
             config,
@@ -294,6 +308,7 @@ impl WorkerService {
             wait_strategy_registry: WaitStrategyRegistry::new(),
             cancellation_token,
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            diagnostics_limiter,
         })
     }
 
@@ -546,119 +561,6 @@ impl WorkerService {
                 }
             }
         }
-    }
-
-    /// Collect browser diagnostics (console logs, page info) with timeout protection.
-    ///
-    /// This method runs diagnostics in a separate blocking task with a timeout to prevent
-    /// blocking the response. If diagnostics take too long, they are abandoned (but may
-    /// continue running in the background).
-    async fn collect_browser_diagnostics(tab: Arc<headless_chrome::Tab>, timeout: Duration) {
-        // spawn_blocking runs on a separate thread, so the current request span does not
-        // propagate there. Capture and re-enter it so diagnostics logs inherit the request
-        // context (ray_id, url, …) from the span.
-        let diag_span = tracing::Span::current();
-
-        let diagnostics_result = tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || {
-                let _span_guard = diag_span.enter();
-                Self::run_diagnostics_sync(&tab);
-            }),
-        )
-        .await;
-
-        match diagnostics_result {
-            Ok(Ok(())) => {
-                info!("Browser diagnostics completed successfully");
-            }
-            Ok(Err(e)) => {
-                warn!("Browser diagnostics task failed: {}", e);
-            }
-            Err(_) => {
-                warn!("Browser diagnostics timed out after {:?} - skipping to return response faster", timeout);
-            }
-        }
-    }
-
-    /// Synchronous diagnostics collection (runs in blocking task).
-    fn run_diagnostics_sync(tab: &headless_chrome::Tab) {
-        // Collect console logs
-        if let Err(e) = Self::collect_console_logs_sync(tab) {
-            warn!("Failed to collect console logs: {}", e);
-        }
-
-        // Collect page diagnostics
-        if let Err(e) = Self::collect_page_diagnostics_sync(tab) {
-            warn!("Failed to collect page diagnostics: {}", e);
-        }
-    }
-
-    /// Collect console logs from the injected logger.
-    fn collect_console_logs_sync(tab: &headless_chrome::Tab) -> Result<()> {
-        let result = tab.evaluate(
-            r#"JSON.stringify(window.__browserHiveConsoleLogger || { errors: [], warnings: [], logs: [] })"#,
-            false,
-        )?;
-
-        if let Some(value) = result.value {
-            if let Some(json_str) = value.as_str() {
-                #[derive(serde::Deserialize)]
-                struct ConsoleLog {
-                    errors: Vec<String>,
-                    warnings: Vec<String>,
-                    logs: Vec<String>,
-                }
-
-                if let Ok(console_log) = serde_json::from_str::<ConsoleLog>(json_str) {
-                    debug!(
-                        "Console logs collected: {} errors, {} warnings, {} logs",
-                        console_log.errors.len(),
-                        console_log.warnings.len(),
-                        console_log.logs.len()
-                    );
-
-                    if !console_log.errors.is_empty() {
-                        warn!("Browser console errors: {:?}", console_log.errors);
-                    }
-                    if !console_log.warnings.is_empty() {
-                        debug!("Browser console warnings: {:?}", console_log.warnings);
-                    }
-                    if !console_log.logs.is_empty() {
-                        let preview: Vec<_> = console_log.logs.iter().take(10).collect();
-                        debug!(
-                            "Browser console.log messages (first 10 of {}): {:?}",
-                            console_log.logs.len(),
-                            preview
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Collect page diagnostics (document state, element counts, etc.).
-    fn collect_page_diagnostics_sync(tab: &headless_chrome::Tab) -> Result<()> {
-        let result = tab.evaluate(
-            r#"JSON.stringify({
-                documentReady: document.readyState,
-                scriptsCount: document.getElementsByTagName('script').length,
-                hasBody: !!document.body,
-                bodyChildrenCount: document.body ? document.body.children.length : 0,
-                htmlLength: document.documentElement.outerHTML.length,
-                title: document.title || "(no title)",
-                url: document.URL
-            })"#,
-            false,
-        )?;
-
-        if let Some(value) = result.value {
-            if let Some(json_str) = value.as_str() {
-                debug!("Page diagnostics: {}", json_str);
-            }
-        }
-        Ok(())
     }
 
     async fn scrape_page_internal(
@@ -1207,11 +1109,9 @@ impl WorkerService {
                     match tab.add_event_listener(listener) {
                         Ok(weak) => {
                             let tab_for_remove = tab.clone();
-                            Some(EventListenerGuard {
-                                remove: Some(Box::new(move || {
-                                    let _ = tab_for_remove.remove_event_listener(&weak);
-                                })),
-                            })
+                            Some(EventListenerGuard::new(move || {
+                                let _ = tab_for_remove.remove_event_listener(&weak);
+                            }))
                         }
                         Err(e) => {
                             debug!("Failed to add response header listener: {}", e);
@@ -1221,6 +1121,21 @@ impl WorkerService {
                 }
             }
         };
+
+        // Start diagnostics capture BEFORE navigating: the failures worth explaining (blocked
+        // bundles, JS that throws during load) all happen while the page loads, so a listener
+        // registered afterwards sees nothing. Returns None when diagnostics are inactive for
+        // this request, in which case no CDP domain is touched.
+        //
+        // The session emits on drop, which is what covers the early returns below (hard
+        // timeouts, cancellation) without a call at every `return`. Its default outcome is
+        // "failed"; the success path calls mark_success() further down.
+        let mut diagnostics = crate::diagnostics::start_capture(
+            &tab,
+            &self.config.scope.diagnostics,
+            &self.diagnostics_limiter,
+            &req.url,
+        );
 
         // Navigate to URL (reusing existing tab!)
         // NOTE: Navigation errors are NOT critical - we still try to get content (chrome error page)
@@ -1297,54 +1212,10 @@ impl WorkerService {
             error!("Navigation failed: {} - will still try to get content", e);
         }
 
-        // Inject console logger and check headless markers (only if browser diagnostics enabled)
-        // These are optional diagnostics that add overhead but help with debugging
-        if self.config.scope.enable_browser_diagnostics && navigation_result.is_ok() {
-            debug!("Injecting console logger to capture JavaScript errors...");
-            let inject_console_logger = || -> Result<(), anyhow::Error> {
-                tab.evaluate(
-                    r#"
-                    (function() {
-                        if (window.__browserHiveConsoleLogger) return;
-                        window.__browserHiveConsoleLogger = {
-                            errors: [],
-                            warnings: [],
-                            logs: []
-                        };
-
-                        const originalError = console.error;
-                        const originalWarn = console.warn;
-                        const originalLog = console.log;
-
-                        console.error = function(...args) {
-                            window.__browserHiveConsoleLogger.errors.push(args.map(a => String(a)).join(' '));
-                            originalError.apply(console, args);
-                        };
-
-                        console.warn = function(...args) {
-                            window.__browserHiveConsoleLogger.warnings.push(args.map(a => String(a)).join(' '));
-                            originalWarn.apply(console, args);
-                        };
-
-                        console.log = function(...args) {
-                            window.__browserHiveConsoleLogger.logs.push(args.map(a => String(a)).join(' '));
-                            originalLog.apply(console, args);
-                        };
-                    })()
-                    "#,
-                    false,
-                )?;
-                Ok(())
-            };
-
-            if let Err(e) = inject_console_logger() {
-                warn!("Failed to inject console logger: {}", e);
-            } else {
-                debug!("Console logger injected successfully");
-            }
-
-            // Check for headless detection markers
-            info!("Checking for headless detection markers...");
+        // Headless-detection markers: a one-off snapshot of the stealth-relevant navigator
+        // surface. Gated on the diagnostics session so it inherits the same domain filter and
+        // never costs anything on a normal request.
+        if diagnostics.is_some() && navigation_result.is_ok() {
             let check_headless = || -> Result<(), anyhow::Error> {
                 let result = tab.evaluate(
                     r#"
@@ -1369,7 +1240,7 @@ impl WorkerService {
 
                 if let Some(value) = result.value {
                     if let Some(json_str) = value.as_str() {
-                        info!("Headless detection markers: {}", json_str);
+                        info!("Diagnostics/headless markers: {}", json_str);
                     }
                 }
                 Ok(())
@@ -1625,34 +1496,28 @@ impl WorkerService {
             }
         };
 
+        // Page-state snapshot, while the tab is still alive: in AlwaysNew mode the early destroy
+        // below tears down the CDP context, after which evaluating anything on the tab fails.
+        // Bounded by PAGE_STATE_BUDGET, independent of how much of the wait timeout was spent —
+        // a leftover-based budget would be zero exactly on the timeouts worth diagnosing.
+        if diagnostics.is_some() && navigation_result.is_ok() {
+            if let Some(state) = crate::diagnostics::capture_page_state(tab.clone()).await {
+                if let Some(session) = diagnostics.as_ref() {
+                    session.set_page_state(state);
+                }
+            }
+        }
+
         // EARLY DESTROY: In AlwaysNew mode, destroy context immediately after getting content
         // This frees the slot for the next request BEFORE we spend time on diagnostics/logging
         // Critical for high-throughput scenarios where max_contexts=1
         if self.config.scope.session_mode == SessionMode::AlwaysNew {
             let browser_pool = self.browser_pool.read().await;
-            browser_pool
-                .destroy_context(&context.metadata.id)
-                .await;
+            browser_pool.destroy_context(&context.metadata.id).await;
             info!(
                 "Early context destroy completed (AlwaysNew mode): {}",
                 context.metadata.id
             );
-        }
-
-        // Collect browser diagnostics (optional, with timeout protection)
-        if self.config.scope.enable_browser_diagnostics && navigation_result.is_ok() {
-            let total_timeout = Duration::from_millis(DEFAULT_WAIT_TIMEOUT_MS as u64);
-            let elapsed = start_time.elapsed();
-            let remaining_time = total_timeout.saturating_sub(elapsed);
-
-            if remaining_time > Duration::from_secs(MIN_TIME_FOR_DIAGNOSTICS_SECS) {
-                info!("Collecting browser diagnostics (remaining time: {:?})...", remaining_time);
-                // Use remaining_time minus 1 second as safety margin
-                let diagnostics_timeout = remaining_time.saturating_sub(Duration::from_secs(1));
-                Self::collect_browser_diagnostics(tab.clone(), diagnostics_timeout).await;
-            } else {
-                info!("Skipping browser diagnostics - not enough time remaining ({:?})", remaining_time);
-            }
         }
 
         // DO NOT close tab - keep it for session reuse!
@@ -1773,6 +1638,15 @@ impl WorkerService {
                 ),
             }
         };
+
+        // Tell the diagnostics session how this request ended, so `on_error` mode can decide
+        // whether to log. A found skip_selector counts as success: the client asked for that
+        // check, so it is an expected outcome rather than a malfunction to explain.
+        if let Some(session) = diagnostics.as_mut() {
+            if success || error_code == ErrorCode::SkipSelectorFound {
+                session.mark_success();
+            }
+        }
 
         // For AlwaysNew mode, don't return context_id since it will be destroyed
         // and cannot be reused. This prevents coordinator from caching invalid session IDs.
