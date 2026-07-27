@@ -80,6 +80,13 @@ message ScrapePageResponse {
   // HTTP response headers of the MAIN document (the top-level navigation to `url`),
   // not sub-resources or iframes. Forwarded from the worker unchanged. Empty when
   // unavailable (capture disabled/failed, or an error path). See RESPONSE_OBSERVERS.md.
+  //
+  // WARNING: these headers describe the wire response, NOT the `content` field above.
+  // Do not rely on `content-length`/`content-encoding` here: `content-length` is the
+  // size of the COMPRESSED body (and is often absent on HTTP/2, HTTP/3 and chunked
+  // responses), `content-encoding` reports what the server sent before Chrome
+  // decompressed it, while `content` is post-JavaScript outerHTML. A mismatch between
+  // `content-length` and the size of `content` is expected, not a truncated response.
   map<string, string> response_headers = 6;
 
   // Session info for further request

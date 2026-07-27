@@ -77,6 +77,11 @@ message ScrapePageResponse {
   // HTTP response headers of the MAIN document (the top-level navigation to `url`),
   // not sub-resources or iframes. Captured via CDP. Empty when unavailable
   // (capture disabled/failed, or an error path). See RESPONSE_OBSERVERS.md.
+  //
+  // WARNING: these headers describe the wire response, NOT the `content` field above.
+  // `content-length` is the size of the COMPRESSED body (often absent entirely) and
+  // `content-encoding` reports what the server sent before Chrome decompressed it,
+  // while `content` is post-JavaScript outerHTML. A mismatch is expected.
   map<string, string> response_headers = 6;
   uint64 execution_time_ms = 7;
 

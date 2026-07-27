@@ -184,3 +184,22 @@ diagnostics, not only the gRPC response — see METRICS.md.
   JSON string form.
 - **Empty is a valid result.** Clients must treat missing `response_headers` as "not
   captured", not as an error.
+- **Headers describe the wire response, not the returned `content`.** They are forwarded
+  verbatim, exactly as the browser received them — deliberately, since the raw values are
+  themselves a useful signal (anti-bot fingerprints, CDN provenance, encoding negotiation).
+  This means `content-length` and `content-encoding` must **not** be used to reason about
+  `content`:
+  - `content-encoding: gzip` (or `br`, `deflate`, `zstd`) reports what the *server* sent.
+    The body was already decompressed by Chrome long before we read it.
+  - `content-length` is the length of the **compressed** body (per RFC 9110 it measures the
+    body *after* Content-Encoding is applied), and Chrome does not rewrite it after
+    decompressing. It is frequently **absent** altogether — chunked transfer-encoding, HTTP/2
+    and HTTP/3 responses usually carry no `content-length` at all.
+  - `content` is neither of those: it is `document.documentElement.outerHTML` read **after**
+    JavaScript execution, so its size matches neither the compressed nor the original
+    uncompressed body.
+
+  A `content-length` that disagrees with `content.len()` is therefore expected and is **not**
+  a sign of a truncated response. Clients needing the size of what they received must measure
+  `content` themselves. (The actual transferred byte count is available in CDP as
+  `encodedDataLength`, which this observer does not capture today.)
