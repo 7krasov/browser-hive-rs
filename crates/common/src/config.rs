@@ -416,7 +416,7 @@ fn parse_domain_list(raw: &str) -> Vec<String> {
 
 /// Match a host against a configured domain on a **label boundary**.
 ///
-/// `ends_with` alone would make `egorealestate.com` match `notegorealestate.com`, so a
+/// `ends_with` alone would make `example.com` match `notexample.com`, so a
 /// non-exact match additionally requires a dot right before the suffix.
 fn host_matches(host: &str, domain: &str) -> bool {
     if host == domain {
@@ -433,17 +433,11 @@ mod tests {
 
     #[test]
     fn test_host_matches_on_label_boundary() {
-        assert!(host_matches("egorealestate.com", "egorealestate.com"));
-        assert!(host_matches(
-            "11828-3.ep.egorealestate.com",
-            "egorealestate.com"
-        ));
+        assert!(host_matches("example.com", "example.com"));
+        assert!(host_matches("11828-3.ep.example.com", "example.com"));
         // The reason this is not a plain `ends_with`.
-        assert!(!host_matches("notegorealestate.com", "egorealestate.com"));
-        assert!(!host_matches(
-            "egorealestate.com.evil.net",
-            "egorealestate.com"
-        ));
+        assert!(!host_matches("notexample.com", "example.com"));
+        assert!(!host_matches("example.com.evil.net", "example.com"));
     }
 
     #[test]
@@ -466,11 +460,11 @@ mod tests {
         assert!(base.is_active_for("https://anything.example/x"));
 
         let filtered = DiagnosticsConfig {
-            domains: vec!["egorealestate.com".to_string()],
+            domains: vec!["example.com".to_string()],
             ..base.clone()
         };
-        assert!(filtered.is_active_for("https://11828-3.ep.egorealestate.com/imoveis?a=1"));
-        assert!(!filtered.is_active_for("https://example.com/"));
+        assert!(filtered.is_active_for("https://11828-3.ep.example.com/items?a=1"));
+        assert!(!filtered.is_active_for("https://other.org/"));
         // A filter must not be widened by an unparseable URL.
         assert!(!filtered.is_active_for("not a url"));
 
@@ -479,12 +473,12 @@ mod tests {
             enabled: false,
             ..filtered.clone()
         }
-        .is_active_for("https://egorealestate.com/"));
+        .is_active_for("https://example.com/"));
         assert!(!DiagnosticsConfig {
             mode: DiagnosticsMode::Off,
             ..filtered
         }
-        .is_active_for("https://egorealestate.com/"));
+        .is_active_for("https://example.com/"));
     }
 
     #[test]

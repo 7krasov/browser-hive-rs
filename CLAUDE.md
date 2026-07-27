@@ -183,7 +183,7 @@ The returned `content` shows *what* a page ended up as, never *why*. A page whos
 |---|---|---|
 | `WORKER_ENABLE_BROWSER_DIAGNOSTICS` | `false` | master switch |
 | `WORKER_DIAGNOSTICS_MODE` | `on_error` | `off` / `on_error` / `always` |
-| `WORKER_DIAGNOSTICS_DOMAINS` | empty = all | comma-separated; matches the host **and its subdomains** on a label boundary (`egorealestate.com` matches `x.ep.egorealestate.com` but not `notegorealestate.com`) |
+| `WORKER_DIAGNOSTICS_DOMAINS` | empty = all | comma-separated; matches the host **and its subdomains** on a label boundary (`example.com` matches `x.ep.example.com` but not `notexample.com`) |
 | `WORKER_DIAGNOSTICS_MAX_ENTRIES` | `20` | cap per category; duplicates collapse to `msg (xN)` without consuming the cap, overflow is counted |
 | `WORKER_DIAGNOSTICS_MAX_PER_MINUTE` | `10` | requests per minute that may emit; `0` = unlimited; suppressed count is reported with the next line |
 | `WORKER_DIAGNOSTICS_CONSOLE` | `false` | enable the `Runtime` domain for `console.*` capture |
