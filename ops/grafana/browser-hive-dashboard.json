@@ -34,6 +34,7 @@
       {
         "name": "max_contexts",
         "label": "WORKER_MAX_CONTEXTS",
+        "description": "Per-worker capacity (contexts = concurrent requests per pod) of the selected scope. Only meaningful with a SINGLE scope selected — it feeds the 'Recommended maxReplicas' panel (peak load / this value). Set it to the scope's WORKER_MAX_CONTEXTS config value.",
         "type": "textbox",
         "query": "3",
         "current": { "text": "3", "value": "3" },
@@ -46,7 +47,7 @@
       "type": "timeseries",
       "title": "Concurrent busy contexts (load) per scope",
       "description": "Requests in flight right now = active browser contexts. This is the load curve; its daily peak sizes maxReplicas. Instantaneous gauge, sampled at scrape interval.",
-      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 0 },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
       "datasource": "${datasource}",
       "fieldConfig": {
         "defaults": {
@@ -69,7 +70,7 @@
       "type": "stat",
       "title": "Peak busy contexts (selected range)",
       "description": "Max concurrent busy contexts over the dashboard time range, per scope.",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
       "datasource": "${datasource}",
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
@@ -87,7 +88,7 @@
       "type": "stat",
       "title": "Recommended maxReplicas (+25% headroom)",
       "description": "ceil( peak_busy_contexts / WORKER_MAX_CONTEXTS * 1.25 ). Set the WORKER_MAX_CONTEXTS variable to this scope's value.",
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
       "datasource": "${datasource}",
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
@@ -105,7 +106,7 @@
       "type": "stat",
       "title": "Running workers per scope",
       "description": "One series per scraped worker instance (in K8s: pod), so the count = current replicas.",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 4 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 25 },
       "datasource": "${datasource}",
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "purple", "value": null } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
@@ -123,7 +124,7 @@
       "type": "stat",
       "title": "Utilization now",
       "description": "sum(active_contexts) / sum(total_slots). >90% = near capacity.",
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 4 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
       "datasource": "${datasource}",
       "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.95 } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" },
@@ -141,7 +142,7 @@
       "type": "timeseries",
       "title": "Utilization % per scope",
       "description": "Busy / capacity. Sustained ~100% means you are capped - the busy-contexts curve above is clipped, so true demand is higher than shown.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
       "datasource": "${datasource}",
       "fieldConfig": {
         "defaults": {
@@ -165,7 +166,7 @@
       "type": "timeseries",
       "title": "Throughput (requests/sec) per scope",
       "description": "rate(requests_total). Shows the daily traffic profile.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
       "datasource": "${datasource}",
       "fieldConfig": {
         "defaults": {
@@ -188,7 +189,7 @@
       "type": "timeseries",
       "title": "Failure rate % per scope",
       "description": "5xxx + gRPC failures / total requests. 4xxx client-side codes are not counted.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
       "datasource": "${datasource}",
       "fieldConfig": {
         "defaults": {
@@ -212,7 +213,7 @@
       "type": "timeseries",
       "title": "Request latency p50 / p95 / p99 per scope",
       "description": "From browser_hive_worker_request_duration_seconds histogram.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
       "datasource": "${datasource}",
       "fieldConfig": {
         "defaults": {
@@ -247,7 +248,7 @@
       "type": "timeseries",
       "title": "Avg in-flight requests (Little's Law) per scope",
       "description": "rate(request_duration_seconds_sum) = average concurrent requests, immune to scrape sampling. Should track the busy-contexts curve; if it is consistently higher, your scrape interval is too coarse to catch the true peak.",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 25 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 57 },
       "datasource": "${datasource}",
       "fieldConfig": {
         "defaults": {
