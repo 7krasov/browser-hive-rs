@@ -25,6 +25,38 @@ tunnels. The `corsErrorStatus` field now logged by browser diagnostics decides i
 production occurrence: `InvalidResponse` (the tunnel failed) vs `MissingAllowOriginHeader` (a block
 or challenge page really arrived).
 
+## `rotation_strategy` is hardcoded to `Hybrid` — decision or oversight?
+
+**Status**: open question, left as-is deliberately for now (raised 2026-07-29)
+
+Both worker binaries — the base `crates/worker/src/main.rs` and the downstream
+`src/bin/worker.rs` — set `ContextLifecycleConfig::rotation_strategy` to `RotationStrategy::Hybrid`
+as a literal. It is the only lifecycle field not read from the environment, and no manifest sets
+it. No prior note explains whether that is a decision or simply never finished, which is why this
+item exists.
+
+`should_recycle_context` (`worker/src/browser_pool.rs`) makes the strategy decide *which thresholds
+are consulted at all*:
+
+| Strategy | Honoured | Silently ignored |
+|---|---|---|
+| `TimeBasedOnly` | `max_lifetime` | `max_requests`, `max_idle_time`, `max_cache_size_mb` |
+| `RequestBasedOnly` | `max_requests` | `max_lifetime`, `max_idle_time`, `max_cache_size_mb` |
+| `Hybrid` | all four, OR-ed | — |
+
+**Argument for leaving it hardcoded**: `Hybrid` is the only value under which the other four knobs
+mean anything. Exposing it as `WORKER_ROTATION_STRATEGY` creates a knob that can silently disable
+three other knobs — `time_based_only` would turn `WORKER_MAX_IDLE_TIME_SECS` and
+`WORKER_MAX_CACHE_SIZE_MB` into no-ops with nothing in the logs to say so. The three restrictive
+modes have no known use case; the base enum offers them, nobody asked for them.
+
+**Trigger to act**: a concrete scope that must *not* recycle on idle or cache size (e.g. a
+long-lived logged-in session that should survive idle periods). Then expose it, and log the
+resolved strategy at startup next to the thresholds it disables.
+
+**Alternative worth considering instead**: drop the enum and let each threshold be disabled by
+setting it to zero/unset. That expresses the same intent without one variable overriding others.
+
 ## Empty CDP BrowserContexts are never disposed
 
 **Status**: residue of the tab-leak fix; needs an upstream change (raised 2026-07-27)
