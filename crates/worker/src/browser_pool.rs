@@ -29,7 +29,7 @@ pub struct BrowserPool {
     total_contexts_recycled: Arc<AtomicU64>,
 }
 
-/// Remove leaked contexts from an `AlwaysNew` pool, returning how many were removed.
+/// Remove leaked contexts from an `AlwaysNew` pool, returning the ones that were removed.
 ///
 /// In `SessionMode::AlwaysNew` a context is owned by exactly one request: it is created
 /// pre-marked busy and removed from the pool when that request's scope ends. A context that
@@ -39,10 +39,65 @@ pub struct BrowserPool {
 ///
 /// Pre-marking at creation is what makes this safe: a context that was handed out but has
 /// not started processing yet is already busy, so a concurrent request can never collect it.
-fn reclaim_leaked_always_new_contexts(contexts: &mut Vec<Arc<BrowserContext>>) -> usize {
-    let before = contexts.len();
-    contexts.retain(|c| c.metadata.is_busy.load(Ordering::SeqCst));
-    before - contexts.len()
+///
+/// The removed contexts are returned rather than dropped: dropping frees nothing inside Chrome,
+/// so the caller must pass each to `close_context_tab` — which it can only do after releasing
+/// the pool lock this function is called under.
+fn reclaim_leaked_always_new_contexts(
+    contexts: &mut Vec<Arc<BrowserContext>>,
+) -> Vec<Arc<BrowserContext>> {
+    let mut leaked = Vec::new();
+    contexts.retain(|c| {
+        if c.metadata.is_busy.load(Ordering::SeqCst) {
+            true
+        } else {
+            leaked.push(c.clone());
+            false
+        }
+    });
+    leaked
+}
+
+/// Close a tab inside Chrome after its context has been removed from the pool.
+///
+/// Removing a context from the pool `Vec` frees nothing browser-side: headless_chrome's `Tab`
+/// and `Context` have no `Drop` impl and the crate never disposes either, so a dropped handle
+/// leaves a live tab — with its renderer, sockets and proxy tunnels — inside Chrome. In
+/// `SessionMode::AlwaysNew` that would be one leaked tab per request, for the pod's lifetime.
+///
+/// The call runs **detached on the blocking pool**, for two reasons. `Tab::close` is a
+/// synchronous CDP round-trip, so it must not run on a runtime thread. And its wait is bounded
+/// only by `idle_browser_timeout` (1 hour, see `BrowserPool::new`), while the tab being closed
+/// is frequently the one that just stopped responding — awaiting it would stall the request
+/// path for that whole hour. Nothing depends on the outcome, so it is only logged.
+///
+/// The now-empty CDP BrowserContext is *not* disposed: `Target.disposeBrowserContext` is
+/// rejected over a page session (`Not allowed`) and headless_chrome exposes no browser-level
+/// method call. An empty context holds no renderer and no sockets, so that residue is minor.
+fn close_tab_detached(tab: Arc<Tab>, context_id: uuid::Uuid) {
+    // The request span does not cross spawn_blocking; re-enter it so these lines keep ray_id.
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _guard = span.enter();
+        match tab.close(false) {
+            Ok(_) => debug!("Closed tab of removed context {}", context_id),
+            // Usually means the tab was already gone (dead CDP session) — benign, and the
+            // opposite of the leak this guards against.
+            Err(e) => debug!(
+                "Could not close tab of removed context {}: {}",
+                context_id, e
+            ),
+        }
+    });
+}
+
+/// Take a removed context's tab and close it in Chrome. Must be called with the pool lock
+/// released. See `close_tab_detached`.
+async fn close_context_tab(context: &Arc<BrowserContext>) {
+    let tab = context.tab.lock().await.take();
+    if let Some(tab) = tab {
+        close_tab_detached(tab, context.metadata.id);
+    }
 }
 
 pub struct BrowserContext {
@@ -298,10 +353,7 @@ impl BrowserPool {
         Ok(())
     }
 
-    async fn create_new_context(
-        &self,
-        proxy_params: &ProxyParams,
-    ) -> Result<BrowserContext> {
+    async fn create_new_context(&self, proxy_params: &ProxyParams) -> Result<BrowserContext> {
         let start_time = std::time::Instant::now();
 
         let mut metadata = BrowserContextMetadata::new();
@@ -314,8 +366,7 @@ impl BrowserPool {
             {
                 info!(
                     "Assigning context-specific proxy to context {} (country_code: {:?})",
-                    metadata.id,
-                    proxy_params.country_code
+                    metadata.id, proxy_params.country_code
                 );
                 metadata.assigned_proxy_config = Some(context_proxy);
             }
@@ -337,10 +388,7 @@ impl BrowserPool {
                     anyhow::anyhow!("Failed to create tab in isolated context: {}", e)
                 })?;
 
-                info!(
-                    "Created ISOLATED CDP context {} with tab",
-                    context_id
-                );
+                info!("Created ISOLATED CDP context {} with tab", context_id);
 
                 (tab, Some(context_id))
             }
@@ -380,9 +428,7 @@ impl BrowserPool {
 
         info!(
             "Created browser context ({}) for metadata id: {} in {}ms",
-            isolation_mode,
-            metadata.id,
-            creation_time_ms
+            isolation_mode, metadata.id, creation_time_ms
         );
 
         self.total_contexts_created.fetch_add(1, Ordering::SeqCst);
@@ -416,14 +462,18 @@ impl BrowserPool {
                 // recycling would replace it with a fresh context that keeps holding the slot,
                 // which is what previously turned a one-off leak into a permanently full pool.
                 if session_mode == SessionMode::AlwaysNew {
-                    let removed = reclaim_leaked_always_new_contexts(&mut contexts_guard);
-                    if removed > 0 {
+                    let leaked = reclaim_leaked_always_new_contexts(&mut contexts_guard);
+                    if !leaked.is_empty() {
                         warn!(
                             ray_id = "lifecycle-monitor",
                             "Removed {} leaked idle context(s) in AlwaysNew mode ({} remaining)",
-                            removed,
+                            leaked.len(),
                             contexts_guard.len()
                         );
+                    }
+                    drop(contexts_guard);
+                    for context in &leaked {
+                        close_context_tab(context).await;
                     }
                     continue;
                 }
@@ -454,11 +504,12 @@ impl BrowserPool {
                             context.metadata.total_requests.load(Ordering::SeqCst)
                         );
 
-                        // Close tab if it exists
-                        // Note: For isolated contexts, Chrome will automatically clean up
-                        // the CDP BrowserContext when all tabs in it are closed
-                        if let Some(_tab) = context.tab.lock().await.take() {
-                            // Tab will be dropped and closed automatically
+                        // Close the old tab in Chrome. Dropping the handle does not close it —
+                        // headless_chrome's Tab has no Drop — so the recycled-away tab would
+                        // otherwise keep its renderer, sockets and proxy tunnel alive forever.
+                        let old_tab = context.tab.lock().await.take();
+                        if let Some(old_tab) = old_tab {
+                            close_tab_detached(old_tab, context.metadata.id);
                         }
 
                         // Create new context metadata
@@ -665,7 +716,14 @@ impl BrowserPool {
         if !proxy_params.requires_dedicated_context() {
             // No routing overrides - try to reuse an idle context
             if let Some(context) = self.find_least_busy_context().await {
-                info!("Reusing idle context: {} (total_requests: {})", context.metadata.id, context.metadata.total_requests.load(std::sync::atomic::Ordering::SeqCst));
+                info!(
+                    "Reusing idle context: {} (total_requests: {})",
+                    context.metadata.id,
+                    context
+                        .metadata
+                        .total_requests
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                );
                 return Ok(Some(context));
             }
         } else {
@@ -697,7 +755,11 @@ impl BrowserPool {
                 "Creating new context on-demand ({}/{}){}",
                 contexts.len() + 1,
                 self.scope_config.max_contexts,
-                if proxy_params.requires_dedicated_context() { " [dedicated]" } else { "" }
+                if proxy_params.requires_dedicated_context() {
+                    " [dedicated]"
+                } else {
+                    ""
+                }
             );
 
             let context = self.create_new_context(proxy_params).await?;
@@ -736,16 +798,16 @@ impl BrowserPool {
 
         // Reclaim leaked contexts before measuring capacity, so a leak cannot consume a slot
         // until the lifecycle monitor's next tick.
-        let purged = reclaim_leaked_always_new_contexts(&mut contexts);
-        if purged > 0 {
+        let leaked = reclaim_leaked_always_new_contexts(&mut contexts);
+        if !leaked.is_empty() {
             warn!(
                 "Purged {} leaked idle context(s) in AlwaysNew mode before creating a new one",
-                purged
+                leaked.len()
             );
         }
 
         // Check if we're under the limit
-        if contexts.len() < self.scope_config.max_contexts as usize {
+        let result = if contexts.len() < self.scope_config.max_contexts as usize {
             info!(
                 "Creating new context (AlwaysNew mode) ({}/{}) with proxy params: country_code={:?}",
                 contexts.len() + 1,
@@ -753,17 +815,21 @@ impl BrowserPool {
                 proxy_params.country_code
             );
 
-            let context = self.create_new_context(proxy_params).await?;
+            // No `?` here: an early return would skip closing the purged tabs below.
+            match self.create_new_context(proxy_params).await {
+                Ok(context) => {
+                    // Pre-mark as busy while still holding the write lock, so the context is
+                    // never visible to the purge above as an idle (and therefore collectable)
+                    // context. ContextBusyGuard adopts this flag instead of setting it.
+                    context.metadata.is_busy.store(true, Ordering::SeqCst);
 
-            // Pre-mark as busy while still holding the write lock, so the context is never
-            // visible to the purge above as an idle (and therefore collectable) context.
-            // ContextBusyGuard adopts this flag instead of setting it.
-            context.metadata.is_busy.store(true, Ordering::SeqCst);
+                    let context_arc = Arc::new(context);
+                    contexts.push(context_arc.clone());
 
-            let context_arc = Arc::new(context);
-            contexts.push(context_arc.clone());
-
-            Ok(Some(context_arc))
+                    Ok(Some(context_arc))
+                }
+                Err(e) => Err(e),
+            }
         } else {
             // At maximum capacity
             info!(
@@ -772,7 +838,15 @@ impl BrowserPool {
                 self.scope_config.max_contexts
             );
             Ok(None)
+        };
+
+        // Close the purged tabs only after the pool lock is released.
+        drop(contexts);
+        for context in &leaked {
+            close_context_tab(context).await;
         }
+
+        result
     }
 
     /// Remove a context from the pool by its ID.
@@ -780,30 +854,43 @@ impl BrowserPool {
     /// This is used in SessionMode::AlwaysNew to destroy the context after
     /// the request completes, freeing up the slot for the next request.
     ///
-    /// Note: For isolated contexts, Chrome will automatically clean up the
-    /// CDP BrowserContext when all tabs in it are closed (which happens when
-    /// the BrowserContext is dropped).
+    /// The tab is closed in Chrome as well — removing the context from the pool `Vec` alone
+    /// leaks it, see `close_tab_detached`. Idempotent: a second call finds neither the context
+    /// nor a tab to close.
     pub async fn destroy_context(&self, context_id: &uuid::Uuid) {
-        let mut contexts = self.contexts.write().await;
-        let initial_len = contexts.len();
+        let removed = {
+            let mut contexts = self.contexts.write().await;
 
-        // Find if context was isolated (for logging)
-        let was_isolated = contexts
-            .iter()
-            .find(|c| &c.metadata.id == context_id)
-            .map(|c| c.cdp_context_id.is_some())
-            .unwrap_or(false);
+            let mut removed = Vec::new();
+            contexts.retain(|c| {
+                if &c.metadata.id == context_id {
+                    removed.push(c.clone());
+                    false
+                } else {
+                    true
+                }
+            });
 
-        contexts.retain(|c| &c.metadata.id != context_id);
+            if let Some(context) = removed.first() {
+                let isolation_info = if context.cdp_context_id.is_some() {
+                    " (isolated)"
+                } else {
+                    ""
+                };
+                info!(
+                    "Destroyed context (AlwaysNew mode) {}{} ({} contexts remaining)",
+                    context_id,
+                    isolation_info,
+                    contexts.len()
+                );
+            }
 
-        if contexts.len() < initial_len {
-            let isolation_info = if was_isolated { " (isolated)" } else { "" };
-            info!(
-                "Destroyed context (AlwaysNew mode) {}{} ({} contexts remaining)",
-                context_id,
-                isolation_info,
-                contexts.len()
-            );
+            removed
+        };
+
+        // Close the tab only after the pool lock is released.
+        for context in &removed {
+            close_context_tab(context).await;
         }
     }
 
@@ -867,10 +954,7 @@ impl BrowserPool {
     /// * `Ok(Arc<Tab>)` - The newly created tab
     /// * `Err` - Failed to create tab (context may be invalid)
     pub fn create_tab_in_context(&self, cdp_context_id: &str) -> Result<Arc<Tab>> {
-        info!(
-            "Recreating tab in existing CDP context: {}",
-            cdp_context_id
-        );
+        info!("Recreating tab in existing CDP context: {}", cdp_context_id);
 
         let create_target = CreateTarget {
             url: "about:blank".to_string(),
@@ -923,9 +1007,7 @@ impl BrowserPool {
     /// * `Ok(Arc<Tab>)` - The newly created tab
     /// * `Err` - Failed to create tab
     pub fn create_tab_shared(&self) -> Result<Arc<Tab>> {
-        info!(
-            "Recreating tab in shared browser context"
-        );
+        info!("Recreating tab in shared browser context");
 
         let new_tab = self
             .browser
@@ -943,9 +1025,7 @@ impl BrowserPool {
             }
         }
 
-        info!(
-            "Successfully recreated tab in shared context"
-        );
+        info!("Successfully recreated tab in shared context");
 
         Ok(new_tab)
     }
@@ -985,7 +1065,7 @@ mod tests {
 
         let removed = reclaim_leaked_always_new_contexts(&mut contexts);
 
-        assert_eq!(removed, 2);
+        assert_eq!(removed.len(), 2);
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].metadata.id, busy.metadata.id);
     }
@@ -994,7 +1074,7 @@ mod tests {
     fn reclaims_nothing_while_all_contexts_are_busy() {
         let mut contexts = vec![make_context(true), make_context(true)];
 
-        assert_eq!(reclaim_leaked_always_new_contexts(&mut contexts), 0);
+        assert!(reclaim_leaked_always_new_contexts(&mut contexts).is_empty());
         assert_eq!(contexts.len(), 2);
     }
 
@@ -1006,7 +1086,7 @@ mod tests {
         let just_created = make_context(true); // pre-marked busy under the pool write lock
         let mut contexts = vec![just_created.clone()];
 
-        assert_eq!(reclaim_leaked_always_new_contexts(&mut contexts), 0);
+        assert!(reclaim_leaked_always_new_contexts(&mut contexts).is_empty());
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].metadata.id, just_created.metadata.id);
     }
@@ -1029,7 +1109,7 @@ mod tests {
 
         let removed = reclaim_leaked_always_new_contexts(&mut contexts);
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed.len(), 1);
         assert!(contexts.len() < max_contexts, "slot is available again");
     }
 }

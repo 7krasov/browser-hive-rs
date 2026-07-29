@@ -75,6 +75,75 @@ struct MainDocumentResponse {
     url: String,
 }
 
+/// How many distinct kinds of proxy failure are kept per request before only the count grows.
+const MAX_PROXY_FAILURE_KINDS: usize = 8;
+
+/// Chromium error texts that mean the **proxy path** failed rather than the origin.
+///
+/// This is deliberately keyed on Chromium's error taxonomy and not on any provider's status
+/// code. For HTTPS the browser reaches the origin through a `CONNECT` tunnel, and the proxy's
+/// reply to `CONNECT` is consumed by the network stack — an unavailable peer is typically
+/// answered with HTTP 502, but that 502 never surfaces as a status code, only as
+/// `ERR_TUNNEL_CONNECTION_FAILED`. Detection therefore works the same for every provider.
+///
+/// Origin-side failures (`ERR_CONNECTION_REFUSED`, `ERR_NAME_NOT_RESOLVED`, plain `ERR_FAILED`)
+/// are deliberately absent: they say nothing about the proxy.
+fn is_proxy_error(error_text: &str) -> bool {
+    const PROXY_ERRORS: [&str; 8] = [
+        "ERR_TUNNEL_CONNECTION_FAILED",
+        "ERR_PROXY_CONNECTION_FAILED",
+        "ERR_PROXY_AUTH_UNSUPPORTED",
+        "ERR_PROXY_CERTIFICATE_INVALID",
+        "ERR_UNEXPECTED_PROXY_AUTH",
+        "ERR_MANDATORY_PROXY_CONFIGURATION_FAILED",
+        "ERR_SOCKS_CONNECTION_FAILED",
+        "ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+    ];
+    PROXY_ERRORS.iter().any(|e| error_text.contains(e))
+}
+
+/// Resource loads that failed with a proxy/tunnel error during one request.
+///
+/// Collected by the same CDP `Network` listener that captures the main-document response, so it
+/// costs no extra domain and works whether or not browser diagnostics are enabled — these
+/// failures are rare, always actionable, and otherwise invisible: when they hit sub-resources
+/// the document still returns 200 and only the content is wrong.
+///
+/// URLs are not tracked here on purpose. `Network.loadingFailed` does not carry one, so naming
+/// the resource would require keeping a request-id → URL map for every request; browser
+/// diagnostics already does that when it is switched on.
+#[derive(Default)]
+struct ProxyFailures {
+    /// "<resource type> <error text>" → how many loads failed that way.
+    by_kind: std::collections::BTreeMap<String, usize>,
+    /// Total failures, including those past `MAX_PROXY_FAILURE_KINDS`.
+    total: usize,
+}
+
+impl ProxyFailures {
+    fn record(&mut self, kind: String) {
+        self.total += 1;
+        if self.by_kind.len() < MAX_PROXY_FAILURE_KINDS || self.by_kind.contains_key(&kind) {
+            *self.by_kind.entry(kind).or_insert(0) += 1;
+        }
+    }
+
+    /// One-line summary, e.g. `Script net::ERR_TUNNEL_CONNECTION_FAILED (x4)`.
+    fn summary(&self) -> String {
+        self.by_kind
+            .iter()
+            .map(|(kind, count)| {
+                if *count > 1 {
+                    format!("{} (x{})", kind, count)
+                } else {
+                    kind.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Detect a redirect that landed on a **different registrable domain** (eTLD+1) than the one
 /// requested. Returns `Some(final_registrable_domain)` for an off-domain redirect, or `None`
 /// when it is the same site (e.g. `www.example.com` → `shop.example.com`) or when either
@@ -1058,8 +1127,14 @@ impl WorkerService {
         // event. The listener is removed on drop so it does not accumulate on reused tabs.
         // Failure to enable is non-fatal: the request falls back to the Performance-API
         // status and empty headers.
+        //
+        // The same listener also records proxy/tunnel failures (see `ProxyFailures`): they
+        // arrive on the already-enabled domain, and a sub-resource lost to a dead tunnel is
+        // otherwise invisible — the document still returns 200.
         let main_response_holder: Arc<std::sync::Mutex<Option<MainDocumentResponse>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let proxy_failure_holder: Arc<std::sync::Mutex<ProxyFailures>> =
+            Arc::new(std::sync::Mutex::new(ProxyFailures::default()));
         let _header_capture_guard: Option<EventListenerGuard> = {
             use headless_chrome::protocol::cdp::types::Event;
             use headless_chrome::protocol::cdp::Network;
@@ -1076,9 +1151,18 @@ impl WorkerService {
                 Ok(_) => {
                     let main_frame_id = tab.get_target_id().clone();
                     let holder = main_response_holder.clone();
+                    let proxy_holder = proxy_failure_holder.clone();
                     let listener: Arc<
                         dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync,
                     > = Arc::new(move |event: &Event| {
+                        if let Event::NetworkLoadingFailed(ev) = event {
+                            if is_proxy_error(&ev.params.error_text) {
+                                proxy_holder.lock().unwrap().record(format!(
+                                    "{:?} {}",
+                                    ev.params.Type, ev.params.error_text
+                                ));
+                            }
+                        }
                         if let Event::NetworkResponseReceived(ev) = event {
                             // Only the top-level document response (main frame == target id).
                             if matches!(ev.params.Type, Network::ResourceType::Document)
@@ -1592,15 +1676,39 @@ impl WorkerService {
             );
         }
 
+        // Resource loads lost to the proxy path, recorded by the response observer. Always
+        // logged when present, whatever the request's outcome and independent of the browser
+        // diagnostics switch: they are rare, actionable, and invisible in the returned content.
+        let (proxy_failure_count, proxy_failure_summary) = {
+            let failures = proxy_failure_holder.lock().unwrap();
+            (failures.total, failures.summary())
+        };
+        if proxy_failure_count > 0 {
+            warn!(
+                "{} resource load(s) failed with a proxy/tunnel error: {}",
+                proxy_failure_count, proxy_failure_summary
+            );
+        }
+
         // Build response based on navigation result and wait result.
         // Priority: navigation error > off-domain redirect > wait result.
         let (success, error_message, error_code) = if let Err(e) = navigation_result {
-            // Navigation failed - this is a network/browser error
-            (
-                false,
-                format!("Failed to navigate to URL: {}", e),
-                ErrorCode::NetworkError,
-            )
+            // Navigation failed. Separate a dead proxy path from a site-side network error:
+            // the former is retryable by the client and says nothing about the target site.
+            let text = e.to_string();
+            if is_proxy_error(&text) {
+                (
+                    false,
+                    format!("Proxy/tunnel failure while navigating: {}", text),
+                    ErrorCode::ProxyError,
+                )
+            } else {
+                (
+                    false,
+                    format!("Failed to navigate to URL: {}", text),
+                    ErrorCode::NetworkError,
+                )
+            }
         } else if redirect_target.is_some() {
             // Redirected to another domain. wait_selector/skip_selector were evaluated
             // against a foreign page, so their outcome is meaningless — discard it and report
@@ -1637,6 +1745,32 @@ impl WorkerService {
                     ErrorCode::TimeoutBrowser,
                 ),
             }
+        };
+
+        // A page whose scripts were lost to a dead tunnel renders as an unfilled template, so
+        // it fails as a plain "selector not found" that blames the site. Report the cause
+        // instead — but only when the request already failed for a reason those missing
+        // resources can explain:
+        //   - a successful request stays successful: the client got what it asked for, and the
+        //     failures are only in the log;
+        //   - a found skip_selector stays as it is: that element really was present, which a
+        //     network failure cannot invalidate;
+        //   - an off-domain redirect stays as it is: it is a definitive observation.
+        // Hard-timeout and cancellation paths return earlier and are not covered here.
+        let (error_message, error_code) = if proxy_failure_count > 0
+            && matches!(
+                error_code,
+                ErrorCode::SelectorNotFound | ErrorCode::TimeoutBrowser
+            ) {
+            (
+                format!(
+                    "{} — {} resource load(s) failed with a proxy/tunnel error: {}",
+                    error_message, proxy_failure_count, proxy_failure_summary
+                ),
+                ErrorCode::ProxyError,
+            )
+        } else {
+            (error_message, error_code)
         };
 
         // Tell the diagnostics session how this request ended, so `on_error` mode can decide
@@ -1932,6 +2066,48 @@ impl WorkerServiceTrait for WorkerService {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The classifier must fire on the proxy path only. Origin-side failures share the same
+    /// event and the same shape, and mistaking one for the other would blame the proxy for a
+    /// site being down — or, worse, hide a site outage behind a "retry, it's the proxy" code.
+    #[test]
+    fn proxy_errors_are_told_apart_from_origin_errors() {
+        assert!(is_proxy_error("net::ERR_TUNNEL_CONNECTION_FAILED"));
+        assert!(is_proxy_error("net::ERR_PROXY_CONNECTION_FAILED"));
+        assert!(is_proxy_error(
+            "Navigate failed: net::ERR_TUNNEL_CONNECTION_FAILED"
+        ));
+
+        assert!(!is_proxy_error("net::ERR_FAILED"));
+        assert!(!is_proxy_error("net::ERR_CONNECTION_REFUSED"));
+        assert!(!is_proxy_error("net::ERR_NAME_NOT_RESOLVED"));
+        assert!(!is_proxy_error("net::ERR_ABORTED"));
+        assert!(!is_proxy_error(""));
+    }
+
+    #[test]
+    fn proxy_failures_collapse_duplicates_and_cap_distinct_kinds() {
+        let mut failures = ProxyFailures::default();
+        for _ in 0..4 {
+            failures.record("Script net::ERR_TUNNEL_CONNECTION_FAILED".to_string());
+        }
+        failures.record("Stylesheet net::ERR_PROXY_CONNECTION_FAILED".to_string());
+
+        assert_eq!(failures.total, 5);
+        assert_eq!(
+            failures.summary(),
+            "Script net::ERR_TUNNEL_CONNECTION_FAILED (x4), \
+             Stylesheet net::ERR_PROXY_CONNECTION_FAILED"
+        );
+
+        // Past the cap only the total grows, so a page failing every resource cannot grow the
+        // log line without bound.
+        for i in 0..50 {
+            failures.record(format!("Kind{} net::ERR_TUNNEL_CONNECTION_FAILED", i));
+        }
+        assert_eq!(failures.total, 55);
+        assert_eq!(failures.by_kind.len(), MAX_PROXY_FAILURE_KINDS);
+    }
 
     #[test]
     fn busy_guard_rejects_a_context_that_is_already_busy() {

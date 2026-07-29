@@ -82,6 +82,42 @@ These indicate issues with the worker/browser infrastructure.
 | `ERROR_CODE_NETWORK_ERROR` | 5004 | Network error during page navigation | ✅ Yes |
 | `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | Failed to create browser context | ✅ Yes |
 | `ERROR_CODE_TERMINATING` | 5006 | Worker/Coordinator is shutting down gracefully | ✅ Yes - retry immediately or route to another instance |
+| `ERROR_CODE_PROXY_ERROR` | 5007 | The proxy path failed: a refused/failed `CONNECT`, an unreachable proxy, or a proxy auth problem. Says nothing about the target site | ✅ Yes - a retry draws a different exit IP |
+
+#### When 5007 is returned
+
+Detection is keyed on Chromium's error taxonomy (`ERR_TUNNEL_CONNECTION_FAILED`,
+`ERR_PROXY_CONNECTION_FAILED`, …), not on any provider's status code — for HTTPS the proxy's
+reply to `CONNECT` is consumed by the network stack, so a provider's own status (an unavailable
+peer is typically answered with 502) never surfaces as `status_code`. The classification is
+therefore identical for every proxy provider. See PROXY_NETWORKING.md.
+
+Two situations produce it:
+
+1. **The main navigation failed** with a proxy-class error. Previously reported as
+   `ERROR_CODE_NETWORK_ERROR` (5004), which conflated a dead tunnel with a site-side problem.
+2. **Sub-resources failed** with a proxy-class error *and* the request was already failing with
+   `ERROR_CODE_SELECTOR_NOT_FOUND` (4042) or `ERROR_CODE_TIMEOUT_BROWSER` (4041). A page whose
+   scripts were lost to a dead tunnel renders as an unfilled template, so it otherwise fails as
+   a plain "selector not found" that blames the site. `error_message` keeps the original text
+   and appends the failure summary.
+
+Deliberately **not** overridden: a successful request (the client got what it asked for — the
+failures appear only in the log), `ERROR_CODE_SKIP_SELECTOR_FOUND` (that element really was
+present, which a network failure cannot invalidate), and
+`ERROR_CODE_REDIRECT_TO_ANOTHER_DOMAIN` (a definitive observation). Hard-timeout and
+cancellation paths return before the check and are not covered.
+
+`status_code` is unaffected: it stays whatever the main document actually returned.
+
+Proxy failures are logged at WARN on every request that has any (`N resource load(s) failed
+with a proxy/tunnel error: …`), independent of the outcome and of
+`WORKER_ENABLE_BROWSER_DIAGNOSTICS` — including on requests that succeed, where they are the
+only trace that a page was served through two different exit IPs.
+
+⚠️ **Metrics impact**: `browser_hive_worker_requests_failed` counts 5xxx codes, so cases that
+used to be silent 4042s now count as failures. An increase after deploying this is the metric
+becoming honest, not a regression.
 
 ### Unknown Errors (9xxx)
 
@@ -464,6 +500,7 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
 - `ERROR_CODE_NETWORK_ERROR` (5004)
 - `ERROR_CODE_CONTEXT_CREATION_FAILED` (5005)
 - `ERROR_CODE_TERMINATING` (5006) - retry immediately, service is shutting down gracefully
+- `ERROR_CODE_PROXY_ERROR` (5007) - retry draws a different exit IP; no backoff needed for the first attempt, but back off if it repeats, since a whole zone can be blocked
 - `ERROR_CODE_TIMEOUT_BROWSER` (4041) - but consider increasing timeout first
 
 **Non-retryable errors**:

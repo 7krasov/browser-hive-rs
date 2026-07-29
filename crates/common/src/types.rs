@@ -65,7 +65,8 @@ pub struct BrowserContextMetadata {
     pub primary_domains: Arc<RwLock<HashSet<String>>>,
     pub is_busy: Arc<AtomicBool>, // True when processing a request
     /// Context-specific proxy config (overrides global scope proxy if set)
-    /// Used for providers that need per-context proxy assignment (e.g., Oxylabs DC with proxy pool)
+    /// Used for providers that need per-context proxy assignment (e.g. a datacenter pool where
+    /// each context gets its own exit IP)
     pub assigned_proxy_config: Option<ProxyConfig>,
 }
 

@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn test_host_matches_on_label_boundary() {
         assert!(host_matches("example.com", "example.com"));
-        assert!(host_matches("11828-3.ep.example.com", "example.com"));
+        assert!(host_matches("a1.sub.example.com", "example.com"));
         // The reason this is not a plain `ends_with`.
         assert!(!host_matches("notexample.com", "example.com"));
         assert!(!host_matches("example.com.evil.net", "example.com"));
@@ -463,7 +463,7 @@ mod tests {
             domains: vec!["example.com".to_string()],
             ..base.clone()
         };
-        assert!(filtered.is_active_for("https://11828-3.ep.example.com/items?a=1"));
+        assert!(filtered.is_active_for("https://a1.sub.example.com/items?a=1"));
         assert!(!filtered.is_active_for("https://other.org/"));
         // A filter must not be widened by an unparseable URL.
         assert!(!filtered.is_active_for("not a url"));

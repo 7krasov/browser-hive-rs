@@ -388,9 +388,26 @@ pub fn start_capture(
                     } else {
                         ""
                     };
+                    // A CORS block surfaces as a bare net::ERR_FAILED, which cannot be told
+                    // apart from a connection failure. This field separates them:
+                    // MissingAllowOriginHeader means a response really did arrive without the
+                    // header (so something on the path returned a different body than the
+                    // origin serves), while InvalidResponse means the fetch never completed.
+                    let cors = match &ev.params.cors_error_status {
+                        Some(status) => format!(
+                            " cors={:?}{}",
+                            status.cors_error,
+                            if status.failed_parameter.is_empty() {
+                                String::new()
+                            } else {
+                                format!("({})", status.failed_parameter)
+                            }
+                        ),
+                        None => String::new(),
+                    };
                     let text = format!(
-                        "[{:?}] {}{}{} — {}",
-                        ev.params.Type, ev.params.error_text, blocked, canceled, url
+                        "[{:?}] {}{}{}{} — {}",
+                        ev.params.Type, ev.params.error_text, blocked, cors, canceled, url
                     );
                     buf.push(Category::FailedRequest, text, max_entries);
                 }

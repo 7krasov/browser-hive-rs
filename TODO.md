@@ -2,6 +2,51 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## Decide whether `AlwaysNew` should use sticky proxy sessions
+
+**Status**: open decision (raised 2026-07-27)
+
+Downstream `src/providers/mod.rs::create_from_env` derives `use_sticky` from the session mode, so
+`AlwaysNew` runs without a session ID. Every new CONNECT tunnel therefore draws a fresh exit IP —
+including the extra tunnel Chromium opens for `crossorigin="anonymous"` sub-resources, which is how
+one page load ends up served by two different exit IPs. See PROXY_NETWORKING.md.
+
+Setting `use_sticky = true` unconditionally costs nothing in IP diversity: the session ID is the
+context UUID, and an `AlwaysNew` context lives for exactly one request, so each request still gets
+its own IP. It only stops the scatter *within* one page load, turning a partial failure (document
+loads, scripts do not, 40 s selector timeout, plausible but useless HTML) into a complete one that
+existing error handling surfaces and a client can retry.
+
+**Unverified**: whether the proxy provider's plan meters sessions separately. Check before applying.
+
+**Still open**: why the second tunnel failed in production at all. Not reproducible locally —
+ten runs without a session ID all succeeded, and five simultaneously open contexts all got working
+tunnels. The `corsErrorStatus` field now logged by browser diagnostics decides it from the first
+production occurrence: `InvalidResponse` (the tunnel failed) vs `MissingAllowOriginHeader` (a block
+or challenge page really arrived).
+
+## Empty CDP BrowserContexts are never disposed
+
+**Status**: residue of the tab-leak fix; needs an upstream change (raised 2026-07-27)
+
+Tabs are now closed at every context-removal site (`close_tab_detached` in
+`worker/src/browser_pool.rs`), so the per-request tab leak in `AlwaysNew` is gone. What remains is
+the empty CDP BrowserContext behind each closed tab: `Target.disposeBrowserContext` is rejected
+over a page session (`Not allowed`), and headless_chrome exposes no browser-level method call
+(`Transport::call_method_on_browser` exists but is unreachable from the public API).
+
+Low priority — an empty context holds no renderer, no sockets and no proxy tunnel, which is what
+the memory and connection pressure actually came from. Fixing it needs either an upstream PR
+exposing browser-level calls, or a raw CDP call over the browser WebSocket alongside
+headless_chrome.
+
+**Verification level of the tab fix**: `tab.close(false)` was measured to hold the browser's tab
+count flat over 5 create/use/drop cycles (`2 → 3 → 4 → 5 → 6` before, `1 → 1 → 1 → 1 → 1` after)
+in a standalone reproduction. The wiring into `BrowserPool` itself is covered only by
+`cargo test` + build; no end-to-end check against a running worker was made. A production pod on
+an `AlwaysNew` scope should now show flat memory over its lifetime instead of growing with
+request count.
+
 ## Generalize the response observer into a `ResponseObserver` trait
 
 **Status**: deferred by design; inline struct is fine for now (raised 2026-07-23)
