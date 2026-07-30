@@ -131,13 +131,21 @@ connections, closes idle ones, and partitions pools by privacy mode.
 
 ## Consequences for session modes
 
-In `AlwaysNew` the session ID is off (`use_sticky` is derived from the session mode downstream),
-so every new tunnel draws a fresh IP — including the extra privacy-mode tunnel within a single
-page load.
+Deriving `use_sticky` from the session mode — the obvious reading, and what downstream providers
+did originally — is **wrong**. It treats the session ID as a property of the *context*, but what it
+actually pins is one *page load*: without it, the extra privacy-mode tunnel described above draws a
+fresh IP even though the context, the request and the mode never changed. `AlwaysNew` is the mode
+that suffers most, and it is exactly the mode that reading gives no session to.
 
 Enabling sticky sessions for `AlwaysNew` costs nothing in IP diversity: the session ID is the
 context UUID and an `AlwaysNew` context lives for exactly one request, so each request still gets
 its own IP. It only stops the scatter *within* one page load.
+
+**Decided 2026-07-30, applied downstream** for the datacenter provider (the one deployed): sticky
+in every session mode. See the production reading below for the evidence. A provider whose IPs are
+fixed (dedicated pools) has no session mechanism and is unaffected; for the residential provider
+the same argument applies but its per-session idle expiry and billing differ, so it was left
+mode-driven pending the same billing check.
 
 What it does and does not buy:
 

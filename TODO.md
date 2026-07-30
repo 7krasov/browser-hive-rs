@@ -2,48 +2,22 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
-## Decide whether `AlwaysNew` should use sticky proxy sessions
+## Confirm sticky proxy sessions are not metered separately
 
-**Status**: answered by production evidence 2026-07-30; ready to apply, one billing check left
-(raised 2026-07-27)
+**Status**: open, non-technical (raised 2026-07-27, technical side resolved and applied 2026-07-30)
 
-Downstream `src/providers/mod.rs::create_from_env` derives `use_sticky` from the session mode, so
-`AlwaysNew` runs without a session ID. Every new CONNECT tunnel therefore draws a fresh exit IP —
-including the extra tunnel Chromium opens for `crossorigin="anonymous"` sub-resources, which is how
-one page load ends up served by two different exit IPs. See PROXY_NETWORKING.md.
+Sticky sessions are now on in every session mode for the deployed datacenter provider — the
+reasoning, the production evidence and what it does *not* buy are in PROXY_NETWORKING.md
+("Consequences for session modes"). Nothing further is needed in code.
 
-Setting `use_sticky = true` unconditionally costs nothing in IP diversity: the session ID is the
-context UUID, and an `AlwaysNew` context lives for exactly one request, so each request still gets
-its own IP. It only stops the scatter *within* one page load, turning a partial failure (document
-loads, scripts do not, 40 s selector timeout, plausible but useless HTML) into a complete one that
-existing error handling surfaces and a client can retry.
+What is left is a billing question for whoever owns the proxy contract: whether the plan meters
+sessions separately from plain requests. `AlwaysNew` opens one session per request, so if sessions
+are metered, the request count and the session count are now the same number. If they are billed
+per session **and** per request, this doubles the line items without changing the traffic.
 
-**Resolved 2026-07-30 — the discriminator fired.** The first production occurrence carried
-`cors=PreflightMissingAllowOriginHeader`, not `InvalidResponse`. So the second tunnel did **not**
-fail: a response really arrived and simply carried no `Access-Control-Allow-Origin`, which is what
-a block or challenge page looks like from the browser's side. The second exit IP was rejected by
-the origin, the first was not.
-
-The failure shape on an `AlwaysNew` scope, from one request's diagnostics:
-
-- the document loads normally over the page's own tunnel — `documentReady: complete`, expected
-  title, `wait_selector` found in ~2.5 s
-- the XHR that fetches the actual listing data goes out over a *second* tunnel and dies with
-  `[Xhr] net::ERR_FAILED cors=PreflightMissingAllowOriginHeader`
-- the returned HTML is a plausible-looking page at roughly a third of the normal size (68 KB vs
-  180 KB on a good run), with the data region empty
-
-Nothing in `content` distinguishes this from a site that simply has no results, which is why it
-was invisible before diagnostics existed.
-
-**Conclusion**: pin the exit IP for the whole page load by setting `use_sticky = true` regardless
-of session mode. In `AlwaysNew` the session ID is the context UUID and the context serves exactly
-one request, so per-request IP diversity is unchanged — only the scatter *within* one page load
-goes away.
-
-**Remaining check before applying**: whether the proxy provider's plan meters sticky sessions
-separately from plain requests. This is a billing question, not a technical one — the technical
-side is settled.
+Also worth passing on if the residential provider is ever deployed: it is still mode-driven, and
+turning it sticky has the same argument but a different cost profile (session idle expiry on the
+order of minutes, see PROXY_NETWORKING.md).
 
 ## `rotation_strategy` is hardcoded to `Hybrid` — decision or oversight?
 
