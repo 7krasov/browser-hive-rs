@@ -214,7 +214,15 @@ is indistinguishable from a connection failure. The field separates them:
 | Value | Meaning |
 |---|---|
 | `MissingAllowOriginHeader` | a response really arrived without the header — something on the path returned a different body than the origin serves (block/challenge page) |
+| `PreflightMissingAllowOriginHeader` | same, on the preflight `OPTIONS` — the response arrived, so the tunnel was alive |
 | `InvalidResponse` | the fetch never completed — the tunnel itself failed, no block page was involved |
+
+**First production reading (2026-07-30)**: `PreflightMissingAllowOriginHeader` on the XHR that
+carries a listing page's data, on an `AlwaysNew` scope. The document itself loaded normally over
+the page's own tunnel and the `wait_selector` was found in ~2.5 s — only the data XHR, on its own
+tunnel and therefore its own exit IP, was rejected. The returned HTML was a plausible page at a
+third of its normal size with the data region empty. This settled the open question in TODO.md:
+the second tunnel is not failing, its exit IP is being blocked.
 
 ## Debugging checklist
 

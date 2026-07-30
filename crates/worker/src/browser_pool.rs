@@ -93,8 +93,34 @@ fn close_tab_detached(tab: Arc<Tab>, context_id: uuid::Uuid) {
 
 /// Take a removed context's tab and close it in Chrome. Must be called with the pool lock
 /// released. See `close_tab_detached`.
+/// How long context teardown may wait for `context.tab` before giving up.
+///
+/// The lock is normally uncontended: whoever owns the context has finished with it by the time it
+/// is destroyed. The bound exists because the failure mode of an unbounded wait is far worse than
+/// the failure mode of a timeout — see [`close_context_tab`].
+const TAB_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hand the context's tab to the detached closer.
+///
+/// The wait for `context.tab` is bounded on purpose. This runs on the request path (the
+/// `AlwaysNew` early destroy), so a caller still holding that mutex would park this task forever —
+/// which is exactly what shipped in v0.17.0, where `scrape_page_internal` held its `tab_guard`
+/// across the destroy and every `always_new` request hung until its client gave up. Timing out
+/// instead leaks one tab in Chrome: bad, but bounded, loud, and it still returns the response.
 async fn close_context_tab(context: &Arc<BrowserContext>) {
-    let tab = context.tab.lock().await.take();
+    let tab = match tokio::time::timeout(TAB_LOCK_TIMEOUT, context.tab.lock()).await {
+        Ok(mut guard) => guard.take(),
+        Err(_) => {
+            warn!(
+                "Timed out after {:?} waiting for the tab lock of context {} - leaving its tab \
+                 open in Chrome. Some caller is holding context.tab across the destroy; that is a \
+                 bug in the caller, not a transient condition.",
+                TAB_LOCK_TIMEOUT, context.metadata.id
+            );
+            return;
+        }
+    };
+
     if let Some(tab) = tab {
         close_tab_detached(tab, context.metadata.id);
     }

@@ -1596,6 +1596,13 @@ impl WorkerService {
         // This frees the slot for the next request BEFORE we spend time on diagnostics/logging
         // Critical for high-throughput scenarios where max_contexts=1
         if self.config.scope.session_mode == SessionMode::AlwaysNew {
+            // Release the tab lock first. `destroy_context` -> `close_context_tab` takes the very
+            // same `context.tab` mutex to hand the tab to the detached closer, so holding it here
+            // makes this task await itself: the request never returns and the slot is only freed
+            // when the client's deadline drops the future. `tab` is an `Arc<Tab>` clone taken
+            // above and stays valid for the status/URL reads further down.
+            drop(tab_guard);
+
             let browser_pool = self.browser_pool.read().await;
             browser_pool.destroy_context(&context.metadata.id).await;
             info!(
