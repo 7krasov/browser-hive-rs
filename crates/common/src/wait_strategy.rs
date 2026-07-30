@@ -31,9 +31,39 @@ pub enum WaitResult {
 /// This is also the total timeout cap - client cannot exceed this value
 pub const DEFAULT_WAIT_TIMEOUT_MS: u32 = 40_000;
 
-/// HTTP status codes that trigger early exit (don't wait for network idle)
-/// These are typically error pages that may have continuous network activity
-const EARLY_EXIT_STATUS_CODES: &[u32] = &[403];
+/// Read the HTTP status of the main document from the Performance API.
+///
+/// Returns `None` when the entry is absent or zero — a `chrome-error://` page, a
+/// navigation that never got a response, or a browser that does not populate the
+/// field. Callers must treat `None` as "unknown", never as "fine".
+fn read_navigation_status(tab: &Arc<Tab>) -> Option<u32> {
+    let result = tab
+        .evaluate(
+            "performance.getEntriesByType('navigation')[0]?.responseStatus || 0",
+            false,
+        )
+        .ok()?;
+    let status = result.value?.as_u64()? as u32;
+    (status > 0).then_some(status)
+}
+
+/// HTTP statuses on which waiting is pointless: the response body *is* the whole
+/// answer, and no application will render into a block or rate-limit page, so
+/// polling for a selector only burns the request budget.
+///
+/// Stopping is all this decides. `Success` here means only "there is nothing left
+/// to wait for" — the request still reaches the client with the origin's
+/// `status_code`, and **what that means is the client's call**, not ours. Neither
+/// status gets an `ErrorCode` of its own: that would duplicate a fact the response
+/// already states. See ERROR_HANDLING.md.
+///
+/// Deliberately narrow: 5xx are excluded because they can be transient inside a
+/// CDN and the page sometimes still arrives.
+const EARLY_EXIT_STATUS_CODES: &[u32] = &[403, 429];
+
+fn should_exit_early(status: u32) -> bool {
+    EARLY_EXIT_STATUS_CODES.contains(&status)
+}
 
 /// Result of checking if a selector exists in the page
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,8 +209,10 @@ pub trait WaitStrategy: Send + Sync {
 ///   - If timeout_ms=X: search for min(X, remaining time until total timeout)
 /// - Always performs final selector check before returning
 ///
-/// **Early exit**: On HTTP 403 and other error codes, exits early to avoid
-/// waiting for network idle (which may never occur on CAPTCHA/error pages).
+/// **Early exit**: On HTTP 403 and 429 the strategy returns without waiting —
+/// during Phase 1 (where idle may never arrive on a CAPTCHA page) and again right
+/// before Phase 2 (where a small error page has already reached idle). See
+/// [`early_exit_result`] for the outcome each status maps to.
 ///
 /// Best for: Most web pages, SPAs, pages requiring dynamic content to load
 /// Not ideal for: Pages with continuous polling (use timeout strategy instead)
@@ -261,25 +293,18 @@ impl WaitStrategy for NetworkIdleStrategy {
                 }
             }
 
-            // Check early exit status codes (403, etc.)
-            if let Ok(result) = tab.evaluate(
-                "performance.getEntriesByType('navigation')[0]?.responseStatus || 0",
-                false,
-            ) {
-                if let Some(status) = result.value.and_then(|v| v.as_u64()) {
-                    let status_u32 = status as u32;
+            // Check early exit status codes (403, 429)
+            if let Some(status) = read_navigation_status(tab) {
+                if should_exit_early(status) {
+                    tracing::info!(
+                        "Early exit: HTTP {} detected after {:?}",
+                        status,
+                        start.elapsed()
+                    );
 
-                    if status_u32 > 0 && EARLY_EXIT_STATUS_CODES.contains(&status_u32) {
-                        tracing::info!(
-                            "Early exit: HTTP {} detected after {:?}",
-                            status_u32,
-                            start.elapsed()
-                        );
-
-                        // Return immediately - no point waiting for selectors on error pages
-                        // The HTTP status code already indicates the page is blocked/error
-                        return Ok(WaitResult::Success);
-                    }
+                    // Return immediately - no point waiting for selectors on error pages
+                    // The HTTP status code already indicates the page is blocked/error
+                    return Ok(WaitResult::Success);
                 }
             }
 
@@ -478,6 +503,24 @@ impl WaitStrategy for NetworkIdleStrategy {
             } else {
                 Ok(WaitResult::Success)
             };
+        }
+
+        // A small error page reaches network idle almost immediately, so Phase 1's
+        // status check often never runs: the loop breaks on idle before it fires.
+        // Without this second look, a rate-limited page spends the entire remaining
+        // budget polling for a selector that cannot exist - measured at 38.8s of a
+        // 40s budget on a 3KB "Site Offline" body. Checked once here rather than
+        // inside the Phase 2 loop: the main document's status cannot change once the
+        // document has loaded, so one round-trip answers it for the whole phase.
+        if let Some(status) = read_navigation_status(tab) {
+            if should_exit_early(status) {
+                tracing::info!(
+                    "Early exit before selector search: HTTP {} after {:?}",
+                    status,
+                    start.elapsed()
+                );
+                return Ok(WaitResult::Success);
+            }
         }
 
         // Phase 2: If wait_selector specified, search for it after network idle
@@ -805,5 +848,24 @@ mod tests {
             effective_timeout(MAX_WAIT_TIMEOUT_MS + 10_000),
             MAX_WAIT_TIMEOUT_MS
         );
+    }
+
+    #[test]
+    fn blocked_and_rate_limited_pages_stop_the_wait() {
+        assert!(should_exit_early(403));
+        assert!(should_exit_early(429));
+    }
+
+    /// Anything else has to fall through to the normal waiting path - including the
+    /// neighbours it would be tempting to lump in. 5xx can be transient inside a
+    /// CDN and the page sometimes still arrives.
+    #[test]
+    fn other_statuses_do_not_short_circuit_the_wait() {
+        for status in [0, 200, 301, 404, 500, 502, 503, 504] {
+            assert!(
+                !should_exit_early(status),
+                "HTTP {status} must not trigger an early exit"
+            );
+        }
     }
 }

@@ -84,6 +84,21 @@ These indicate issues with the worker/browser infrastructure.
 | `ERROR_CODE_TERMINATING` | 5006 | Worker/Coordinator is shutting down gracefully | ✅ Yes - retry immediately or route to another instance |
 | `ERROR_CODE_PROXY_ERROR` | 5007 | The proxy path failed: a refused/failed `CONNECT`, an unreachable proxy, or a proxy auth problem. Says nothing about the target site | ✅ Yes - a retry draws a different exit IP |
 
+#### HTTP 403 and 429 are reported through `status_code`, not an error code
+
+Neither gets an `ErrorCode` of its own. The response carries `success = true`, `error_code = 0`
+and the origin's `status_code`, and the client decides what that means — the same treatment 403
+has always had. Duplicating an HTTP status into a bespoke enum would create a second source of
+truth for a fact the response already states, and the list would have no natural end (451? 503?).
+
+`content` is the origin's block or refusal page, so a client that keys "this is content" on
+`success` alone will store it. Key on `status_code` instead.
+
+What the worker does do is stop waiting: with the `network_idle` strategy the request returns as
+soon as the status is seen, instead of spending the rest of its budget polling for a selector
+that cannot appear — measured at 38.8 s of a 40 s budget before the change. The `timeout`
+strategy still burns its full budget by design.
+
 #### When 5007 is returned
 
 Detection is keyed on Chromium's error taxonomy (`ERR_TUNNEL_CONNECTION_FAILED`,
