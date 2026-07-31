@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio_cancellation_ext::CancellationToken;
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
 
@@ -77,6 +77,16 @@ pub const LIBRARY_VERSION_BANNER: &str =
 ///     run_worker(config).await
 /// }
 /// ```
+// Process-lifetime span for everything that is not request-scoped: startup, the gRPC/metrics
+// select, signal handling and shutdown all run inside this future, so those lines carry the
+// pod's `scope` like request lines do. `ray_id` holds a sentinel instead of a request id, which
+// keeps the invariant that every log line can be filtered by `span_ray_id` — and
+// `span_ray_id!~"^ray_"` isolates the non-request lines.
+#[tracing::instrument(
+    skip_all,
+    name = "worker_lifecycle",
+    fields(scope = %config.scope.name, ray_id = "worker-lifecycle")
+)]
 pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     // Logged first, before anything can fail: identifying which library revision a pod runs
     // must never depend on reaching later startup steps. A deployment can silently keep
@@ -101,11 +111,19 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     // Start metrics HTTP server in background
     let metrics_port = 9090;
-    let metrics_handle = tokio::spawn(async move {
-        if let Err(e) = metrics.start_server(metrics_port, browser_pool).await {
-            tracing::error!("Metrics server error: {}", e);
+    let metrics_span = tracing::info_span!(
+        "metrics_server",
+        scope = %config.scope.name,
+        ray_id = "metrics-server",
+    );
+    let metrics_handle = tokio::spawn(
+        async move {
+            if let Err(e) = metrics.start_server(metrics_port, browser_pool).await {
+                tracing::error!("Metrics server error: {}", e);
+            }
         }
-    });
+        .instrument(metrics_span),
+    );
 
     // Start gRPC server
     let addr: SocketAddr = format!("{}:{}", config.pod_ip, config.grpc_port)

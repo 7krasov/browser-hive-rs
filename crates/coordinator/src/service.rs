@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 /// Worker discovery implementation - either K8s-based or local
 pub enum WorkerDiscoveryImpl {
@@ -84,7 +84,10 @@ pub fn select_best_worker<'a>(
 
 /// Fetch fresh stats from a worker to verify slot availability
 /// Returns None if the call fails (timeout, connection error, etc.)
-async fn fetch_fresh_worker_stats(endpoint: &str, ray_id: &str) -> Option<usize> {
+///
+/// Awaited inside the request handler, so its log lines inherit that request's span
+/// (`span_ray_id`, `span_scope`, …) — no ray_id parameter is needed for correlation.
+async fn fetch_fresh_worker_stats(endpoint: &str) -> Option<usize> {
     let connect_result = tokio::time::timeout(
         FRESH_STATS_TIMEOUT,
         WorkerServiceClient::connect(endpoint.to_string()),
@@ -94,11 +97,11 @@ async fn fetch_fresh_worker_stats(endpoint: &str, ray_id: &str) -> Option<usize>
     let mut client = match connect_result {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => {
-            debug!(ray_id = %ray_id, "Fresh stats: connection failed: {}", e);
+            debug!("Fresh stats: connection failed: {}", e);
             return None;
         }
         Err(_) => {
-            debug!(ray_id = %ray_id, "Fresh stats: connection timeout");
+            debug!("Fresh stats: connection timeout");
             return None;
         }
     };
@@ -113,18 +116,17 @@ async fn fetch_fresh_worker_stats(endpoint: &str, ray_id: &str) -> Option<usize>
         Ok(Ok(response)) => {
             let stats = response.into_inner();
             debug!(
-                ray_id = %ray_id,
                 "Fresh stats from worker: available_slots={}",
                 stats.available_slots
             );
             Some(stats.available_slots as usize)
         }
         Ok(Err(e)) => {
-            debug!(ray_id = %ray_id, "Fresh stats: gRPC error: {}", e);
+            debug!("Fresh stats: gRPC error: {}", e);
             None
         }
         Err(_) => {
-            debug!(ray_id = %ray_id, "Fresh stats: request timeout");
+            debug!("Fresh stats: request timeout");
             None
         }
     }
@@ -224,7 +226,12 @@ impl CoordinatorService {
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
-        tokio::spawn(async move {
+        // Background task, so no request span reaches it: it opens its own with a sentinel
+        // ray_id, keeping every line filterable by `span_ray_id` / `span_name`. No `scope`
+        // field — this loop walks the workers of every scope.
+        let span = tracing::info_span!("health_monitor", ray_id = "health-monitor");
+
+        let monitor = async move {
             info!("Starting health monitor task");
             let mut interval = tokio::time::interval(Duration::from_secs(1));
 
@@ -292,7 +299,9 @@ impl CoordinatorService {
             }
 
             info!("Health monitor task stopped");
-        });
+        };
+
+        tokio::spawn(monitor.instrument(span));
     }
 }
 
@@ -311,6 +320,26 @@ impl ScraperCoordinator for CoordinatorService {
             req.ray_id.clone()
         };
 
+        // Per-request span, mirroring the worker's: every log line emitted while routing this
+        // request inherits the context, so in JSON logs it lands under the `span` object (Loki:
+        // span_ray_id, span_scope, …) and the same query works across coordinator and worker.
+        // `scope` matters more here than in the worker — the coordinator serves every scope.
+        // `session_id` is recorded only when the client sent one; `worker_id` starts Empty and
+        // is recorded once routing has picked a worker (and re-recorded on a retry, so the field
+        // always names the worker that produced the response).
+        let span = tracing::info_span!(
+            "scrape_page",
+            scope = %req.scope_name,
+            ray_id = %ray_id,
+            url = %req.url,
+            session_id = tracing::field::Empty,
+            worker_id = tracing::field::Empty,
+        );
+        if !req.session_id.is_empty() {
+            span.record("session_id", req.session_id.as_str());
+        }
+
+        async move {
         // Track active request (automatically decrements on drop)
         let _active_guard = ActiveRequestGuard::new(self.active_requests.clone());
 
@@ -335,7 +364,6 @@ impl ScraperCoordinator for CoordinatorService {
         }
 
         debug!(
-            ray_id = %ray_id,
             "Received scraping request for scope: {}, URL: {}, wait_timeout_ms: {}, wait_selector: {:?}, skip_selector: {:?}",
             req.scope_name, req.url, req.wait_timeout_ms,
             if req.wait_selector.is_empty() { None } else { Some(&req.wait_selector) },
@@ -347,9 +375,13 @@ impl ScraperCoordinator for CoordinatorService {
 
         // If session_id is provided - use the stored worker
         let (worker_endpoint, worker_id) = if !req.session_id.is_empty() {
-            debug!(ray_id = %ray_id, "Using existing session: {}", req.session_id);
+            debug!("Using existing session: {}", req.session_id);
 
             if let Some(session_info) = self.session_manager.get_session(&req.session_id).await {
+                // Routing follows the session's scope, not the request's — keep the span field
+                // pointing at the scope the request is actually served from.
+                tracing::Span::current().record("scope", session_info.scope_name.as_str());
+
                 // Check that worker still exists
                 let scope_workers = workers.get(&session_info.scope_name);
                 let worker_exists = scope_workers
@@ -366,7 +398,7 @@ impl ScraperCoordinator for CoordinatorService {
                     )
                 } else {
                     // Worker unavailable - remove session and select a new one
-                    warn!(ray_id = %ray_id, "Session worker not available, creating new session");
+                    warn!("Session worker not available, creating new session");
                     self.session_manager.remove_session(&req.session_id).await;
 
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -408,7 +440,7 @@ impl ScraperCoordinator for CoordinatorService {
             let scope_workers = match workers.get(&req.scope_name) {
                 Some(w) => w,
                 None => {
-                    warn!(ray_id = %ray_id, "Scope not found: {}", req.scope_name);
+                    warn!("Scope not found: {}", req.scope_name);
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(Response::new(ScrapePageResponse {
                         success: false,
@@ -453,7 +485,7 @@ impl ScraperCoordinator for CoordinatorService {
             let selected = match selected {
                 Some(s) => {
                     if s.used_fallback {
-                        warn!(ray_id = %ray_id, "No healthy workers in health cache, using all discovered workers");
+                        warn!("No healthy workers in health cache, using all discovered workers");
                     }
                     s
                 }
@@ -486,18 +518,16 @@ impl ScraperCoordinator for CoordinatorService {
             // Fetch fresh stats before rejecting the request
             if best_worker.stats.available_slots == 0 {
                 debug!(
-                    ray_id = %ray_id,
                     "Cache shows 0 slots for worker {}, fetching fresh stats",
                     best_worker.pod_name
                 );
 
-                let fresh_slots = fetch_fresh_worker_stats(&endpoint, &ray_id).await;
+                let fresh_slots = fetch_fresh_worker_stats(&endpoint).await;
 
                 match fresh_slots {
                     Some(slots) if slots > 0 => {
                         // Cache was stale - worker actually has slots available
                         info!(
-                            ray_id = %ray_id,
                             "Fresh stats show {} available slots (cache was stale), proceeding with request",
                             slots
                         );
@@ -532,6 +562,9 @@ impl ScraperCoordinator for CoordinatorService {
         };
 
         drop(workers); // Release lock
+
+        // Routing is decided: add the target worker to the span so every later line names it.
+        tracing::Span::current().record("worker_id", worker_id.as_str());
 
         // Calculate request deadline
         let request_deadline = start_time + Duration::from_secs(req.timeout_seconds as u64);
@@ -586,7 +619,6 @@ impl ScraperCoordinator for CoordinatorService {
             };
 
             debug!(
-                ray_id = %ray_id,
                 "Attempt {}: Forwarding to worker {} (timeout: {}s, wait_timeout_ms={}, wait_selector={:?}, skip_selector={:?})",
                 attempt,
                 last_worker_id,
@@ -618,7 +650,6 @@ impl ScraperCoordinator for CoordinatorService {
 
             // Worker is terminating - check if we should retry
             warn!(
-                ray_id = %ray_id,
                 "Worker {} returned TERMINATING (attempt {})",
                 last_worker_id, attempt
             );
@@ -630,13 +661,12 @@ impl ScraperCoordinator for CoordinatorService {
             let remaining_time = request_deadline.saturating_duration_since(now);
 
             if remaining_time < min_retry_time_remaining {
-                warn!(ray_id = %ray_id, "Not enough time remaining for retry ({:?} < {:?}), returning TERMINATING to client", remaining_time, min_retry_time_remaining);
+                warn!("Not enough time remaining for retry ({:?} < {:?}), returning TERMINATING to client", remaining_time, min_retry_time_remaining);
                 break worker_resp;
             }
 
             if attempt >= MAX_RETRY_ATTEMPTS {
                 warn!(
-                    ray_id = %ray_id,
                     "Max retry attempts ({}) reached, returning TERMINATING to client",
                     MAX_RETRY_ATTEMPTS
                 );
@@ -644,7 +674,7 @@ impl ScraperCoordinator for CoordinatorService {
             }
 
             // Try to find another worker
-            debug!(ray_id = %ray_id, "Attempting to retry on another worker (remaining time: {:?})", remaining_time);
+            debug!("Attempting to retry on another worker (remaining time: {:?})", remaining_time);
 
             let workers_guard = self.worker_discovery.get_workers();
             let workers = workers_guard.read().await;
@@ -652,7 +682,7 @@ impl ScraperCoordinator for CoordinatorService {
             let scope_workers = match workers.get(&req.scope_name) {
                 Some(w) => w,
                 None => {
-                    warn!(ray_id = %ray_id, "Scope {} not found during retry", req.scope_name);
+                    warn!("Scope {} not found during retry", req.scope_name);
                     break worker_resp;
                 }
             };
@@ -668,7 +698,7 @@ impl ScraperCoordinator for CoordinatorService {
             drop(healthy_guard);
 
             if available_workers.is_empty() {
-                warn!(ray_id = %ray_id, "No healthy workers available for retry");
+                warn!("No healthy workers available for retry");
                 break worker_resp;
             }
 
@@ -678,16 +708,17 @@ impl ScraperCoordinator for CoordinatorService {
                 .unwrap();
 
             if best_worker.stats.available_slots == 0 {
-                warn!(ray_id = %ray_id, "No available slots for retry");
+                warn!("No available slots for retry");
                 break worker_resp;
             }
 
             last_worker_id = best_worker.pod_name.clone();
             last_worker_endpoint = format!("http://{}:{}", best_worker.pod_ip, best_worker.port);
+            tracing::Span::current().record("worker_id", last_worker_id.as_str());
 
             drop(workers);
 
-            debug!(ray_id = %ray_id, "Retrying on worker: {}", last_worker_id);
+            debug!("Retrying on worker: {}", last_worker_id);
         };
 
         // Create or update session
@@ -722,6 +753,9 @@ impl ScraperCoordinator for CoordinatorService {
             execution_time_ms,
             ray_id,
         }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn get_cluster_stats(

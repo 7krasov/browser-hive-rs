@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 pub struct BrowserPool {
     browser: Arc<Browser>,
@@ -477,7 +477,17 @@ impl BrowserPool {
         let context_isolation = self.scope_config.context_isolation;
         let session_mode = self.scope_config.session_mode;
 
-        tokio::spawn(async move {
+        // Standalone background task: the request span never reaches it, so it opens its own.
+        // `scope` matches the request span's field, and `ray_id` keeps the sentinel value these
+        // lines have always carried — both now live under the `span` object (Loki: span_scope,
+        // span_ray_id) instead of being repeated as an event field on every call site.
+        let span = tracing::info_span!(
+            "lifecycle_monitor",
+            scope = %self.scope_config.name,
+            ray_id = "lifecycle-monitor",
+        );
+
+        let monitor = async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
@@ -491,7 +501,6 @@ impl BrowserPool {
                     let leaked = reclaim_leaked_always_new_contexts(&mut contexts_guard);
                     if !leaked.is_empty() {
                         warn!(
-                            ray_id = "lifecycle-monitor",
                             "Removed {} leaked idle context(s) in AlwaysNew mode ({} remaining)",
                             leaked.len(),
                             contexts_guard.len()
@@ -523,7 +532,6 @@ impl BrowserPool {
                         .load(std::sync::atomic::Ordering::SeqCst)
                     {
                         info!(
-                            ray_id = "lifecycle-monitor",
                             "Recycling context {} (age: {:?}, requests: {})",
                             context.metadata.id,
                             context.metadata.created_at.elapsed(),
@@ -553,7 +561,6 @@ impl BrowserPool {
                                 )
                             {
                                 info!(
-                                    ray_id = "lifecycle-monitor",
                                     "Assigning context-specific proxy to recycled context {}",
                                     metadata.id
                                 );
@@ -574,7 +581,6 @@ impl BrowserPool {
                                                 for middleware in &tab_init_middlewares {
                                                     if let Err(e) = middleware.apply(&new_tab) {
                                                         tracing::warn!(
-                                                            ray_id = "lifecycle-monitor",
                                                             "Failed to apply tab init middleware '{}': {}",
                                                             middleware.name(),
                                                             e
@@ -585,7 +591,6 @@ impl BrowserPool {
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
-                                                    ray_id = "lifecycle-monitor",
                                                     "Failed to create tab in isolated context: {}",
                                                     e
                                                 );
@@ -595,7 +600,6 @@ impl BrowserPool {
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            ray_id = "lifecycle-monitor",
                                             "Failed to create isolated context during recycling: {}",
                                             e
                                         );
@@ -608,7 +612,6 @@ impl BrowserPool {
                                 match browser.new_tab() {
                                     Ok(new_tab) => {
                                         tracing::debug!(
-                                            ray_id = "lifecycle-monitor",
                                             "Successfully created tab during context recycling"
                                         );
 
@@ -616,7 +619,6 @@ impl BrowserPool {
                                         for middleware in &tab_init_middlewares {
                                             if let Err(e) = middleware.apply(&new_tab) {
                                                 tracing::warn!(
-                                                    ray_id = "lifecycle-monitor",
                                                     "Failed to apply tab init middleware '{}' during recycling: {}",
                                                     middleware.name(),
                                                     e
@@ -628,7 +630,6 @@ impl BrowserPool {
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            ray_id = "lifecycle-monitor",
                                             "Failed to create tab during recycling (likely WebSocket timeout): {}. \
                                             Context will be created without tab - it will be lazily initialized on next request.",
                                             e
@@ -653,7 +654,9 @@ impl BrowserPool {
                     }
                 }
             }
-        });
+        };
+
+        tokio::spawn(monitor.instrument(span));
     }
 
     async fn should_recycle_context(

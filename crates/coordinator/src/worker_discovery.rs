@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{error, Instrument};
 
 pub struct WorkerDiscovery {
     kube_client: Client,
@@ -39,7 +39,12 @@ impl WorkerDiscovery {
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
-        tokio::spawn(async move {
+        // Background task: no request span reaches it, so it opens its own with a sentinel
+        // ray_id (see the worker's lifecycle monitor for the same pattern). Scope is per
+        // discovered worker, not per task, so it stays in the messages.
+        let span = tracing::info_span!("worker_discovery", ray_id = "worker-discovery");
+
+        let discovery = async move {
             loop {
                 match Self::discover_workers(&pods, log_terminating_pod_warnings).await {
                     Ok(discovered_workers) => {
@@ -71,7 +76,9 @@ impl WorkerDiscovery {
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
-        });
+        };
+
+        tokio::spawn(discovery.instrument(span));
     }
 
     async fn discover_workers(

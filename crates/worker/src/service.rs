@@ -307,6 +307,7 @@ struct AlwaysNewContextGuard {
     browser_pool: Arc<RwLock<BrowserPool>>,
     context_id: uuid::Uuid,
     ray_id: String,
+    scope: String,
 }
 
 impl Drop for AlwaysNewContextGuard {
@@ -320,10 +321,12 @@ impl Drop for AlwaysNewContextGuard {
         let browser_pool = self.browser_pool.clone();
         let context_id = self.context_id;
         let ray_id = std::mem::take(&mut self.ray_id);
+        let scope = std::mem::take(&mut self.scope);
 
         // Drop runs in a freshly spawned task, so the request span does not propagate here.
-        // Open a span carrying ray_id so destroy_context's logs stay correlated (span_ray_id).
-        let span = tracing::info_span!("always_new_context_drop", ray_id = %ray_id);
+        // Open a span carrying ray_id/scope so destroy_context's logs stay correlated
+        // (span_ray_id, span_scope).
+        let span = tracing::info_span!("always_new_context_drop", scope = %scope, ray_id = %ray_id);
         handle.spawn(
             async move {
                 browser_pool.read().await.destroy_context(&context_id).await;
@@ -1826,6 +1829,7 @@ impl WorkerServiceTrait for WorkerService {
         // (context_id, wait_strategy, wait_timeout_ms); Empty fields are omitted from output.
         let span = tracing::info_span!(
             "scrape_page",
+            scope = %self.config.scope.name,
             ray_id = %req.ray_id,
             url = %req.url,
             wait_selector = tracing::field::Empty,
@@ -1973,6 +1977,7 @@ impl WorkerServiceTrait for WorkerService {
                 browser_pool: self.browser_pool.clone(),
                 context_id: context.metadata.id,
                 ray_id: ray_id.clone(),
+                scope: self.config.scope.name.clone(),
             })
         } else {
             None

@@ -76,6 +76,22 @@ async fn main() -> Result<()> {
     // Initialize tracing (format via LOG_FORMAT, level via RUST_LOG)
     browser_hive_common::init_logging()?;
 
+    run_coordinator().await
+}
+
+// Process-lifetime span for everything that is not request-scoped: startup, the serving future,
+// signal handling and shutdown all run inside it. There is no `scope` field — one coordinator
+// serves every scope — but `ray_id` carries a sentinel so every line stays filterable by
+// `span_ray_id`, and `span_ray_id!~"^ray_"` isolates the non-request lines.
+//
+// The body lives here rather than in `main` because a span must be applied to a future
+// (`.instrument`), never entered with a guard held across `.await`: the guard is thread-local,
+// so a request task polled on the same thread meanwhile would inherit this span.
+#[tracing::instrument(
+    name = "coordinator_lifecycle",
+    fields(ray_id = "coordinator-lifecycle")
+)]
+async fn run_coordinator() -> Result<()> {
     // Logged before anything can fail, so the running revision is always identifiable.
     // The coordinator image is built from base `main` unpinned, so this is the only
     // in-process record of which build is actually serving.

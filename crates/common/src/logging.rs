@@ -99,11 +99,16 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!(
                 "scrape_page",
+                scope = "scope-a",
                 ray_id = "ray-123",
                 url = "http://example/x",
                 wait_selector = tracing::field::Empty,
             );
             span.record("wait_selector", "div.foo");
+            // A field that already has a value can be re-recorded (the coordinator does this
+            // for `scope` once a session's own scope is known); the later value must replace
+            // the earlier one rather than emit the key twice.
+            span.record("scope", "scope-b");
             let _enter = span.enter();
             tracing::info!("hello");
         });
@@ -121,6 +126,10 @@ mod tests {
         assert!(
             out.contains("\"wait_selector\":\"div.foo\""),
             "field recorded after creation is present: {out}"
+        );
+        assert!(
+            out.contains("\"scope\":\"scope-b\"") && !out.contains("scope-a"),
+            "re-recorded field replaces the original value: {out}"
         );
     }
 }
