@@ -11,6 +11,7 @@ pub struct Metrics {
     pub registry: Arc<Registry>,
     pub total_contexts: IntGaugeVec,
     pub active_contexts: IntGaugeVec,
+    pub claimed_contexts: IntGaugeVec,
     pub available_slots: IntGaugeVec,
     pub total_slots: IntGaugeVec,
     pub requests_total: IntCounterVec,
@@ -44,7 +45,25 @@ impl Metrics {
         )?;
         registry.register(Box::new(active_contexts.clone()))?;
 
-        // Available slots (max_contexts - busy contexts)
+        // Slots that cannot be given to a new client. Added alongside active_contexts rather
+        // than replacing it, since dashboards and KEDA triggers already reference that gauge.
+        //
+        // This is the gauge to autoscale on, in every mode. `active_contexts` counts contexts
+        // that are busy *right now*, and in `dedicated` a slot held by a session that is idle
+        // between two requests is not busy — an autoscaler reading active/total_slots would see
+        // an empty worker whose every slot is spoken for. Claimed equals active in the other
+        // modes, so one trigger works everywhere. See METRICS.md.
+        let claimed_contexts = IntGaugeVec::new(
+            Opts::new(
+                "browser_hive_worker_claimed_contexts",
+                "Number of slots that cannot be handed to a new client (busy contexts, plus \
+                 idle-but-owned session contexts in dedicated mode)",
+            ),
+            &["scope"],
+        )?;
+        registry.register(Box::new(claimed_contexts.clone()))?;
+
+        // Available slots (max_contexts - claimed contexts)
         let available_slots = IntGaugeVec::new(
             Opts::new(
                 "browser_hive_worker_available_slots",
@@ -104,6 +123,7 @@ impl Metrics {
         // Initialize all metrics with scope label so they are exposed immediately
         total_contexts.with_label_values(&[scope_name]).set(0);
         active_contexts.with_label_values(&[scope_name]).set(0);
+        claimed_contexts.with_label_values(&[scope_name]).set(0);
         available_slots.with_label_values(&[scope_name]).set(0);
         total_slots.with_label_values(&[scope_name]).set(0);
         requests_total.with_label_values(&[scope_name]);
@@ -114,6 +134,7 @@ impl Metrics {
             registry,
             total_contexts,
             active_contexts,
+            claimed_contexts,
             available_slots,
             total_slots,
             requests_total,
@@ -141,6 +162,9 @@ impl Metrics {
         self.active_contexts
             .with_label_values(&scope)
             .set(stats.active_requests as i64);
+        self.claimed_contexts
+            .with_label_values(&scope)
+            .set(stats.claimed_contexts as i64);
         self.available_slots
             .with_label_values(&scope)
             .set(stats.available_slots as i64);

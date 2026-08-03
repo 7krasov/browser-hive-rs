@@ -197,7 +197,7 @@ grpcurl -plaintext -d '{
 }' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
 ```
 
-The proxy provider must support geo-targeting (see `ProxyProvider::build_config_with_params`). Because the proxy country affects connection identity, specifying `country_code` in `reusable`/`reusable_preinit` session modes always creates a **dedicated new context** instead of reusing an idle one. If `country_code` is omitted, the provider uses its default behavior.
+The proxy provider must support geo-targeting (see `ProxyProvider::build_config_with_params`). Because the proxy country affects connection identity, specifying `country_code` in the `reusable` session mode always creates a **new dedicated context** instead of reusing an idle one (in `dedicated` mode every session starts on its own context anyway). If `country_code` is omitted, the provider uses its default behavior.
 
 ## Request Tracing
 

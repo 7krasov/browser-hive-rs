@@ -2,6 +2,34 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## Align the coordinator's session TTL with `dedicated`'s idle removal
+
+**Status**: open, deliberately unresolved (raised 2026-08-03, still open after `dedicated` shipped)
+
+`SessionManager` defaults to a 30-minute TTL (`common/src/session.rs`) while a `dedicated` context
+is removed after a minute idle. A client returning from a two-minute pause therefore presents a
+session id the coordinator still accepts and the worker no longer has → `SESSION_NOT_FOUND`. The
+answer is correct, but it makes that code a routine outcome rather than an exception.
+
+Not trivial to fix: the coordinator has one `SessionManager` for all scopes and knows neither a
+scope's session mode nor its idle timeout. Decide it with real numbers on how often clients
+actually pause — not up front. See SESSION_MODES.md.
+
+## Measure the gateway provider's sticky TTL from context deaths
+
+**Status**: open — the log line it needs now exists (raised 2026-08-03)
+
+A gateway provider's sticky session has a TTL it does not publish. When it expires the exit IP
+changes underneath a live context, the origin answers the now-mismatched cookies with a 403, and
+the client drops the session — the system self-corrects at a cost of one wasted page load, which
+is why `max_lifetime` is deliberately left at its default rather than guessed (SESSION_MODES.md).
+
+To replace the guess with a number: set `WORKER_DESTROY_SESSION_ON_BLOCK=true` on a `dedicated`
+scope and collect the **context age** from the `Releasing dedicated context … after HTTP 403`
+lines. If those ages cluster, the cluster is the provider's sticky TTL and `max_lifetime` can be
+set just below it. Note this is a per-provider fact — a dedicated IP pool
+has no sticky TTL and needs no ceiling.
+
 ## WebRTC can reveal the pod's real IP — flag not set, effect on blocking unknown
 
 **Status**: open, needs a decision backed by a measurement (raised 2026-07-31)
@@ -83,6 +111,13 @@ resolved strategy at startup next to the thresholds it disables.
 **Alternative worth considering instead**: drop the enum and let each threshold be disabled by
 setting it to zero/unset. That expresses the same intent without one variable overriding others.
 
+**Update 2026-08-03**: `dedicated` depends on `max_idle_time` being honoured — it is the only
+mechanism that releases a claimed slot — so `ScopeConfig::validate()` now **rejects** `dedicated`
+combined with any non-`Hybrid` strategy, and **warns** for `reusable` (SESSION_MODES.md). The
+strategies are therefore no longer silent, but the underlying oddity stands: an enum where two of
+three values disable other configuration, still hardcoded, still unexposed. The argument above is
+unchanged.
+
 ## Empty CDP BrowserContexts are never disposed
 
 **Status**: residue of the tab-leak fix; needs an upstream change (raised 2026-07-27)
@@ -124,7 +159,7 @@ No provider in this repository sets the flag; the first user is a downstream ded
 **Status**: open (raised 2026-07-31)
 
 `ProxyParams::requires_dedicated_context()` (`common/src/request_context.rs`) is derived from the
-request alone: any `country_code` forces a dedicated context in `reusable`/`reusable_preinit`,
+request alone: any `country_code` forces a new dedicated context in `reusable`,
 because country affects connection identity. For a provider that cannot act on it at all — a
 dedicated IP pool, where geography is a property of the purchased addresses — this is pure cost:
 the scope loses a warm idle context and pays for a new one, and the client's parameter still does
@@ -181,7 +216,7 @@ What is left:
 
 `NetworkIdleStrategy::wait` runs its first `check_selector_exists` call immediately at the
 top of the Phase 1 loop, while `wait_until_navigated()` is still running in a background
-thread. In reusable contexts (`WORKER_SESSION_MODE=reusable` / `reusable_preinit`) the tab
+thread. Where a context outlives its request (`WORKER_SESSION_MODE=reusable` / `dedicated`) the tab
 is carried over from the previous request, so if the document has not been swapped to the
 new page yet, `skip_selector` (or the 403 early-exit probe) could match content from the
 *previous* page and abort the request with `ERROR_CODE_SKIP_SELECTOR_FOUND`.

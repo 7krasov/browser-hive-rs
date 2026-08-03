@@ -398,7 +398,7 @@ This scenario happens internally when a previous request hit a hard timeout and 
 **What happens internally**:
 1. Previous request hits hard timeout (e.g., navigation stuck for 20s)
 2. Worker closes the tab via `tab.close(false)` to abort the CDP call
-3. Context remains in pool (in Reusable/ReusablePreinit mode) with cookies/storage preserved
+3. Context remains in pool (in Reusable/Dedicated mode) with cookies/storage preserved
 4. Next request to this context gets "No session with given id" error
 5. Worker automatically creates new tab in the same CDP BrowserContext
 6. Request proceeds normally with session state preserved

@@ -18,20 +18,30 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_total_slots` | Gauge | Configured capacity (`WORKER_MAX_CONTEXTS`) - the maximum number of concurrent requests the worker can handle |
 | `browser_hive_worker_total_contexts` | Gauge | Browser contexts currently in the pool. Contexts are created on demand, so this can be lower than `total_slots` |
 | `browser_hive_worker_active_contexts` | Gauge | Busy contexts (= requests currently being processed) |
-| `browser_hive_worker_available_slots` | Gauge | Free capacity: `total_slots - active_contexts` |
+| `browser_hive_worker_claimed_contexts` | Gauge | Slots that cannot be handed to a new client. Identical to `active_contexts` in `always_new`/`reusable`; in `dedicated` it also counts contexts owned by sessions that are idle between requests |
+| `browser_hive_worker_available_slots` | Gauge | Free capacity: `total_slots - claimed_contexts` |
 | `browser_hive_worker_requests_total` | Counter | Total scraping requests received |
 | `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, selector not found, skip selector) are client-side conditions and are NOT counted - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
 | `browser_hive_worker_request_duration_seconds` | Histogram | End-to-end `scrape_page` duration in seconds (observed on every return path, including early returns). Buckets: 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 60. Exposes `_bucket`, `_sum`, `_count` |
 
-**Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). Counters are incremented in the request path.
+**Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `claimed_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). Counters are incremented in the request path.
 
 **Capacity model**: each worker runs `WORKER_MAX_CONTEXTS` CDP browser contexts (default: 3), one tab per context, and each context processes exactly one request at a time. So the concurrency unit is a **context**, not a worker pod:
 
 ```
 cluster capacity = sum(total_slots)   = pods × WORKER_MAX_CONTEXTS
-cluster load     = sum(active_contexts)
-utilization      = sum(active_contexts) / sum(total_slots)
+cluster load     = sum(claimed_contexts)
+utilization      = sum(claimed_contexts) / sum(total_slots)
 ```
+
+⚠️ **Autoscale on `claimed_contexts`, not `active_contexts`.** They are the same number in
+`always_new` and `reusable`, so nothing changes for those scopes. In `dedicated`
+(`WORKER_SESSION_MODE=dedicated`) a slot is held by a session for as long as the client keeps
+coming back, and between two of its requests that context is *not busy* — a trigger reading
+`active/total_slots` would see an idle worker whose every slot is already spoken for and would
+scale down under a full pool. The examples below use `active_contexts` where they are measuring
+request concurrency (a latency/throughput question) and `claimed_contexts` where they are
+measuring capacity pressure.
 
 ## Sizing `maxReplicaCount` per scope
 
@@ -108,19 +118,21 @@ spec:
   - type: prometheus
     metadata:
       serverAddress: http://prometheus.monitoring:9090
-      # Busy contexts for this scope across all pods
-      query: sum(browser_hive_worker_active_contexts{scope="my_scope"})
-      # Target busy contexts per pod = WORKER_MAX_CONTEXTS × target utilization
+      # Claimed slots for this scope across all pods. Equals busy contexts in
+      # always_new/reusable, and additionally counts idle-but-owned session
+      # contexts in dedicated - which is the only correct signal there.
+      query: sum(browser_hive_worker_claimed_contexts{scope="my_scope"})
+      # Target claimed contexts per pod = WORKER_MAX_CONTEXTS × target utilization
       # e.g. 3 contexts/pod × 0.8 = 2.4
       threshold: "2.4"
 ```
 
-With `WORKER_MAX_CONTEXTS=3` and `threshold: "2.4"`, KEDA keeps average utilization around 80%: 7 busy contexts → `ceil(7 / 2.4) = 3` pods.
+With `WORKER_MAX_CONTEXTS=3` and `threshold: "2.4"`, KEDA keeps average utilization around 80%: 7 claimed contexts → `ceil(7 / 2.4) = 3` pods.
 
 For dashboards and alerting, the utilization ratio is more readable:
 
 ```promql
-sum(browser_hive_worker_active_contexts{scope="my_scope"})
+sum(browser_hive_worker_claimed_contexts{scope="my_scope"})
 /
 sum(browser_hive_worker_total_slots{scope="my_scope"})
 ```
@@ -129,6 +141,6 @@ sum(browser_hive_worker_total_slots{scope="my_scope"})
 
 ### Scale-down caveats
 
-- **Sessions are lost on pod termination.** Session IDs have the form `{worker_id}:{context_id}` - when KEDA removes a pod, every session living on it dies. Clients get `ERROR_CODE_SESSION_NOT_FOUND` (4002) on the next request and must start a new session. If clients rely on long-lived sessions (login flows), scale down conservatively: increase `scaleDown.stabilizationWindowSeconds` (via `spec.advanced.horizontalPodAutoscalerConfig.behavior`, HPA default 300s). KEDA's `cooldownPeriod` does not help here - it only applies to scale-to-zero.
+- **Sessions are lost on pod termination.** Session IDs have the form `{worker_id}:{context_id}` - when KEDA removes a pod, every session living on it dies. Clients get `ERROR_CODE_SESSION_NOT_FOUND` (4002) on the next request and must start a new session. Only `WORKER_SESSION_MODE=dedicated` has sessions at all; in the other modes nothing is lost. For a `dedicated` scope, scale down conservatively: increase `scaleDown.stabilizationWindowSeconds` (via `spec.advanced.horizontalPodAutoscalerConfig.behavior`, HPA default 300s). KEDA's `cooldownPeriod` does not help here - it only applies to scale-to-zero.
 - **In-flight requests are safe.** Graceful shutdown (SIGTERM → wait for active requests, coordinator retries on healthy workers) handles pod removal cleanly - see [GRACEFUL_SHUTDOWN.md](GRACEFUL_SHUTDOWN.md). Ensure `terminationGracePeriodSeconds` covers your longest request timeout.
 - **Prometheus must scrape the workers.** The metrics port (9090) must be reachable by Prometheus (ServiceMonitor / scrape annotations) - see [K8S_DEPLOYMENT.md](K8S_DEPLOYMENT.md) for the Service definition.

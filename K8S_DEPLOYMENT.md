@@ -77,11 +77,11 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         - name: WORKER_MIN_CONTEXTS
-          value: "2"
+          value: "2"         # pre-created on startup; only useful with session_mode=reusable (default: 0)
         - name: WORKER_MAX_CONTEXTS
-          value: "10"
+          value: "10"        # concurrent requests - but concurrent SESSIONS with session_mode=dedicated
         - name: WORKER_SESSION_MODE
-          value: "reusable"  # or always_new, reusable_preinit (default: reusable)
+          value: "reusable"  # or always_new, dedicated (default: reusable)
         - name: WORKER_HEADLESS
           value: "true"
 

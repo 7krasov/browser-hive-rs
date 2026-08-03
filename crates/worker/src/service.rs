@@ -256,9 +256,16 @@ impl Drop for RequestTimer {
     }
 }
 
-/// RAII guard that automatically sets context is_busy flag
+/// RAII guard that marks a context busy for the duration of a request.
+///
+/// On drop it also stamps `last_used_at` with the moment the request **ended**. Idle time is
+/// measured from that stamp, and the handler sets it when the request *starts* — so without this
+/// a request that runs longer than `max_idle_time` would be counted as idle for its whole
+/// duration the instant it finished. In `Dedicated`, where the idle timeout removes the context
+/// and is deliberately short, that would tear down the session of a client that is still working.
 struct ContextBusyGuard {
     is_busy: Arc<std::sync::atomic::AtomicBool>,
+    last_used_at: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 impl ContextBusyGuard {
@@ -268,19 +275,22 @@ impl ContextBusyGuard {
     /// pool write lock is held, so that leak reclamation can never collect a context that
     /// was handed out but has not started processing yet. The flag is already set here —
     /// this guard only takes over clearing it on drop.
-    fn adopt(is_busy: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        Self { is_busy }
+    fn adopt(context: &Arc<BrowserContext>) -> Self {
+        Self {
+            is_busy: context.metadata.is_busy.clone(),
+            last_used_at: context.metadata.last_used_at.clone(),
+        }
     }
 
-    fn new(is_busy: Arc<std::sync::atomic::AtomicBool>) -> Result<Self, ()> {
+    fn new(context: &Arc<BrowserContext>) -> Result<Self, ()> {
         // Try to set busy flag (compare-and-swap from false to true)
-        match is_busy.compare_exchange(
+        match context.metadata.is_busy.compare_exchange(
             false,
             true,
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
         ) {
-            Ok(_) => Ok(Self { is_busy }),
+            Ok(_) => Ok(Self::adopt(context)),
             Err(_) => Err(()), // Context is already busy
         }
     }
@@ -288,6 +298,16 @@ impl ContextBusyGuard {
 
 impl Drop for ContextBusyGuard {
     fn drop(&mut self) {
+        // `try_lock` because Drop is synchronous. The only other holders of this mutex take it
+        // briefly and never across an await, and the context is ours until the flag below is
+        // cleared, so contention here does not happen in practice; if it ever did, the stamp
+        // stays at the request's start time, which is the pre-existing behaviour.
+        if let Ok(mut last_used_at) = self.last_used_at.try_lock() {
+            *last_used_at = Instant::now();
+        }
+
+        // Cleared last, so the lifecycle monitor can never observe this context as idle while
+        // its timestamp still says the request started long ago.
         self.is_busy
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -514,8 +534,26 @@ impl WorkerService {
             error_code: ErrorCode::BrowserError as i32,
             response_headers: std::collections::HashMap::new(),
             execution_time_ms,
-            context_id: context.metadata.id.to_string(),
+            // Deliberately empty even in Dedicated: this context died with the browser process,
+            // so its id addresses nothing. (A client normally never sees this response — the
+            // handler retries against the new pool and returns that attempt's answer.)
+            context_id: String::new(),
             ray_id: ray_id.to_string(),
+        }
+    }
+
+    /// The `context_id` a response may carry.
+    ///
+    /// The field is an **address**: it is only worth returning where a later request can use it
+    /// to come back to this context, which is `Dedicated` alone. In `AlwaysNew` the context dies
+    /// with the request, and in `Reusable` it belongs to no one in particular — returning its id
+    /// there would make the coordinator mint a session for a context that any other client may be
+    /// handed next. Empty is what stops that.
+    fn addressable_context_id(&self, context: &Arc<BrowserContext>) -> String {
+        if self.config.scope.session_mode.returns_session_id() {
+            context.metadata.id.to_string()
+        } else {
+            String::new()
         }
     }
 
@@ -531,10 +569,12 @@ impl WorkerService {
         error_msg.contains("No session with given id")
     }
 
-    /// Acquire a context for a request, using the appropriate strategy based on config.
+    /// Acquire a context for a request that arrived **without** a session id.
     ///
-    /// In AlwaysNew mode: always creates a new context (never reuses).
-    /// In Reusable/ReusablePreinit mode: reuses idle context or creates new one up to max.
+    /// - `AlwaysNew`: always a new context, destroyed when the request ends.
+    /// - `Reusable`: the least-used idle context, or a new one up to `max_contexts`.
+    /// - `Dedicated`: always a new context — every context already in the pool belongs to
+    ///   somebody, and a session reaches its own through `find_context_by_id` instead.
     ///
     /// # Parameters
     /// * `pool` - The browser pool to acquire context from
@@ -546,9 +586,35 @@ impl WorkerService {
     ) -> anyhow::Result<Option<Arc<BrowserContext>>> {
         match self.config.scope.session_mode {
             SessionMode::AlwaysNew => pool.create_always_new_context(proxy_params).await,
-            SessionMode::Reusable | SessionMode::ReusablePreinit => {
-                pool.get_or_create_context(proxy_params).await
+            SessionMode::Reusable => pool.get_or_create_context(proxy_params).await,
+            SessionMode::Dedicated => pool.create_dedicated_context(proxy_params).await,
+        }
+    }
+
+    /// Why no context could be acquired, in the terms of the mode the client is talking to.
+    ///
+    /// The three modes exhaust capacity for genuinely different reasons, and the difference is
+    /// operationally important: "all session slots claimed" is answered by more workers or a
+    /// shorter idle timeout, "all contexts busy" by more concurrency.
+    fn capacity_exhausted_message(&self, after_recovery: bool) -> String {
+        let suffix = if after_recovery {
+            " after pool recreation"
+        } else {
+            ""
+        };
+        let max = self.config.scope.max_contexts;
+        match self.config.scope.session_mode {
+            SessionMode::AlwaysNew => {
+                format!("No available slots{suffix} - max contexts limit ({max}) reached")
             }
+            SessionMode::Reusable => {
+                format!("No available contexts{suffix} - all {max} contexts are busy")
+            }
+            SessionMode::Dedicated => format!(
+                "No available session slots{suffix} - all {max} contexts are claimed by sessions \
+                 (a session holds its slot until it goes idle for {:?})",
+                self.config.scope.lifecycle.max_idle_time
+            ),
         }
     }
 
@@ -567,13 +633,12 @@ impl WorkerService {
         ray_id: &str,
         proxy_params: &ProxyParams,
     ) -> Result<Arc<BrowserContext>, Response<ScrapePageResponse>> {
-        let mode_name = match self.config.scope.session_mode {
-            SessionMode::AlwaysNew => "always_new",
-            SessionMode::Reusable => "reusable",
-            SessionMode::ReusablePreinit => "reusable_preinit",
-        };
+        let mode_name = self.config.scope.session_mode.as_str();
 
-        debug!("Acquiring context ({} mode) with country_code={:?}", mode_name, proxy_params.country_code);
+        debug!(
+            "Acquiring context ({} mode) with country_code={:?}",
+            mode_name, proxy_params.country_code
+        );
 
         let browser_pool_guard = self.browser_pool.read().await;
 
@@ -584,22 +649,11 @@ impl WorkerService {
             Ok(Some(ctx)) => Ok(ctx),
             Ok(None) => {
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                let error_message = if self.config.scope.session_mode == SessionMode::AlwaysNew {
-                    format!(
-                        "No available slots - max contexts limit ({}) reached",
-                        self.config.scope.max_contexts
-                    )
-                } else {
-                    format!(
-                        "No available contexts - all {} contexts are busy",
-                        self.config.scope.max_contexts
-                    )
-                };
                 Err(Response::new(ScrapePageResponse {
                     success: false,
                     status_code: 0,
                     content: String::new(),
-                    error_message,
+                    error_message: self.capacity_exhausted_message(false),
                     error_code: ErrorCode::ContextCreationFailed as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
@@ -640,34 +694,18 @@ impl WorkerService {
 
                     // Retry with new pool
                     let new_pool_guard = self.browser_pool.read().await;
-                    match self
-                        .acquire_context(&new_pool_guard, proxy_params)
-                        .await
-                    {
+                    match self.acquire_context(&new_pool_guard, proxy_params).await {
                         Ok(Some(ctx)) => {
                             debug!("Successfully acquired context after browser pool recovery");
                             Ok(ctx)
                         }
                         Ok(None) => {
                             let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                            let error_message = if self.config.scope.session_mode
-                                == SessionMode::AlwaysNew
-                            {
-                                format!(
-                                    "No available slots after pool recreation - max contexts limit ({}) reached",
-                                    self.config.scope.max_contexts
-                                )
-                            } else {
-                                format!(
-                                    "No available contexts after pool recreation - all {} contexts are busy",
-                                    self.config.scope.max_contexts
-                                )
-                            };
                             Err(Response::new(ScrapePageResponse {
                                 success: false,
                                 status_code: 0,
                                 content: String::new(),
-                                error_message,
+                                error_message: self.capacity_exhausted_message(true),
                                 error_code: ErrorCode::ContextCreationFailed as i32,
                                 response_headers: std::collections::HashMap::new(),
                                 execution_time_ms,
@@ -726,9 +764,9 @@ impl WorkerService {
         // setting it — otherwise the compare-and-swap would fail on a perfectly valid context.
         let is_always_new = self.config.scope.session_mode == SessionMode::AlwaysNew;
         let busy_guard_result = if is_always_new {
-            Ok(ContextBusyGuard::adopt(context.metadata.is_busy.clone()))
+            Ok(ContextBusyGuard::adopt(&context))
         } else {
-            ContextBusyGuard::new(context.metadata.is_busy.clone())
+            ContextBusyGuard::new(&context)
         };
 
         let _busy_guard = match busy_guard_result {
@@ -749,13 +787,13 @@ impl WorkerService {
                     error_code: ErrorCode::BrowserError as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
         };
 
-        // Extract domain for tracking
+        // Extract domain (used in error messages below)
         // NOTE: Invalid URL is not a gRPC error - we return response with error code
         let domain = match utils::extract_domain(&req.url) {
             Ok(d) => d,
@@ -769,19 +807,11 @@ impl WorkerService {
                     error_code: ErrorCode::InvalidUrl as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
         };
-
-        // Track domain affinity
-        context
-            .metadata
-            .primary_domains
-            .write()
-            .await
-            .insert(domain.clone());
 
         // Update usage metrics
         *context.metadata.last_used_at.lock().await = Instant::now();
@@ -822,7 +852,7 @@ impl WorkerService {
                         error_code: ErrorCode::BrowserError as i32,
                         response_headers: std::collections::HashMap::new(),
                         execution_time_ms,
-                        context_id: context.metadata.id.to_string(),
+                        context_id: self.addressable_context_id(&context),
                         ray_id: ray_id.to_string(),
                     });
                 }
@@ -870,7 +900,10 @@ impl WorkerService {
                     error_code: ErrorCode::BrowserError as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    // The context has just been removed, so its id addresses nothing — even in
+                    // Dedicated, where the client must start a new session rather than retry
+                    // into a slot that no longer exists.
+                    context_id: String::new(),
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -914,7 +947,7 @@ impl WorkerService {
                                 error_code: ErrorCode::BrowserError as i32,
                                 response_headers: std::collections::HashMap::new(),
                                 execution_time_ms,
-                                context_id: context.metadata.id.to_string(),
+                                context_id: self.addressable_context_id(&context),
                                 ray_id: ray_id.to_string(),
                             });
                         }
@@ -937,7 +970,7 @@ impl WorkerService {
                             error_code: ErrorCode::BrowserError as i32,
                             response_headers: std::collections::HashMap::new(),
                             execution_time_ms,
-                            context_id: context.metadata.id.to_string(),
+                            context_id: self.addressable_context_id(&context),
                             ray_id: ray_id.to_string(),
                         });
                     }
@@ -986,7 +1019,7 @@ impl WorkerService {
                                     error_code: ErrorCode::BrowserError as i32,
                                     response_headers: std::collections::HashMap::new(),
                                     execution_time_ms,
-                                    context_id: context.metadata.id.to_string(),
+                                    context_id: self.addressable_context_id(&context),
                                     ray_id: ray_id.to_string(),
                                 });
                             }
@@ -1008,7 +1041,7 @@ impl WorkerService {
                                     error_code: ErrorCode::BrowserError as i32,
                                     response_headers: std::collections::HashMap::new(),
                                     execution_time_ms,
-                                    context_id: context.metadata.id.to_string(),
+                                    context_id: self.addressable_context_id(&context),
                                     ray_id: ray_id.to_string(),
                                 });
                             }
@@ -1032,7 +1065,7 @@ impl WorkerService {
                             error_code: ErrorCode::BrowserError as i32,
                             response_headers: std::collections::HashMap::new(),
                             execution_time_ms,
-                            context_id: context.metadata.id.to_string(),
+                            context_id: self.addressable_context_id(&context),
                             ray_id: ray_id.to_string(),
                         });
                     }
@@ -1080,7 +1113,7 @@ impl WorkerService {
                                     error_code: ErrorCode::BrowserError as i32,
                                     response_headers: std::collections::HashMap::new(),
                                     execution_time_ms,
-                                    context_id: context.metadata.id.to_string(),
+                                    context_id: self.addressable_context_id(&context),
                                     ray_id: ray_id.to_string(),
                                 });
                             }
@@ -1108,7 +1141,7 @@ impl WorkerService {
                                         error_code: ErrorCode::BrowserError as i32,
                                         response_headers: std::collections::HashMap::new(),
                                         execution_time_ms,
-                                        context_id: context.metadata.id.to_string(),
+                                        context_id: self.addressable_context_id(&context),
                                         ray_id: ray_id.to_string(),
                                     });
                                 }
@@ -1132,7 +1165,7 @@ impl WorkerService {
                                     error_code: ErrorCode::BrowserError as i32,
                                     response_headers: std::collections::HashMap::new(),
                                     execution_time_ms,
-                                    context_id: context.metadata.id.to_string(),
+                                    context_id: self.addressable_context_id(&context),
                                     ray_id: ray_id.to_string(),
                                 });
                             }
@@ -1152,7 +1185,7 @@ impl WorkerService {
                         error_code: ErrorCode::BrowserError as i32,
                         response_headers: std::collections::HashMap::new(),
                         execution_time_ms,
-                        context_id: context.metadata.id.to_string(),
+                        context_id: self.addressable_context_id(&context),
                         ray_id: ray_id.to_string(),
                     });
                 }
@@ -1172,7 +1205,7 @@ impl WorkerService {
                     error_code: ErrorCode::BrowserError as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -1212,7 +1245,10 @@ impl WorkerService {
                 max_post_data_size: None,
             }) {
                 Err(e) => {
-                    debug!("Failed to enable Network domain for response capture: {}", e);
+                    debug!(
+                        "Failed to enable Network domain for response capture: {}",
+                        e
+                    );
                     None
                 }
                 Ok(_) => {
@@ -1310,7 +1346,7 @@ impl WorkerService {
                     error_code: ErrorCode::Terminating as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -1333,7 +1369,7 @@ impl WorkerService {
                     error_code: ErrorCode::TimeoutBrowser as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -1351,7 +1387,7 @@ impl WorkerService {
                             error_code: ErrorCode::BrowserError as i32,
                             response_headers: std::collections::HashMap::new(),
                             execution_time_ms,
-                            context_id: context.metadata.id.to_string(),
+                            context_id: self.addressable_context_id(&context),
                             ray_id: ray_id.to_string(),
                         });
                     }
@@ -1512,7 +1548,7 @@ impl WorkerService {
                         error_code: ErrorCode::Terminating as i32,
                         response_headers: std::collections::HashMap::new(),
                         execution_time_ms,
-                        context_id: context.metadata.id.to_string(),
+                        context_id: self.addressable_context_id(&context),
                         ray_id: ray_id.to_string(),
                     });
                 }
@@ -1535,7 +1571,7 @@ impl WorkerService {
                         error_code: ErrorCode::TimeoutBrowser as i32,
                         response_headers: std::collections::HashMap::new(),
                         execution_time_ms,
-                        context_id: context.metadata.id.to_string(),
+                        context_id: self.addressable_context_id(&context),
                         ray_id: ray_id.to_string(),
                     });
                 }
@@ -1553,7 +1589,7 @@ impl WorkerService {
                                 error_code: ErrorCode::BrowserError as i32,
                                 response_headers: std::collections::HashMap::new(),
                                 execution_time_ms,
-                                context_id: context.metadata.id.to_string(),
+                                context_id: self.addressable_context_id(&context),
                                 ray_id: ray_id.to_string(),
                             });
                         }
@@ -1585,7 +1621,7 @@ impl WorkerService {
                     error_code: ErrorCode::Terminating as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -1608,7 +1644,7 @@ impl WorkerService {
                     error_code: ErrorCode::BrowserError as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: context.metadata.id.to_string(),
+                    context_id: self.addressable_context_id(&context),
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -1625,7 +1661,7 @@ impl WorkerService {
                             error_code: ErrorCode::BrowserError as i32,
                             response_headers: std::collections::HashMap::new(),
                             execution_time_ms,
-                            context_id: context.metadata.id.to_string(),
+                            context_id: self.addressable_context_id(&context),
                             ray_id: ray_id.to_string(),
                         });
                     }
@@ -1639,7 +1675,7 @@ impl WorkerService {
                             error_code: ErrorCode::BrowserError as i32,
                             response_headers: std::collections::HashMap::new(),
                             execution_time_ms,
-                            context_id: context.metadata.id.to_string(),
+                            context_id: self.addressable_context_id(&context),
                             ray_id: ray_id.to_string(),
                         });
                     }
@@ -1659,17 +1695,19 @@ impl WorkerService {
             }
         }
 
+        // Release the tab lock before any path that can destroy this context.
+        // `destroy_context` -> `close_context_tab` takes the very same `context.tab` mutex to hand
+        // the tab to the detached closer, so holding it across a destroy makes this task await
+        // itself: the request never returns and the slot is only freed when the client's deadline
+        // drops the future. Two such paths exist below (the AlwaysNew early destroy and the
+        // blocked-session release), and nothing after this point needs the guard — `tab` is an
+        // `Arc<Tab>` clone taken above and stays valid for the status/URL reads.
+        drop(tab_guard);
+
         // EARLY DESTROY: In AlwaysNew mode, destroy context immediately after getting content
         // This frees the slot for the next request BEFORE we spend time on diagnostics/logging
         // Critical for high-throughput scenarios where max_contexts=1
         if self.config.scope.session_mode == SessionMode::AlwaysNew {
-            // Release the tab lock first. `destroy_context` -> `close_context_tab` takes the very
-            // same `context.tab` mutex to hand the tab to the detached closer, so holding it here
-            // makes this task await itself: the request never returns and the slot is only freed
-            // when the client's deadline drops the future. `tab` is an `Arc<Tab>` clone taken
-            // above and stays valid for the status/URL reads further down.
-            drop(tab_guard);
-
             let browser_pool = self.browser_pool.read().await;
             browser_pool.destroy_context(&context.metadata.id).await;
             info!(
@@ -1856,12 +1894,43 @@ impl WorkerService {
             }
         }
 
-        // For AlwaysNew mode, don't return context_id since it will be destroyed
-        // and cannot be reused. This prevents coordinator from caching invalid session IDs.
-        let context_id = if self.config.scope.session_mode == SessionMode::AlwaysNew {
+        // A blocked session is a finished session: release its slot now instead of holding it —
+        // along with the exit IP the origin has just refused — until the idle timeout. The client
+        // drops its session on these statuses anyway, so nothing is taken away that was still in
+        // use; without this the slot would simply sit there.
+        //
+        // The context age is logged on purpose. For a gateway provider the useful session length
+        // is bounded by the provider's sticky TTL, which providers do not publish: when the TTL
+        // expires the exit IP changes under the session and the origin answers the mismatched
+        // cookies with a block. If these ages cluster, the cluster *is* the sticky TTL, and
+        // `max_lifetime` can then be set just below it — measured rather than guessed.
+        let session_destroyed = if self.config.scope.destroy_session_on_block
+            && self.config.scope.session_mode == SessionMode::Dedicated
+            && browser_hive_common::should_exit_early(status_code)
+        {
+            info!(
+                "Releasing dedicated context {} after HTTP {} (age: {:?}, requests: {})",
+                context.metadata.id,
+                status_code,
+                context.metadata.created_at.elapsed(),
+                context.metadata.total_requests.load(Ordering::SeqCst)
+            );
+            self.browser_pool
+                .read()
+                .await
+                .destroy_context(&context.metadata.id)
+                .await;
+            true
+        } else {
+            false
+        };
+
+        // A context released as blocked is gone, so its id addresses nothing — the extra
+        // condition on top of the usual per-mode rule.
+        let context_id = if session_destroyed {
             String::new()
         } else {
-            context.metadata.id.to_string()
+            self.addressable_context_id(&context)
         };
 
         Ok(ScrapePageResponse {
@@ -1982,20 +2051,24 @@ impl WorkerServiceTrait for WorkerService {
             ProxyParams::with_country(&req.country_code)
         };
 
-        // Select context: either by session_id (Reusable modes only) or create a new one
+        // Select context: either by session id (Dedicated only) or acquire a new one.
         //
-        // IMPORTANT: In AlwaysNew mode, we ALWAYS create a new context and ignore
-        // any incoming context_id. This is because AlwaysNew contexts are destroyed after
-        // each request, so they cannot be reused. The coordinator should not be caching
-        // session IDs for AlwaysNew mode, but we ignore them here as a safety measure.
+        // Only `Dedicated` hands out session ids, so only `Dedicated` honours one coming back.
+        // An incoming context_id is ignored in the other two modes rather than followed: in
+        // `AlwaysNew` the context named by it was destroyed with its request, and in `Reusable`
+        // it would address a context that belongs to nobody in particular — which is exactly the
+        // shared-session confusion that removing session ids from that mode got rid of.
         let browser_pool_guard = self.browser_pool.read().await;
         let is_always_new = self.config.scope.session_mode == SessionMode::AlwaysNew;
-        let should_use_existing_context = !req.context_id.is_empty() && !is_always_new;
+        let should_use_existing_context =
+            !req.context_id.is_empty() && self.config.scope.session_mode.returns_session_id();
 
         let context = if should_use_existing_context {
-            // Session persistence (Reusable session mode only) - try to find existing context
-            // Note: For existing sessions, we reuse the context's assigned proxy
-            // (country_code in request is ignored for session continuation)
+            // Session continuation: the context keeps its own assigned proxy, so a country_code
+            // in this request is ignored — the session's exit identity is already fixed.
+            // A context that is busy here means the client sent two concurrent requests on one
+            // session; that is answered further down with "already busy", which in this mode is
+            // an honest statement about the client's own traffic.
             info!("Looking for existing context: {}", req.context_id);
             match browser_pool_guard.find_context_by_id(&req.context_id).await {
                 Some(ctx) => ctx,
@@ -2235,27 +2308,62 @@ mod tests {
         assert_eq!(failures.by_kind.len(), MAX_PROXY_FAILURE_KINDS);
     }
 
+    /// A pool slot with no browser behind it: the busy guard only touches metadata.
+    fn test_context(busy: bool) -> Arc<BrowserContext> {
+        let metadata = browser_hive_common::BrowserContextMetadata::new();
+        metadata.is_busy.store(busy, Ordering::SeqCst);
+        Arc::new(BrowserContext {
+            metadata,
+            tab: Arc::new(tokio::sync::Mutex::new(None)),
+            cdp_context_id: None,
+            proxy_host: None,
+        })
+    }
+
     #[test]
     fn busy_guard_rejects_a_context_that_is_already_busy() {
-        let is_busy = Arc::new(AtomicBool::new(true));
-
-        assert!(ContextBusyGuard::new(is_busy).is_err());
+        assert!(ContextBusyGuard::new(&test_context(true)).is_err());
     }
 
     /// AlwaysNew contexts arrive pre-marked busy from `create_always_new_context`, so the
     /// guard must adopt the flag. Using `new` here would reject a perfectly valid context.
     #[test]
     fn busy_guard_adopts_a_pre_marked_context_and_clears_it_on_drop() {
-        let is_busy = Arc::new(AtomicBool::new(true));
+        let context = test_context(true);
 
         {
-            let _guard = ContextBusyGuard::adopt(is_busy.clone());
-            assert!(is_busy.load(Ordering::SeqCst), "stays busy while in scope");
+            let _guard = ContextBusyGuard::adopt(&context);
+            assert!(
+                context.metadata.is_busy.load(Ordering::SeqCst),
+                "stays busy while in scope"
+            );
         }
 
         assert!(
-            !is_busy.load(Ordering::SeqCst),
+            !context.metadata.is_busy.load(Ordering::SeqCst),
             "adopted flag is cleared on drop, so the context becomes reclaimable"
+        );
+    }
+
+    /// Idle time must be measured from the **end** of a request. The handler stamps
+    /// `last_used_at` when the request starts, so without the guard's re-stamp a request longer
+    /// than `max_idle_time` would look idle the instant it finished — and in `dedicated`, where
+    /// the idle timeout removes the context, that tears down the session of a working client.
+    #[tokio::test]
+    async fn busy_guard_restamps_last_used_at_when_the_request_ends() {
+        let context = test_context(false);
+        let started_at = Instant::now();
+        *context.metadata.last_used_at.lock().await = started_at;
+
+        {
+            let _guard = ContextBusyGuard::new(&context).expect("context is idle");
+            // Stand in for a request that takes longer than the idle timeout.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            *context.metadata.last_used_at.lock().await > started_at,
+            "the stamp must move to the end of the request, not stay at its start"
         );
     }
 

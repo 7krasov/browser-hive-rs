@@ -256,7 +256,7 @@ fn create_scope_config() -> ScopeConfig {
     ScopeConfig {
         name: "production_scope".to_string(),
         proxy_provider: create_proxy_provider(), // Your custom proxy provider
-        min_contexts: 5,
+        min_contexts: 0, // Pre-created contexts are only useful in SessionMode::Reusable
         max_contexts: 20,
         session_mode: SessionMode::AlwaysNew, // One-shot scraping
         headless,
@@ -266,6 +266,7 @@ fn create_scope_config() -> ScopeConfig {
         binary_params_middlewares,
         tab_init_middlewares,
         context_isolation: ContextIsolation::Isolated,
+        destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated
     }
 }
 ```

@@ -28,7 +28,7 @@ This is a Cargo workspace with 5 crates:
 
 **One Tab Per Context**: The architecture uses 1 page (tab) per CDP BrowserContext. This simplifies resource management while maintaining full isolation. The page is reused across requests for session persistence (cookies are preserved).
 
-**Domain Affinity**: Browser contexts track domains they've scraped (via `BrowserContextMetadata::primary_domains` field in `common/src/types.rs`) to optimize cache usage. When routing new requests, the system prefers contexts that have already visited the target domain.
+**Domain Affinity does not exist.** It was considered and rejected on 2026-08-03, and the dead code that implemented it (`BrowserPool::find_best_context_for_domain`, `BrowserContextMetadata::primary_domains`) was deleted — under the load that matters (many concurrent requests to one site) every context is warm within seconds, so affinity is a no-op, while after a 403 it would preferentially route the client's retry back to the burnt context. Context selection is `find_least_busy_context()`, which picks the idle context with the fewest `total_requests` so traffic spreads evenly across exit IPs. Reasoning in SESSION_MODES.md.
 
 **Resource Management**: Each context uses an `AtomicBool` (`is_busy`) to track availability (field in `BrowserContextMetadata` struct in `common/src/types.rs`). Workers report available slots to the coordinator, which uses this for load balancing.
 
@@ -206,7 +206,7 @@ The returned `content` shows *what* a page ended up as, never *why*. A page whos
 
 **Emission is RAII** (`DiagnosticsSession::drop`), not an explicit call, so the hard-timeout / cancellation / panic paths — which `return` early from the handler and are the most interesting failures — are covered without a call at every return. The default outcome is therefore "failed"; the success path calls `mark_success()`.
 
-⚠️ **Domains stay enabled on a reused tab.** The event *listener* is removed on drop (`EventListenerGuard`), but `Log.enable` / `Runtime.enable` are not undone — removal must not make a CDP call, since the tab may already be gone. In `AlwaysNew` this is moot (the context dies with the request). In `reusable`/`reusable_preinit`, once a tab has served one diagnostics-active request, those domains remain enabled for its later requests to other domains — which for `Runtime` means carrying the fingerprinting surface beyond the configured domain list. Prefer `AlwaysNew` scopes for `WORKER_DIAGNOSTICS_CONSOLE`.
+⚠️ **Domains stay enabled on a reused tab.** The event *listener* is removed on drop (`EventListenerGuard`), but `Log.enable` / `Runtime.enable` are not undone — removal must not make a CDP call, since the tab may already be gone. In `AlwaysNew` this is moot (the context dies with the request). In `reusable`/`dedicated`, once a tab has served one diagnostics-active request, those domains remain enabled for its later requests to other domains — which for `Runtime` means carrying the fingerprinting surface beyond the configured domain list. Prefer `AlwaysNew` scopes for `WORKER_DIAGNOSTICS_CONSOLE`.
 
 **Budget**: the page-state snapshot uses its own `PAGE_STATE_BUDGET` constant rather than "whatever is left of the wait timeout". The wait strategy may consume the entire request budget, so a leftover-based budget is zero exactly when the request timed out — the case diagnostics exist for. It is taken **before** the AlwaysNew early destroy, which tears down the CDP context.
 
@@ -214,7 +214,10 @@ The returned `content` shows *what* a page ended up as, never *why*. A page whos
 
 The browser pool starts a background task (via `BrowserPool::start_lifecycle_monitor` in `worker/src/browser_pool.rs`) that periodically checks contexts against lifecycle thresholds and recycles them when needed. Contexts are only recycled when no active pages are running.
 
-**AlwaysNew mode is exempt from recycling.** In `SessionMode::AlwaysNew` a context belongs to exactly one request and is removed from the pool when that request's scope ends, so any idle context found in the pool is a leak — the monitor **removes** it instead of recycling it. Recycling would replace the leaked context with a fresh one that keeps occupying the slot, turning a one-off leak into a permanently full pool (`No available slots - max contexts limit (N) reached` with no request in flight).
+**Only `Reusable` is recycled; the other two modes remove instead.** Recycling replaces a context with a fresh one in the same slot, which is right only where the slot serves everybody.
+
+- In `SessionMode::AlwaysNew` a context belongs to exactly one request and is removed when that request's scope ends, so any idle context found in the pool is a leak — the monitor **removes** it. Recycling would replace the leak with a fresh context that keeps occupying the slot, turning a one-off leak into a permanently full pool (`No available slots - max contexts limit (N) reached` with no request in flight).
+- In `SessionMode::Dedicated` every context belongs to a session and nothing else can free its slot — there is no release RPC, and a request without a session id never takes an existing context. An expired context (idle past `max_idle_time`, or past `max_lifetime`/`max_requests`) is therefore **removed**; replacing it would leave a context nobody owns holding the slot, and the pool would report itself full with no session in sight. The monitor ticks every 60 s, so removal happens up to a minute after expiry.
 
 **Removing a context from the pool does not free it in Chrome.** headless_chrome's `Tab` and `Context` have no `Drop` impl and the crate never disposes a context, so dropping the Rust handles leaves a live tab — renderer, sockets and proxy tunnels included — inside the browser. Every removal site therefore closes the tab explicitly via `close_tab_detached` (`worker/src/browser_pool.rs`): `destroy_context`, `reclaim_leaked_always_new_contexts`' callers, and lifecycle recycling. Two constraints shape it: `Tab::close` is a **blocking** CDP round-trip whose wait is bounded only by `idle_browser_timeout` (1 hour), and the tab being closed is often the one that just stopped responding — so it runs detached on `spawn_blocking`, never awaited and never under the pool lock (which is why reclamation returns the removed contexts to its caller instead of dropping them). The now-empty CDP BrowserContext is still not disposed: `Target.disposeBrowserContext` is rejected over a page session (`Not allowed`) and headless_chrome exposes no browser-level method call. An empty context holds no renderer and no sockets.
 
@@ -242,7 +245,7 @@ Step 3 is the part that is easy to get wrong. A request holds an `Arc<BrowserCon
 When a request hits a hard timeout (navigation or wait strategy stuck), the worker closes the tab via `tab.close(false)` to abort the stuck CDP call. The tab's CDP session is destroyed, but:
 - The browser process remains alive
 - In isolated mode, the CDP BrowserContext survives (cookies/storage preserved)
-- The context remains in the pool (Reusable/ReusablePreinit modes)
+- The context remains in the pool (Reusable/Dedicated modes)
 
 When the next request uses this context, CDP operations fail with "No session with given id". The worker detects this and automatically:
 1. Creates a new tab in the existing CDP BrowserContext (for isolated mode) using `BrowserPool::create_tab_in_context()`
@@ -293,7 +296,8 @@ Workers expose Prometheus metrics on port 9090 at `/metrics` (implemented in `wo
 - `browser_hive_worker_total_slots{scope}` - Configured capacity (max_contexts), gauge
 - `browser_hive_worker_total_contexts{scope}` - Contexts currently in pool, gauge
 - `browser_hive_worker_active_contexts{scope}` - Busy contexts processing requests, gauge
-- `browser_hive_worker_available_slots{scope}` - Free slots (total_slots - active), gauge
+- `browser_hive_worker_claimed_contexts{scope}` - Slots that cannot be handed to a new client, gauge. Equals `active_contexts` in `always_new`/`reusable`; in `dedicated` it also counts contexts held by sessions that are idle between requests, so it is **the gauge to autoscale on in every mode** (an autoscaler reading `active/total_slots` would see an empty `dedicated` worker whose slots are all spoken for)
+- `browser_hive_worker_available_slots{scope}` - Free slots (total_slots - **claimed**), gauge. Also what the coordinator routes on
 - `browser_hive_worker_requests_total{scope}` - Total requests processed, counter
 - `browser_hive_worker_requests_failed{scope}` - Failed requests: responses with 5xxx `error_code` + gRPC-level errors (4xxx client-side codes are not counted), counter
 - `browser_hive_worker_request_duration_seconds{scope}` - End-to-end `scrape_page` duration, histogram (observed via `RequestTimer` RAII guard on every return path). Enables Little's Law concurrency sizing (`rate(_sum)` = avg in-flight requests, immune to scrape sampling) and latency quantiles
@@ -318,26 +322,35 @@ The coordinator supports two deployment modes (selected via `COORDINATOR_MODE`):
 - Proxy settings (see `worker/src/providers.rs`): `PROXY_TYPE` (`none` = direct connection, default; `generic` = HTTP/SOCKS5 proxy via `PROXY_URL` or `PROXY_ADDRESS`/`PROXY_PORT`/`PROXY_USERNAME`/`PROXY_PASSWORD`/`PROXY_SCHEME`)
 
 **Optional worker variables**:
-- `WORKER_MIN_CONTEXTS` - Minimum browser contexts pre-created on startup, used by `reusable_preinit` mode (default: `WORKER_MAX_CONTEXTS`)
+- `WORKER_MIN_CONTEXTS` - Browser contexts pre-created on startup (default: `0`). Only `reusable` pre-creates; in the other modes a pre-created context has no client, so `validate()` warns
 - `WORKER_SESSION_MODE` - Session management mode (see table below)
+- `WORKER_DESTROY_SESSION_ON_BLOCK` - Release a `dedicated` session's context on HTTP 403/429 (default: `false`)
 - `WORKER_ENABLE_BROWSER_DIAGNOSTICS` - Master switch for browser diagnostics (default: `false`). See "Browser Diagnostics" below for the other `WORKER_DIAGNOSTICS_*` knobs
 - `WORKER_HEADLESS` - Run browser in headless mode (default: `true`)
-- `WORKER_MAX_IDLE_TIME_SECS` - Max idle time before context recycling (default: 300)
+- `WORKER_MAX_IDLE_TIME_SECS` - Max idle time before a context is recycled (`reusable`) or removed (`dedicated`). Default: 300, but **60 in `dedicated`**
 - `WORKER_CONTEXT_ISOLATION` - Context isolation mode: `shared` or `isolated` (default: `isolated`)
 - `WORKER_BROWSER_PATH` - Path to browser binary (default: auto-detect Chrome/Chromium). Set to `/usr/bin/brave-browser` for Brave
 
-**Session modes (`WORKER_SESSION_MODE`)**:
+**Session modes (`WORKER_SESSION_MODE`)** — full semantics, the reasoning and the rejected alternatives are in **SESSION_MODES.md**:
 
-| Mode | Reusable? | Behavior | Best for |
-|------|-----------|----------|----------|
-| `always_new` | No | Fresh context per request, destroyed after | One-shot scraping, per-request geo-targeting |
-| `reusable` (default) | Yes | Contexts reused until recycled by lifecycle | Multi-page workflows, login flows |
-| `reusable_preinit` | Yes | Same as `reusable`, pre-created on startup | Low-latency first requests |
+| Mode | Context outlives the request | Who gets it next | `max_contexts` counts | `session_id` |
+|------|---|---|---|---|
+| `always_new` | no, destroyed after | nobody | concurrent **requests** | not returned |
+| `reusable` (default) | yes, until recycled | any later request | concurrent **requests** | not returned |
+| `dedicated` | yes, until idle/expired/blocked | only the session that owns it | concurrent **sessions** | returned |
 
-**Note**: Reusable contexts are NOT kept forever. They are recycled based on lifecycle settings:
-- `WORKER_MAX_IDLE_TIME_SECS` (default: 5 min) - recycled after being idle
-- `max_lifetime` (default: 6 hours) - recycled after this age
-- `max_requests` (default: 10,000) - recycled after this many requests
+⚠️ **Only `dedicated` has sessions.** A request without a session id always gets a *fresh* context there; contexts already in the pool belong to clients and are reached only via their `session_id`. `reusable` deliberately returns **no** `session_id`: its contexts belong to nobody, and an id addressing one promised an ownership the pool never provided (two unrelated clients used to hold the same session, and a simultaneous second arrival got `Context <id> is already busy`). A `context_id` sent to an `always_new` or `reusable` scope is ignored.
+
+⚠️ **In `dedicated`, `max_contexts` bounds concurrent sessions, not request rate.** A client that fetches one page and disappears holds a slot until the idle timeout — size the scope from the number of concurrent scraping processes. Nothing else frees a claimed slot: there is no release RPC (rejected: every client eventually fails to call it), so the short idle timeout and the optional destroy-on-403/429 are the whole release mechanism. Idle time is measured from the **end** of a request (`ContextBusyGuard` re-stamps `last_used_at` on drop), otherwise a request longer than the timeout would look idle the moment it finished.
+
+**Note**: contexts that outlive their request are NOT kept forever. Lifecycle settings:
+- `WORKER_MAX_IDLE_TIME_SECS` - after being idle, **measured from the end of the last request**
+- `max_lifetime` (default: 6 hours) - after this age, **measured from context creation**
+- `max_requests` (default: 10,000) - after this many requests
+
+⚠️ Only `rotation_strategy = Hybrid` (hardcoded in both worker binaries) consults all four thresholds. `TimeBasedOnly` honours `max_lifetime` alone and `RequestBasedOnly` honours `max_requests` alone — under either, `max_idle_time` and `max_cache_size_mb` are silently ignored. This is a **hard startup error** in `dedicated` (where `max_idle_time` is the only thing that frees a slot) and a startup warning in `reusable`. Expiry **replaces** the context in `reusable` (so it never frees a slot) and **removes** it in `dedicated`/`always_new` (see "Context Lifecycle Monitoring").
+
+**Startup validation**: `ScopeConfig::validate()` (`common/src/config.rs`) runs in `run_worker` before the browser is launched, in the same spirit as the "a worker never starts without a proxy" guard. Combinations that would silently do the wrong thing (`dedicated` + `shared` isolation, `dedicated` + non-`Hybrid` rotation, `min_contexts > max_contexts`, `max_contexts == 0`, `max_lifetime < max_idle_time` where it applies) refuse to start; settings that are merely inert in the chosen mode are returned as warnings and logged, never dropped in silence. Downstream workers with their own `main.rs` get this by calling `run_worker`.
 
 **Session modes and proxy country behavior:**
 
@@ -346,12 +359,12 @@ The `country_code` field in scrape requests controls proxy geo-targeting. How it
 | Mode | Client sends `country_code` | Client doesn't send `country_code` |
 |------|---------------------------|-----------------------------------|
 | `always_new` | New context with requested country, no sticky session | New context, provider picks random IP/country per request |
-| `reusable` | **Dedicated** new context with requested country + sticky session (if provider supports it) | Reuses idle context or creates new; sticky session keeps same IP |
-| `reusable_preinit` | Same as `reusable` | Pre-created contexts have no country; sticky session keeps same IP |
+| `reusable` | A **new** context with the requested country + sticky session (if the provider supports it), never a reused one | Reuses the least-used idle context, or creates one; sticky session keeps same IP |
+| `dedicated` | Honoured only when the session is created — a request continuing an existing session keeps that session's exit identity | New context per session; sticky session keeps the same IP for its lifetime |
 
-Key behavior: In `reusable`/`reusable_preinit` modes, when `country_code` is specified, `BrowserPool::get_or_create_context()` **always creates a dedicated new context** instead of reusing an idle one. This is because proxy country affects connection identity (exit IP) and cannot be changed on an existing context. The decision is driven by `ProxyParams::requires_dedicated_context()`.
+Key behavior: In `reusable`, when `country_code` is specified, `BrowserPool::get_or_create_context()` **always creates a new dedicated context** instead of reusing an idle one, because proxy country affects connection identity (exit IP) and cannot be changed on an existing context. The decision is driven by `ProxyParams::requires_dedicated_context()`. In `dedicated` every session already starts on its own context, so the parameter only selects that context's country.
 
-**Sticky sessions** (if supported by proxy provider): The proxy provider uses the browser context ID as a session identifier in proxy credentials, ensuring the same proxy IP is assigned to all requests through that context. This is automatically enabled for `reusable`/`reusable_preinit` modes. Production proxy providers should accept a `use_session: bool` parameter and include session ID in proxy credentials when enabled.
+**Sticky sessions** (if supported by proxy provider): The proxy provider uses the browser context ID as a session identifier in proxy credentials, ensuring the same proxy IP is assigned to all requests through that context. Production proxy providers should accept a `use_session: bool` parameter and include session ID in proxy credentials when enabled.
 
 **Coordinator modes**: See "Deployment Modes" above (`COORDINATOR_MODE=local` for env-based endpoints, anything else for built-in K8s discovery).
 

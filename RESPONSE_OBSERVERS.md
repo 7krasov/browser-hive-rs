@@ -41,7 +41,7 @@ navigation and read just before building the response. The captured fields live 
    `ScrapePageResponse.response_headers`.
 7. **Clean up** via `EventListenerGuard` (RAII): the listener is removed on drop on **every**
    exit path (success, navigation timeout, cancel, panic). This matters because tabs are
-   **reused** across requests in `reusable`/`reusable_preinit` modes — without removal,
+   **reused** across requests in `reusable`/`dedicated` modes — without removal,
    listeners would accumulate on the shared tab.
 
 **Status source and fallback**: `status_code` is taken from the observer when it captured a

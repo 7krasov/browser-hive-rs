@@ -12,8 +12,14 @@ use std::time::Duration;
 pub struct ScopeConfig {
     pub name: String,
     pub proxy_provider: Box<dyn crate::proxy::ProxyProvider>,
-    pub min_contexts: u16, // Minimum contexts to pre-initialize on startup (if session_mode=ReusablePreinit)
-    pub max_contexts: u16, // Maximum number of browser contexts allowed
+    /// Contexts to pre-create on startup. `0` (the default) means none.
+    ///
+    /// Pre-initialization is an option, not a mode: any value above 0 makes the pool fill itself
+    /// at startup. It only pays off in [`SessionMode::Reusable`], where a pre-created context can
+    /// serve any request; in the other modes a context has no client, so it is destroyed unused —
+    /// [`ScopeConfig::validate`] warns about that rather than silently pre-creating.
+    pub min_contexts: u16,
+    pub max_contexts: u16,         // Maximum number of browser contexts allowed
     pub session_mode: SessionMode, // Controls context creation, reuse, and destruction behavior
     pub headless: bool, // true = headless (faster, detectable), false = headfull (slower, better stealth)
     // Note: We use 1 tab per context (hardcoded) for simplicity and reliability
@@ -48,6 +54,19 @@ pub struct ScopeConfig {
     /// Note: Even with `Shared` mode, different Chrome processes (workers) are always isolated.
     /// This setting only affects isolation WITHIN a single worker's Chrome process.
     pub context_isolation: ContextIsolation,
+
+    /// Destroy a [`SessionMode::Dedicated`] context as soon as its page comes back 403 or 429.
+    ///
+    /// This is what replaces an explicit release RPC. A client drops its session on those
+    /// statuses anyway, so without this the worker would keep the slot — and the burnt exit IP —
+    /// claimed until the idle timeout expires. The statuses are the ones the wait strategy already
+    /// exits early on, so the signal costs nothing extra.
+    ///
+    /// An **option** rather than a rule: a 403 on one page does not universally mean the session
+    /// is dead. Has no effect outside `Dedicated`, where a context is either destroyed with the
+    /// request (`AlwaysNew`) or shared by everyone (`Reusable`); [`ScopeConfig::validate`] warns
+    /// when it is set there.
+    pub destroy_session_on_block: bool,
 }
 
 /// Controls how browser contexts share state within a Chrome process
@@ -80,18 +99,19 @@ impl FromStr for ContextIsolation {
 
 /// Controls how browser contexts are created and managed.
 ///
-/// | Mode | Reusable? | Behavior |
-/// |------|-----------|----------|
-/// | `AlwaysNew` | No | Fresh context per request, destroyed after |
-/// | `Reusable` | Yes | Contexts created on-demand, reused until recycled |
-/// | `ReusablePreinit` | Yes | Same as Reusable, but pre-created on startup |
+/// The mode decides three things at once: whether a context outlives the request that created
+/// it, who may be handed that context next, and what `max_contexts` counts. See SESSION_MODES.md.
 ///
-/// **Note on Reusable modes**: Contexts are NOT kept forever. They are automatically
-/// recycled by the lifecycle monitor based on `ContextLifecycleConfig` settings:
-/// - `max_idle_time` (default: 5 min) - recycled after being idle
-/// - `max_lifetime` (default: 6 hours) - recycled after this age
-/// - `max_requests` (default: 10,000) - recycled after this many requests
-/// - `max_cache_size_mb` (default: 500 MB) - recycled when cache grows too large
+/// | Mode | Context outlives the request | Who gets it next | `max_contexts` counts |
+/// |------|---|---|---|
+/// | `AlwaysNew` | no | nobody | concurrent **requests** |
+/// | `Reusable` | yes, until recycled | any later request | concurrent **requests** |
+/// | `Dedicated` | yes, until idle or blocked | only the session that owns it | concurrent **sessions** |
+///
+/// **Note on contexts that outlive their request**: they are NOT kept forever. The lifecycle
+/// monitor acts on them based on `ContextLifecycleConfig` — `Reusable` contexts are *recycled*
+/// (replaced by a fresh one in the same slot), `Dedicated` contexts are *removed* (the slot goes
+/// back to the pool, because nothing else can free it).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionMode {
     /// Create a new context for each request, destroy after completion.
@@ -102,23 +122,47 @@ pub enum SessionMode {
     /// - Session IDs are NOT returned to clients (cannot be reused)
     AlwaysNew,
 
-    /// Reusable contexts with automatic lifecycle management.
-    /// - Contexts are created on-demand up to `max_contexts`
-    /// - Idle contexts are reused for subsequent requests
-    /// - Contexts persist cookies/storage between requests (session affinity)
-    /// - Contexts are recycled based on `ContextLifecycleConfig` (idle time, age, requests, cache size)
-    /// - Best for: session-based scraping, login flows, multi-page workflows
-    /// - Session IDs ARE returned to clients for reuse
+    /// An anonymous pool of reusable contexts.
+    /// - Contexts are created on-demand up to `max_contexts` and reused by **any** later request
+    /// - Requests are spread evenly across contexts, so every exit IP carries a similar share
+    /// - Contexts are recycled based on `ContextLifecycleConfig` (idle time, age, requests, cache)
+    /// - Best for: high-throughput scraping where each request stands on its own
+    /// - Session IDs are NOT returned: the pool guarantees no client anything, and pretending
+    ///   otherwise is what made two unrelated clients believe they shared a session
     #[default]
     Reusable,
 
-    /// Reusable contexts with pre-initialization on startup.
-    /// - Creates `min_contexts` contexts during worker initialization
-    /// - Contexts are reused and recycled like `Reusable` mode
-    /// - Faster first-request latency (no context creation overhead)
-    /// - Best for: high-throughput scenarios where startup time is acceptable
-    /// - Session IDs ARE returned to clients for reuse
-    ReusablePreinit,
+    /// One context belongs to one session, for as long as the client keeps using it.
+    /// - A request without a session id always gets a **fresh** context; a claimed context is
+    ///   never handed to a stranger, so `Context is already busy` between unrelated clients
+    ///   cannot happen
+    /// - Cookies, storage and (with a sticky provider) the exit IP stay stable across the
+    ///   client's requests
+    /// - `max_contexts` bounds **concurrent sessions**, not request rate: a client that fetches
+    ///   one page and disappears holds its slot until `max_idle_time`
+    /// - The idle timeout **removes** the context — it is the only thing that frees a slot
+    ///   without client cooperation, which is why it should be short (a minute, not five)
+    /// - Optionally destroyed on 403/429, see [`ScopeConfig::destroy_session_on_block`]
+    /// - Best for: multi-page workflows, login flows, anything that must not be interleaved
+    ///   with another client's traffic
+    /// - Session IDs ARE returned to clients
+    Dedicated,
+}
+
+impl SessionMode {
+    /// The value accepted by `WORKER_SESSION_MODE`, and what logs call this mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AlwaysNew => "always_new",
+            Self::Reusable => "reusable",
+            Self::Dedicated => "dedicated",
+        }
+    }
+
+    /// Whether clients of this mode receive a `session_id` they can send back.
+    pub fn returns_session_id(&self) -> bool {
+        matches!(self, Self::Dedicated)
+    }
 }
 
 impl FromStr for SessionMode {
@@ -128,11 +172,25 @@ impl FromStr for SessionMode {
         match s.to_lowercase().as_str() {
             "always_new" => Ok(Self::AlwaysNew),
             "reusable" => Ok(Self::Reusable),
-            "reusable_preinit" => Ok(Self::ReusablePreinit),
+            "dedicated" => Ok(Self::Dedicated),
             _ => Err(()),
         }
     }
 }
+
+/// Accepted values of `WORKER_SESSION_MODE`, for error messages.
+pub const SESSION_MODE_VALUES: &str = "always_new, reusable, dedicated";
+
+/// Default idle timeout for modes where an idle context is still useful to somebody.
+pub const DEFAULT_MAX_IDLE_TIME_SECS: u64 = 5 * 60;
+
+/// Default idle timeout for [`SessionMode::Dedicated`].
+///
+/// Much shorter than the others because it is the **only** way a claimed slot comes back without
+/// the client cooperating: there is no release RPC, so every abandoned session costs capacity for
+/// exactly this long. A client that is genuinely working a site comes back far sooner than a
+/// minute; one that does not was finished anyway.
+pub const DEFAULT_DEDICATED_MAX_IDLE_TIME_SECS: u64 = 60;
 
 impl std::fmt::Debug for ScopeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -158,7 +216,131 @@ impl std::fmt::Debug for ScopeConfig {
             .field("binary_params_middlewares", &binary_middleware_names)
             .field("tab_init_middlewares", &tab_init_middleware_names)
             .field("context_isolation", &self.context_isolation)
+            .field("destroy_session_on_block", &self.destroy_session_on_block)
             .finish()
+    }
+}
+
+impl ScopeConfig {
+    /// Check the configuration for combinations that cannot do what they say.
+    ///
+    /// Called fail-fast at worker startup, in the same spirit as the "a worker never starts
+    /// without a proxy" guard in `BrowserPool::new`: a scope that is configured to do something
+    /// it cannot do must not serve traffic while its logs claim otherwise.
+    ///
+    /// Two categories, deliberately distinguished:
+    ///
+    /// - **Error** — the combination silently does the wrong thing. The worker refuses to start.
+    /// - **Warning** — the setting is valid but has no effect in this mode. Returned to the
+    ///   caller to log, never dropped: a value nobody chose to ignore was still typed by
+    ///   somebody, and the whole point of validating is that no configuration disappears in
+    ///   silence.
+    ///
+    /// A third category has nothing to check: `max_lifetime` in `Dedicated`, whose useful value
+    /// is the proxy provider's sticky TTL and is measured rather than guessed (see
+    /// SESSION_MODES.md).
+    pub fn validate(&self) -> anyhow::Result<Vec<String>> {
+        let mode = self.session_mode.as_str();
+
+        if self.max_contexts == 0 {
+            anyhow::bail!(
+                "scope '{}': max_contexts is 0, so the scope can serve nothing",
+                self.name
+            );
+        }
+
+        if self.min_contexts > self.max_contexts {
+            anyhow::bail!(
+                "scope '{}': min_contexts ({}) exceeds max_contexts ({})",
+                self.name,
+                self.min_contexts,
+                self.max_contexts
+            );
+        }
+
+        if self.session_mode == SessionMode::Dedicated {
+            // Every request in shared isolation runs in the browser's default context, which is
+            // one context for the whole process — exclusivity cannot exist there, and the mode
+            // would degrade into `reusable` with a session id nobody honours.
+            if self.context_isolation == ContextIsolation::Shared {
+                anyhow::bail!(
+                    "scope '{}': session_mode=dedicated requires context_isolation=isolated. \
+                     In shared isolation every request runs in the browser's default context, so \
+                     a context cannot belong to one session.",
+                    self.name
+                );
+            }
+
+            // The idle timeout is the only thing that frees a claimed slot without the client's
+            // help, and a non-Hybrid rotation strategy does not consult it — the pool would fill
+            // up with abandoned sessions and never recover.
+            if !matches!(self.lifecycle.rotation_strategy, RotationStrategy::Hybrid) {
+                anyhow::bail!(
+                    "scope '{}': session_mode=dedicated requires rotation_strategy=Hybrid, but \
+                     it is {:?}. Only Hybrid consults max_idle_time, which is the only way a \
+                     claimed slot is ever released.",
+                    self.name,
+                    self.lifecycle.rotation_strategy
+                );
+            }
+        }
+
+        // A context that dies of old age before it can ever be idle long enough is a lifecycle
+        // configured backwards. Checked only where these thresholds do something — in AlwaysNew
+        // they are ignored (and warned about below), so failing on their relationship would
+        // reject a harmless shared lifecycle config.
+        if self.session_mode != SessionMode::AlwaysNew
+            && self.lifecycle.max_lifetime < self.lifecycle.max_idle_time
+        {
+            anyhow::bail!(
+                "scope '{}': max_lifetime ({:?}) is shorter than max_idle_time ({:?}), so a \
+                 context is always recycled by age before it can be idle long enough",
+                self.name,
+                self.lifecycle.max_lifetime,
+                self.lifecycle.max_idle_time
+            );
+        }
+
+        let mut warnings = Vec::new();
+
+        if self.min_contexts > 0 && self.session_mode != SessionMode::Reusable {
+            warnings.push(format!(
+                "scope '{}': min_contexts={} pre-creates contexts that {} mode cannot hand to \
+                 anybody - they will be destroyed unused. Set WORKER_MIN_CONTEXTS=0.",
+                self.name, self.min_contexts, mode
+            ));
+        }
+
+        if self.session_mode == SessionMode::AlwaysNew {
+            warnings.push(format!(
+                "scope '{}': the lifecycle settings (max_idle_time, max_lifetime, max_requests, \
+                 max_cache_size_mb) have no effect in always_new mode - a context never outlives \
+                 its request.",
+                self.name
+            ));
+        }
+
+        // The general case of the gate that is a hard error for `dedicated`: under the
+        // request/time-only strategies two thresholds are read from the config and then ignored.
+        if self.session_mode == SessionMode::Reusable
+            && !matches!(self.lifecycle.rotation_strategy, RotationStrategy::Hybrid)
+        {
+            warnings.push(format!(
+                "scope '{}': rotation_strategy={:?} ignores max_idle_time and max_cache_size_mb; \
+                 only Hybrid consults all four thresholds.",
+                self.name, self.lifecycle.rotation_strategy
+            ));
+        }
+
+        if self.destroy_session_on_block && self.session_mode != SessionMode::Dedicated {
+            warnings.push(format!(
+                "scope '{}': destroy_session_on_block has no effect in {} mode - a context is \
+                 either destroyed with its request or shared by every client.",
+                self.name, mode
+            ));
+        }
+
+        Ok(warnings)
     }
 }
 
@@ -181,7 +363,7 @@ impl Default for ContextLifecycleConfig {
             max_lifetime: Duration::from_secs(6 * 3600), // 6 hours
             max_requests: 10_000,
             max_cache_size_mb: 500,
-            max_idle_time: Duration::from_secs(5 * 60), // 5 minutes (for on-demand session model)
+            max_idle_time: Duration::from_secs(DEFAULT_MAX_IDLE_TIME_SECS),
             rotation_strategy: RotationStrategy::Hybrid,
         }
     }
@@ -479,6 +661,149 @@ mod tests {
             ..filtered
         }
         .is_active_for("https://example.com/"));
+    }
+
+    /// Minimal provider: `validate` never touches the proxy, but `ScopeConfig` needs one.
+    #[derive(Debug, Clone)]
+    struct TestProvider;
+
+    impl crate::proxy::ProxyProvider for TestProvider {
+        fn build_config(&self) -> anyhow::Result<crate::proxy::ProxyConfig> {
+            Ok(crate::proxy::ProxyConfig {
+                proxy_url: None,
+                scheme: crate::proxy::ProxyScheme::Http,
+                address: None,
+                port: None,
+                username: None,
+                password: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::proxy::ProxyProvider> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn scope(session_mode: SessionMode) -> ScopeConfig {
+        ScopeConfig {
+            name: "test_scope".to_string(),
+            proxy_provider: Box::new(TestProvider),
+            min_contexts: 0,
+            max_contexts: 3,
+            session_mode,
+            headless: true,
+            lifecycle: ContextLifecycleConfig::default(),
+            browser_path: None,
+            diagnostics: DiagnosticsConfig::default(),
+            binary_params_middlewares: vec![],
+            tab_init_middlewares: vec![],
+            context_isolation: ContextIsolation::Isolated,
+            destroy_session_on_block: false,
+        }
+    }
+
+    #[test]
+    fn test_session_mode_from_str() {
+        assert_eq!("always_new".parse(), Ok(SessionMode::AlwaysNew));
+        assert_eq!("Reusable".parse(), Ok(SessionMode::Reusable));
+        assert_eq!("dedicated".parse(), Ok(SessionMode::Dedicated));
+        // Removed outright rather than aliased: a manifest still asking for it must fail loudly,
+        // not silently get a mode with different capacity semantics.
+        assert_eq!("reusable_preinit".parse::<SessionMode>(), Err(()));
+    }
+
+    /// A `dedicated` scope in shared isolation would serve every session from the browser's one
+    /// default context — exclusivity, cookies and exit IP all silently absent.
+    #[test]
+    fn test_dedicated_requires_isolated_contexts() {
+        let mut config = scope(SessionMode::Dedicated);
+        config.context_isolation = ContextIsolation::Shared;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("dedicated") && error.contains("isolated"),
+            "the error must name the mode and the required isolation: {error}"
+        );
+    }
+
+    /// Without Hybrid nothing consults `max_idle_time`, and in `dedicated` that is the only way a
+    /// claimed slot ever comes back: the pool would fill with abandoned sessions permanently.
+    #[test]
+    fn test_dedicated_requires_hybrid_rotation() {
+        let mut config = scope(SessionMode::Dedicated);
+        config.lifecycle.rotation_strategy = RotationStrategy::TimeBasedOnly;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("max_idle_time"),
+            "the error must say which threshold stops being consulted: {error}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_impossible_capacities() {
+        let mut zero = scope(SessionMode::Reusable);
+        zero.max_contexts = 0;
+        assert!(zero.validate().is_err());
+
+        let mut inverted = scope(SessionMode::Reusable);
+        inverted.min_contexts = 5;
+        inverted.max_contexts = 3;
+        assert!(inverted.validate().is_err());
+    }
+
+    /// The lifecycle relationship is only checked where the thresholds do something. In
+    /// `always_new` they are ignored, so a shared lifecycle config must not block startup.
+    #[test]
+    fn test_inverted_lifetime_is_an_error_only_where_it_applies() {
+        let mut reusable = scope(SessionMode::Reusable);
+        reusable.lifecycle.max_lifetime = Duration::from_secs(60);
+        reusable.lifecycle.max_idle_time = Duration::from_secs(300);
+        assert!(reusable.validate().is_err());
+
+        let mut always_new = scope(SessionMode::AlwaysNew);
+        always_new.lifecycle.max_lifetime = Duration::from_secs(60);
+        always_new.lifecycle.max_idle_time = Duration::from_secs(300);
+        assert!(always_new.validate().is_ok());
+    }
+
+    /// Settings that do nothing must be reported, not dropped — that is the whole point of
+    /// validating a configuration nobody re-reads after startup.
+    #[test]
+    fn test_warns_about_settings_with_no_effect() {
+        let mut config = scope(SessionMode::Dedicated);
+        config.min_contexts = 2;
+        let warnings = config.validate().expect("valid, just pointless");
+        assert!(warnings.iter().any(|w| w.contains("min_contexts")));
+
+        let mut blocked = scope(SessionMode::Reusable);
+        blocked.destroy_session_on_block = true;
+        let warnings = blocked.validate().expect("valid, just pointless");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("destroy_session_on_block")));
+
+        // The default configuration of every mode must be warning-free, otherwise the warnings
+        // become noise nobody reads.
+        for mode in [
+            SessionMode::AlwaysNew,
+            SessionMode::Reusable,
+            SessionMode::Dedicated,
+        ] {
+            let warnings = scope(mode).validate().expect("defaults must be valid");
+            if mode == SessionMode::AlwaysNew {
+                // Except always_new, which always carries lifecycle settings it ignores.
+                continue;
+            }
+            assert!(
+                warnings.is_empty(),
+                "{mode:?} warned about defaults: {warnings:?}"
+            );
+        }
     }
 
     #[test]

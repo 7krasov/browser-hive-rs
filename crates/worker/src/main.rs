@@ -83,16 +83,18 @@ fn load_config_from_env(
     // Maximum concurrent browser contexts per worker
     let max_contexts = env_parsed::<u16>("WORKER_MAX_CONTEXTS", 3)?;
 
-    // Default: min = max (for ReusablePreinit)
-    let min_contexts = env_parsed::<u16>("WORKER_MIN_CONTEXTS", max_contexts)?;
-
-    // Session mode: "always_new", "reusable", or "reusable_preinit"
+    // Session mode: "always_new", "reusable" or "dedicated"
     // Default is defined by SessionMode's #[default] attribute (Reusable)
     let session_mode = env_enum::<SessionMode>(
         "WORKER_SESSION_MODE",
         SessionMode::default(),
-        "always_new, reusable, reusable_preinit",
+        browser_hive_common::SESSION_MODE_VALUES,
     )?;
+
+    // Contexts pre-created on startup. Default 0: pre-initialization is worth its startup cost
+    // only in `reusable`, where any request can use a pre-created context, so it is opted into
+    // rather than inherited from max_contexts.
+    let min_contexts = env_parsed::<u16>("WORKER_MIN_CONTEXTS", 0)?;
 
     let headless = env_parsed::<bool>("WORKER_HEADLESS", true)?;
 
@@ -113,8 +115,23 @@ fn load_config_from_env(
     // If not set, uses default Chrome/Chromium auto-detection
     let browser_path: Option<PathBuf> = env::var("WORKER_BROWSER_PATH").ok().map(PathBuf::from);
 
-    // Lifecycle configuration
-    let max_idle_time_secs = env_parsed::<u64>("WORKER_MAX_IDLE_TIME_SECS", 5 * 60)?;
+    // Lifecycle configuration.
+    //
+    // The default depends on the mode because the timeout means different things. In `reusable`
+    // an idle context costs only memory, so five minutes of warm cache is a win. In `dedicated`
+    // it is the only thing that ever frees a claimed slot — there is no release RPC — so every
+    // abandoned session costs capacity for exactly this long, and the default drops to a minute.
+    let default_max_idle_time_secs = if session_mode == SessionMode::Dedicated {
+        browser_hive_common::DEFAULT_DEDICATED_MAX_IDLE_TIME_SECS
+    } else {
+        browser_hive_common::DEFAULT_MAX_IDLE_TIME_SECS
+    };
+    let max_idle_time_secs =
+        env_parsed::<u64>("WORKER_MAX_IDLE_TIME_SECS", default_max_idle_time_secs)?;
+
+    // Release a dedicated session's context as soon as its page comes back 403/429, instead of
+    // holding the slot (and the refused exit IP) until the idle timeout.
+    let destroy_session_on_block = env_parsed::<bool>("WORKER_DESTROY_SESSION_ON_BLOCK", false)?;
 
     // Create default binary params middleware
     // Users in production can replace this with custom implementations
@@ -148,6 +165,7 @@ fn load_config_from_env(
         binary_params_middlewares,
         tab_init_middlewares,
         context_isolation,
+        destroy_session_on_block,
     };
 
     Ok(WorkerConfig {

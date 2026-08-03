@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::proxy::ProxyConfig;
@@ -62,7 +62,6 @@ pub struct BrowserContextMetadata {
     pub last_used_at: Arc<Mutex<Instant>>,
     pub total_requests: Arc<AtomicU64>,
     pub cache_size_mb: Arc<AtomicU64>,
-    pub primary_domains: Arc<RwLock<HashSet<String>>>,
     pub is_busy: Arc<AtomicBool>, // True when processing a request
     /// Context-specific proxy config (overrides global scope proxy if set)
     /// Used for providers that need per-context proxy assignment (e.g. a datacenter pool where
@@ -78,7 +77,6 @@ impl Default for BrowserContextMetadata {
             last_used_at: Arc::new(Mutex::new(Instant::now())),
             total_requests: Arc::new(AtomicU64::new(0)),
             cache_size_mb: Arc::new(AtomicU64::new(0)),
-            primary_domains: Arc::new(RwLock::new(HashSet::new())),
             is_busy: Arc::new(AtomicBool::new(false)),
             assigned_proxy_config: None,
         }

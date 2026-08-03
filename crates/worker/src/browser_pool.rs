@@ -87,6 +87,19 @@ fn reclaim_leaked_always_new_contexts(
 /// The now-empty CDP BrowserContext is *not* disposed: `Target.disposeBrowserContext` is
 /// rejected over a page session (`Not allowed`) and headless_chrome exposes no browser-level
 /// method call. An empty context holds no renderer and no sockets, so that residue is minor.
+/// Choose the idle context with the lowest request count, or `None` if all are busy.
+///
+/// Free function rather than a method so both lookups — the optimistic one under the read lock
+/// and the double-check under the write lock — select identically. Ties keep the earlier
+/// context, which only matters for a pool that has just started and where every count is 0.
+fn select_least_used_idle(contexts: &[Arc<BrowserContext>]) -> Option<Arc<BrowserContext>> {
+    contexts
+        .iter()
+        .filter(|c| !c.metadata.is_busy.load(Ordering::SeqCst))
+        .min_by_key(|c| c.metadata.total_requests.load(Ordering::SeqCst))
+        .cloned()
+}
+
 fn close_tab_detached(tab: Arc<Tab>, context_id: uuid::Uuid) {
     // The request span does not cross spawn_blocking; re-enter it so these lines keep ray_id.
     let span = tracing::Span::current();
@@ -382,32 +395,47 @@ impl BrowserPool {
             total_contexts_recycled: Arc::new(AtomicU64::new(0)),
         };
 
-        // Log session mode and conditionally pre-initialize contexts
+        // Log session mode. What `max_contexts` counts differs per mode, so the line says it
+        // rather than printing a number whose meaning the reader has to look up.
         match scope_config.session_mode {
             SessionMode::AlwaysNew => {
-                info!("Session mode: ALWAYS_NEW (fresh context per request, destroyed after)");
                 info!(
-                    "Starting with 0 contexts - will create on-demand up to {}",
+                    "Session mode: ALWAYS_NEW (fresh context per request, destroyed after) - \
+                     up to {} concurrent requests",
                     scope_config.max_contexts
                 );
             }
             SessionMode::Reusable => {
                 info!(
-                    "Session mode: REUSABLE (contexts reused until recycled by lifecycle monitor)"
-                );
-                info!(
-                    "Starting with 0 contexts - will create on-demand up to {}",
+                    "Session mode: REUSABLE (anonymous pool, contexts reused by any request until \
+                     recycled) - up to {} concurrent requests",
                     scope_config.max_contexts
                 );
             }
-            SessionMode::ReusablePreinit => {
-                info!("Session mode: REUSABLE_PREINIT (reusable contexts, pre-created on startup)");
+            SessionMode::Dedicated => {
                 info!(
-                    "Pre-initializing {} contexts on startup (min: {}, max: {})",
-                    scope_config.min_contexts, scope_config.min_contexts, scope_config.max_contexts
+                    "Session mode: DEDICATED (one context per session, removed after {:?} idle) - \
+                     up to {} concurrent SESSIONS, not requests per second",
+                    scope_config.lifecycle.max_idle_time, scope_config.max_contexts
                 );
-                pool.populate_initial_contexts().await?;
             }
+        }
+
+        // Pre-initialization is an option, not a mode. It only helps where a pre-created context
+        // can serve an arbitrary request: in the other modes a context with no client is either
+        // never handed out (dedicated) or never reused (always_new), so it would occupy a slot
+        // until the lifecycle monitor removed it again. `ScopeConfig::validate` warns at startup.
+        if scope_config.min_contexts > 0 && scope_config.session_mode == SessionMode::Reusable {
+            info!(
+                "Pre-initializing {} contexts on startup (max: {})",
+                scope_config.min_contexts, scope_config.max_contexts
+            );
+            pool.populate_initial_contexts().await?;
+        } else {
+            info!(
+                "Starting with 0 contexts - will create on-demand up to {}",
+                scope_config.max_contexts
+            );
         }
 
         // Start lifecycle monitor
@@ -722,6 +750,51 @@ impl BrowserPool {
                     continue;
                 }
 
+                // Dedicated: a context belongs to one session and nothing else can free its
+                // slot — there is no release RPC, and a session-less request never takes an
+                // existing context. So an expired context is *removed*, not recycled: replacing
+                // it would put a fresh context nobody owns in the same slot, and the pool would
+                // report itself full with no session in sight.
+                //
+                // Expiry is the ordinary lifecycle predicate, so a session also ends when it
+                // outlives max_lifetime or exhausts max_requests. `max_idle_time` is the one
+                // that matters in practice, and `validate()` guarantees it is consulted.
+                if session_mode == SessionMode::Dedicated {
+                    let mut expired = Vec::new();
+                    let mut still_alive = Vec::with_capacity(contexts_guard.len());
+                    for context in contexts_guard.drain(..) {
+                        let idle = !context.metadata.is_busy.load(Ordering::SeqCst);
+                        if idle && Self::should_recycle_context(&context, &lifecycle_config).await {
+                            expired.push(context);
+                        } else {
+                            still_alive.push(context);
+                        }
+                    }
+                    *contexts_guard = still_alive;
+
+                    if !expired.is_empty() {
+                        info!(
+                            "Released {} idle dedicated session context(s) ({} still claimed)",
+                            expired.len(),
+                            contexts_guard.len()
+                        );
+                        for context in &expired {
+                            info!(
+                                "Released dedicated context {} (age: {:?}, requests: {})",
+                                context.metadata.id,
+                                context.metadata.created_at.elapsed(),
+                                context.metadata.total_requests.load(Ordering::SeqCst)
+                            );
+                        }
+                    }
+
+                    drop(contexts_guard);
+                    for context in &expired {
+                        close_context_tab(context).await;
+                    }
+                    continue;
+                }
+
                 let mut to_recycle = Vec::new();
 
                 for (idx, context) in contexts_guard.iter().enumerate() {
@@ -938,34 +1011,15 @@ impl BrowserPool {
             .cloned()
     }
 
-    /// Find best context for a specific domain (warm cache optimization)
-    pub async fn find_best_context_for_domain(&self, domain: &str) -> Option<Arc<BrowserContext>> {
-        let contexts = self.contexts.read().await;
-
-        // First, try to find an idle context that already scraped this domain
-        for context in contexts.iter() {
-            let domains = context.metadata.primary_domains.read().await;
-            let is_busy = context
-                .metadata
-                .is_busy
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if domains.contains(domain) && !is_busy {
-                return Some(context.clone());
-            }
-        }
-
-        // If not found, get any idle context
-        self.find_least_busy_context().await
-    }
-
+    /// Pick the idle context that has served the fewest requests.
+    ///
+    /// "Least busy" used to mean "the first one that is not busy", which is a different thing:
+    /// at moderate load the earliest context in the vector took a disproportionate share of the
+    /// traffic while the later ones idled. With per-context proxy routing that concentrated most
+    /// requests on the first exit IP — the opposite of why a pool of addresses is bought.
     pub async fn find_least_busy_context(&self) -> Option<Arc<BrowserContext>> {
         let contexts = self.contexts.read().await;
-
-        // Find first idle context
-        contexts
-            .iter()
-            .find(|c| !c.metadata.is_busy.load(std::sync::atomic::Ordering::SeqCst))
-            .cloned()
+        select_least_used_idle(&contexts)
     }
 
     /// Get or create a new context on-demand.
@@ -1011,14 +1065,8 @@ impl BrowserPool {
 
         if !proxy_params.requires_dedicated_context() {
             // Double-check after acquiring write lock (another task might have created one)
-            for context in contexts.iter() {
-                if !context
-                    .metadata
-                    .is_busy
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Ok(Some(context.clone()));
-                }
+            if let Some(context) = select_least_used_idle(&contexts) {
+                return Ok(Some(context));
             }
         }
 
@@ -1049,6 +1097,43 @@ impl BrowserPool {
             );
             Ok(None)
         }
+    }
+
+    /// Create a context that will belong to one session (Dedicated mode).
+    ///
+    /// Never reuses an existing context: in `Dedicated` every context in the pool is already
+    /// claimed by a client, and handing one to a request that arrived without its session id is
+    /// exactly the confusion this mode exists to remove. A session reaches its own context
+    /// through `find_context_by_id`, not through here.
+    ///
+    /// The capacity check is therefore a check on **concurrent sessions**. `Ok(None)` means every
+    /// session slot is taken — including by sessions that are merely idle between requests, which
+    /// is why the idle timeout has to be short.
+    pub async fn create_dedicated_context(
+        &self,
+        proxy_params: &ProxyParams,
+    ) -> Result<Option<Arc<BrowserContext>>> {
+        let mut contexts = self.contexts.write().await;
+
+        if contexts.len() >= self.scope_config.max_contexts as usize {
+            info!(
+                "Cannot start a new session (Dedicated mode) - all {} session slots are claimed",
+                self.scope_config.max_contexts
+            );
+            return Ok(None);
+        }
+
+        info!(
+            "Starting a new session context (Dedicated mode) ({}/{}) with proxy params: country_code={:?}",
+            contexts.len() + 1,
+            self.scope_config.max_contexts,
+            proxy_params.country_code
+        );
+
+        let context = Arc::new(self.create_new_context(proxy_params).await?);
+        contexts.push(context.clone());
+
+        Ok(Some(context))
     }
 
     /// Create a new context without reusing idle ones (AlwaysNew mode).
@@ -1182,8 +1267,23 @@ impl BrowserPool {
             .filter(|c| c.metadata.is_busy.load(std::sync::atomic::Ordering::SeqCst))
             .count();
 
-        // Available slots = max capacity minus currently busy contexts
-        let available_slots = total_slots.saturating_sub(active_requests);
+        // Slots that cannot be given to a new client.
+        //
+        // In `Dedicated` every context in the pool belongs to a session, so it is claimed whether
+        // or not a request is running in it right now — a client between two requests still owns
+        // its slot. Everywhere else nothing is held between requests, so claimed is exactly the
+        // busy count. Defined this way the number is a superset of `active_requests` in every
+        // mode, which is what makes it usable as a single autoscaling signal.
+        let claimed_contexts = if self.scope_config.session_mode == SessionMode::Dedicated {
+            contexts.len().max(active_requests)
+        } else {
+            active_requests
+        };
+
+        // Available slots = capacity minus what is claimed. Using the busy count here would let
+        // the coordinator route a new session to a `Dedicated` worker whose every context is
+        // already spoken for, and the request would come back as "all session slots claimed".
+        let available_slots = total_slots.saturating_sub(claimed_contexts);
 
         let total_requests: u64 = contexts
             .iter()
@@ -1195,6 +1295,7 @@ impl BrowserPool {
             total_slots,
             available_slots,
             active_requests,
+            claimed_contexts,
             total_requests,
             total_contexts_created: self.total_contexts_created.load(Ordering::SeqCst),
             total_contexts_recycled: self.total_contexts_recycled.load(Ordering::SeqCst),
@@ -1325,6 +1426,9 @@ pub struct BrowserPoolStats {
     pub total_slots: usize,
     pub available_slots: usize,
     pub active_requests: usize,
+    /// Slots that cannot be given to a new client: busy contexts everywhere, plus the idle-but-
+    /// owned contexts of `Dedicated` sessions. Always ≥ `active_requests`.
+    pub claimed_contexts: usize,
     pub total_requests: u64,
     pub total_contexts_created: u64,
     pub total_contexts_recycled: u64,
@@ -1440,6 +1544,7 @@ mod tests {
             binary_params_middlewares: vec![],
             tab_init_middlewares: vec![],
             context_isolation: isolation,
+            destroy_session_on_block: false,
         }
     }
 
@@ -1497,6 +1602,47 @@ mod tests {
             message.contains("proxyless_test") && message.contains("allows_direct_connection"),
             "the error must name the provider and the opt-in that would allow this: {message}"
         );
+    }
+
+    /// Selection must spread traffic, not pile it onto the first context. With per-context proxy
+    /// routing the old "first idle wins" behaviour meant one exit IP carried most of the load
+    /// while the rest of the purchased pool sat idle.
+    #[test]
+    fn selects_the_idle_context_with_the_fewest_requests() {
+        let heavily_used = make_context(false);
+        heavily_used
+            .metadata
+            .total_requests
+            .store(40, Ordering::SeqCst);
+        let barely_used = make_context(false);
+        barely_used
+            .metadata
+            .total_requests
+            .store(3, Ordering::SeqCst);
+
+        // `heavily_used` comes first, which is exactly what the old implementation returned.
+        let contexts = vec![heavily_used, barely_used.clone()];
+
+        let selected = select_least_used_idle(&contexts).expect("one context is idle");
+        assert_eq!(selected.metadata.id, barely_used.metadata.id);
+    }
+
+    /// A busy context is never a candidate, however little it has been used.
+    #[test]
+    fn skips_busy_contexts_however_lightly_used() {
+        let busy_and_fresh = make_context(true);
+        let idle_and_worn = make_context(false);
+        idle_and_worn
+            .metadata
+            .total_requests
+            .store(999, Ordering::SeqCst);
+
+        let contexts = vec![busy_and_fresh, idle_and_worn.clone()];
+
+        let selected = select_least_used_idle(&contexts).expect("one context is idle");
+        assert_eq!(selected.metadata.id, idle_and_worn.metadata.id);
+
+        assert!(select_least_used_idle(&[make_context(true)]).is_none());
     }
 
     #[test]

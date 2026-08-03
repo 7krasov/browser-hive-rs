@@ -75,8 +75,9 @@ impl ProxyParams {
     /// When this returns true, the worker should create a new context instead
     /// of reusing an idle one.
     ///
-    /// This is checked in Reusable/ReusablePreinit modes to decide whether
-    /// to reuse an idle context or create a fresh one with the requested params.
+    /// This is checked in `SessionMode::Reusable` to decide whether to reuse an idle context or
+    /// create a fresh one with the requested params. The other modes create a context per
+    /// request or per session anyway, so it makes no difference there.
     pub fn requires_dedicated_context(&self) -> bool {
         self.country_code.is_some()
         // Future: || self.city.is_some() || self.asn.is_some()

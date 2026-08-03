@@ -60,15 +60,16 @@ pub const LIBRARY_VERSION_BANNER: &str =
 ///         scope: ScopeConfig {
 ///             name: "my_scope".to_string(),
 ///             proxy_provider: Box::new(provider),
-///             min_contexts: 2,
+///             min_contexts: 2,   // Pre-create contexts on startup (0 = none)
 ///             max_contexts: 10,
-///             session_mode: SessionMode::ReusablePreinit, // Pre-initialize contexts on startup
+///             session_mode: SessionMode::Reusable,
 ///             headless: true,
 ///             lifecycle: ContextLifecycleConfig::default(),
 ///             diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
 ///             binary_params_middlewares: vec![],
 ///             tab_init_middlewares: vec![],
 ///             context_isolation: ContextIsolation::Isolated,
+///             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated
 ///         },
 ///         grpc_port: 50052,
 ///         pod_name: "worker-1".to_string(),
@@ -96,9 +97,21 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     info!("{}", LIBRARY_VERSION_BANNER);
 
     info!(
-        "Starting worker for scope: {} on {}:{} (session_mode: {:?})",
-        config.scope.name, config.pod_ip, config.grpc_port, config.scope.session_mode
+        "Starting worker for scope: {} on {}:{} (session_mode: {})",
+        config.scope.name,
+        config.pod_ip,
+        config.grpc_port,
+        config.scope.session_mode.as_str()
     );
+
+    // Fail fast on a scope that cannot do what it is configured to do, before a browser is
+    // launched and before the pod reports itself ready — the same reasoning as the "a worker
+    // never starts without a proxy" guard: a combination that silently does the wrong thing is
+    // worse than a pod that does not start, because nothing downstream reports it. Settings that
+    // are merely inert are logged instead, never dropped in silence.
+    for warning in config.scope.validate()? {
+        warn!("{}", warning);
+    }
 
     // Create cancellation token for graceful shutdown
     let cancellation_token = CancellationToken::new();

@@ -39,15 +39,16 @@
 //!         scope: ScopeConfig {
 //!             name: "my_scope".to_string(),
 //!             proxy_provider: provider,
-//!             min_contexts: 2,
+//!             min_contexts: 2, // Pre-create contexts on startup (0 = none)
 //!             max_contexts: 10,
-//!             session_mode: SessionMode::Reusable, // Reusable contexts (recycled by lifecycle)
+//!             session_mode: SessionMode::Reusable, // Anonymous pool (recycled by lifecycle)
 //!             headless: true,
 //!             lifecycle: Default::default(),
 //!             diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
 //!             binary_params_middlewares: vec![],
 //!             tab_init_middlewares: vec![],
 //!             context_isolation: ContextIsolation::Isolated, // Each context has isolated cookies/storage
+//!             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated
 //!         },
 //!         grpc_port: 50052,
 //!         pod_name: "worker-1".to_string(),

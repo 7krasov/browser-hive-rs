@@ -59,9 +59,16 @@ fn read_navigation_status(tab: &Arc<Tab>) -> Option<u32> {
 ///
 /// Deliberately narrow: 5xx are excluded because they can be transient inside a
 /// CDN and the page sometimes still arrives.
-const EARLY_EXIT_STATUS_CODES: &[u32] = &[403, 429];
+pub const EARLY_EXIT_STATUS_CODES: &[u32] = &[403, 429];
 
-fn should_exit_early(status: u32) -> bool {
+/// Whether a status means "the origin refused this identity", rather than "the page is loading".
+///
+/// Public because the worker reuses the same list for a second decision that follows from the
+/// same fact: a `Dedicated` session whose page came back 403/429 is burnt, so its context can be
+/// released instead of holding a slot until the idle timeout (see
+/// `ScopeConfig::destroy_session_on_block`). Deliberately one list — the day 503 joins it, both
+/// decisions must change together.
+pub fn should_exit_early(status: u32) -> bool {
     EARLY_EXIT_STATUS_CODES.contains(&status)
 }
 
@@ -442,7 +449,10 @@ impl WaitStrategy for NetworkIdleStrategy {
                                                 if let Ok(result) = tab.evaluate(script, false) {
                                                     if let Some(value) = result.value {
                                                         if let Some(json) = value.as_str() {
-                                                            tracing::warn!("Blocked resources diagnostics: {}", json);
+                                                            tracing::warn!(
+                                                                "Blocked resources diagnostics: {}",
+                                                                json
+                                                            );
                                                         }
                                                     }
                                                 }
