@@ -1,13 +1,15 @@
-use anyhow::Result;
+use crate::browser_cdp::BrowserCdpClient;
+use anyhow::{bail, Result};
 use browser_hive_common::{
     BrowserContextMetadata, ContextIsolation, ContextLifecycleConfig, ProxyConfig, ProxyParams,
     ProxyProvider, RotationStrategy, ScopeConfig, SessionMode, TabInitMiddleware,
 };
+use headless_chrome::browser::context::Context as CdpContext;
 use headless_chrome::browser::tab::Tab;
 use headless_chrome::protocol::cdp::Target::CreateTarget;
 use headless_chrome::{Browser, LaunchOptions};
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -20,6 +22,17 @@ pub struct BrowserPool {
     lifecycle_config: ContextLifecycleConfig,
     proxy_config: ProxyConfig,
     proxy_provider: Box<dyn ProxyProvider>, // For per-context proxy assignment
+
+    /// Browser-level CDP client, present only when the provider assigns proxy hosts per
+    /// context. Every other provider keeps using `Browser::new_context()`, so no second
+    /// socket is opened for them.
+    ///
+    /// Shared with the lifecycle monitor, which recycles contexts and must route them the
+    /// same way the request path does.
+    cdp_client: Option<Arc<BrowserCdpClient>>,
+
+    /// Latches the one-time warning about a provider handing out hosts that do not route.
+    proxy_host_mismatch_warned: AtomicBool,
 
     // Browser customization middlewares
     tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>>, // Applied to each new tab after creation
@@ -133,30 +146,121 @@ pub struct BrowserContext {
     /// None for shared mode (tab in default browser context).
     /// Some(id) for isolated mode (tab in dedicated CDP BrowserContext).
     pub cdp_context_id: Option<String>,
+    /// Proxy host this context's traffic actually leaves through, credentials stripped.
+    ///
+    /// Not the same thing as `metadata.assigned_proxy_config`: that config is read for its
+    /// credentials, and its host only routes anything when the provider assigns hosts per
+    /// context. This field records the host that ends up carrying the traffic either way, so a
+    /// log line can name it without the reader having to know which of the two applies.
+    pub proxy_host: Option<String>,
 }
 
 impl BrowserPool {
     pub async fn new(scope_config: ScopeConfig) -> Result<Self> {
         info!("Launching Chrome process for scope: {}", scope_config.name);
 
+        let per_context_proxy_host = scope_config.proxy_provider.assigns_proxy_host_per_context();
+
+        // Refuse the combinations that cannot deliver what the provider promises. Both fail at
+        // startup rather than warn: downgraded to a warning either would be lost in the first
+        // minute of a pod's logs, while the pool went on serving a single address under a log
+        // line announcing rotation.
+        if per_context_proxy_host {
+            // Shared isolation runs every request in the browser's default context, which is
+            // pinned to the launch proxy for the process's lifetime.
+            if matches!(scope_config.context_isolation, ContextIsolation::Shared) {
+                bail!(
+                    "Proxy provider '{}' assigns a proxy host per context, which requires \
+                     WORKER_CONTEXT_ISOLATION=isolated. In shared isolation every request runs in \
+                     the browser's default context and would silently use a single host from the \
+                     pool.",
+                    scope_config.proxy_provider.name()
+                );
+            }
+
+            // The per-context host is read off the config `get_context_proxy` returns, and that
+            // call only happens when `supports_per_context_proxy()` is true. Without it there is
+            // no per-context config to take a host from, so every context would fall back to the
+            // launch proxy - the very bug this flag exists to remove, and invisible, since the
+            // flag alone is enough to log that per-context routing is on.
+            if !scope_config.proxy_provider.supports_per_context_proxy() {
+                bail!(
+                    "Proxy provider '{}' returns assigns_proxy_host_per_context() = true but \
+                     supports_per_context_proxy() = false. The per-context host comes from \
+                     get_context_proxy(), which is only called when the latter is true, so this \
+                     combination would route every context through the browser-wide proxy. \
+                     Override both.",
+                    scope_config.proxy_provider.name()
+                );
+            }
+        }
+
         // Build proxy configuration
         let proxy_config = scope_config.proxy_provider.build_config()?;
 
-        // Get proxy server URL (None if no proxy)
-        let proxy_server = proxy_config.build_proxy_server();
+        // Get proxy server URL (None if no proxy).
+        //
+        // An empty string is normalised to None here rather than passed on: Chrome reads
+        // `--proxy-server=` as "no proxy" and scrapes directly, which is the one outcome this
+        // whole block exists to make impossible by accident.
+        let proxy_server = proxy_config
+            .build_proxy_server()
+            .map(|server| server.trim().to_string())
+            .filter(|server| !server.is_empty());
 
-        // Log proxy configuration
-        if let Some(server) = &proxy_server {
-            if proxy_config.get_credentials().is_some() {
+        // Refuse to start without a proxy unless the provider asks for a direct connection.
+        //
+        // This is the only remaining way a scrape can leave through the pod's own IP: every
+        // in-request fallback (a tab created in the default context, a slot whose recycling
+        // failed, a recreated tab after a dead CDP session) lands on this launch proxy, so if it
+        // exists, no request can escape it. If it does not, they all go out directly - and
+        // nothing downstream fails, which is why this has to fail here.
+        if proxy_server.is_none() && !scope_config.proxy_provider.allows_direct_connection() {
+            bail!(
+                "Proxy provider '{}' produced no proxy server, so every request would be made \
+                 from this pod's own public IP. Check the provider's configuration (an \
+                 unparseable port, an empty URL and an empty pool all end up here). If a direct \
+                 connection is intended, override ProxyProvider::allows_direct_connection() to \
+                 return true.",
+                scope_config.proxy_provider.name()
+            );
+        }
+
+        // Log proxy configuration. Which of the two routing modes is in force is worth a line of
+        // its own: "one proxy for the whole browser" is a legitimate mode, but it is also what a
+        // provider gets by silently not overriding `assigns_proxy_host_per_context`, and the
+        // difference is otherwise only visible by correlating `span_proxy_host` across requests.
+        match &proxy_server {
+            Some(server) if per_context_proxy_host => {
                 info!(
-                    "Using proxy: {} (with authentication via Fetch API)",
+                    "Proxy: per-context hosts from provider '{}' - {} carries the browser's \
+                     default context only",
+                    scope_config.proxy_provider.name(),
                     server
                 );
-            } else {
-                info!("Using proxy: {} (no authentication)", server);
             }
-        } else {
-            info!("No proxy configured - using direct connection");
+            Some(server) => {
+                let credentials = if proxy_config.get_credentials().is_some() {
+                    "with authentication via Fetch API"
+                } else {
+                    "no authentication"
+                };
+                let per_context = if scope_config.proxy_provider.supports_per_context_proxy() {
+                    ", credentials vary per context"
+                } else {
+                    ""
+                };
+                info!(
+                    "Proxy: {} carries every context of this browser ({}{})",
+                    server, credentials, per_context
+                );
+            }
+            None => {
+                info!(
+                    "No proxy configured - using direct connection (provider '{}' asked for it)",
+                    scope_config.proxy_provider.name()
+                );
+            }
         }
 
         // Build Chrome args using binary params middlewares
@@ -226,6 +330,21 @@ impl BrowserPool {
         })?;
         info!("Browser process launched successfully");
 
+        // Only providers that route per context need the second CDP client, so no other scope
+        // pays for the extra socket. Connecting now turns a broken endpoint into a startup
+        // failure instead of into a failure of the first scrape request.
+        let cdp_client = if per_context_proxy_host {
+            let client = BrowserCdpClient::connect(browser.get_ws_url())?;
+            info!(
+                "Per-context proxy hosts enabled for provider '{}' - each context gets its own \
+                 proxy from the pool",
+                scope_config.proxy_provider.name()
+            );
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+
         let lifecycle_config = scope_config.lifecycle.clone();
 
         // Clone proxy provider for per-context assignment
@@ -256,6 +375,8 @@ impl BrowserPool {
             lifecycle_config,
             proxy_config,
             proxy_provider,
+            cdp_client,
+            proxy_host_mismatch_warned: AtomicBool::new(false),
             tab_init_middlewares,
             total_contexts_created: Arc::new(AtomicU64::new(0)),
             total_contexts_recycled: Arc::new(AtomicU64::new(0)),
@@ -398,23 +519,65 @@ impl BrowserPool {
             }
         }
 
+        let context_proxy_host = metadata
+            .assigned_proxy_config
+            .as_ref()
+            .and_then(ProxyConfig::build_proxy_server);
+        let launch_proxy_host = self.proxy_config.build_proxy_server();
+        self.warn_if_assigned_host_does_not_route(&context_proxy_host, &launch_proxy_host);
+
+        // The host that will actually carry this context's traffic. Without per-context
+        // routing the assigned config contributes credentials only, so the launch proxy is the
+        // honest answer - and the one worth logging.
+        let proxy_host = if self.cdp_client.is_some() {
+            context_proxy_host
+                .clone()
+                .or_else(|| launch_proxy_host.clone())
+        } else {
+            launch_proxy_host.clone()
+        };
+
         // Create tab based on isolation mode
         let (new_tab, cdp_context_id) = match self.scope_config.context_isolation {
             ContextIsolation::Isolated => {
                 // Create isolated CDP BrowserContext (like incognito - separate cookies/storage)
-                let cdp_context = self
-                    .browser
-                    .new_context()
-                    .map_err(|e| anyhow::anyhow!("Failed to create isolated CDP context: {}", e))?;
+                let context_id = match (&self.cdp_client, &context_proxy_host) {
+                    // Providers whose pool is a list of hosts: the context is created with its
+                    // own proxy, because `Browser::new_context()` cannot carry one.
+                    //
+                    // No fallback to the plain path on failure. Falling back would put the
+                    // request on the launch proxy while the logs claimed rotation - the exact
+                    // silent single-host behaviour this exists to remove.
+                    (Some(client), Some(host)) => {
+                        client.create_browser_context(host).map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to create isolated CDP context with its own proxy: {}",
+                                e
+                            )
+                        })?
+                    }
+                    _ => self
+                        .browser
+                        .new_context()
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to create isolated CDP context: {}", e)
+                        })?
+                        .get_id()
+                        .to_string(),
+                };
 
-                let context_id = cdp_context.get_id().to_string();
-
-                // Create tab within the isolated context
+                // Tab creation, Fetch auth and navigation all stay on headless_chrome's own
+                // transport - the context id is browser state, so the crate can adopt it.
+                let cdp_context = CdpContext::new(&self.browser, context_id.clone());
                 let tab = cdp_context.new_tab().map_err(|e| {
                     anyhow::anyhow!("Failed to create tab in isolated context: {}", e)
                 })?;
 
-                info!("Created ISOLATED CDP context {} with tab", context_id);
+                info!(
+                    "Created ISOLATED CDP context {} with tab (proxy: {})",
+                    context_id,
+                    proxy_host.as_deref().unwrap_or("direct connection")
+                );
 
                 (tab, Some(context_id))
             }
@@ -463,7 +626,51 @@ impl BrowserPool {
             metadata,
             tab: Arc::new(Mutex::new(Some(new_tab))),
             cdp_context_id,
+            proxy_host,
         })
+    }
+
+    /// Warn once when a provider hands out a proxy host that does not route anything.
+    ///
+    /// `supports_per_context_proxy` delivers *credentials* per context; the host of that config
+    /// is discarded unless the provider also opts into per-context routing. A provider whose
+    /// pool is a list of distinct hosts therefore looks like it is rotating while every request
+    /// leaves through the single host picked at browser launch - and, worse, authenticates that
+    /// host with credentials taken from a different pool entry. That works only as long as every
+    /// entry shares one username and password; the day they differ it becomes a fleet-wide 407
+    /// with nothing in the logs pointing at the cause.
+    ///
+    /// Once per pool: this is a static property of the provider, so repeating it per context
+    /// would only add noise to a log that already carries the effective host.
+    fn warn_if_assigned_host_does_not_route(
+        &self,
+        context_proxy_host: &Option<String>,
+        launch_proxy_host: &Option<String>,
+    ) {
+        if self.cdp_client.is_some() {
+            return;
+        }
+        let Some(assigned) = context_proxy_host else {
+            return;
+        };
+        if Some(assigned) == launch_proxy_host.as_ref() {
+            return;
+        }
+        if self.proxy_host_mismatch_warned.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        warn!(
+            "Proxy provider '{}' assigns host {} per context, but all traffic leaves through the \
+             browser-wide proxy {} - only the credentials of the per-context config are used, so \
+             the pool is NOT being rotated. If this provider's exits are distinct hosts, override \
+             ProxyProvider::assigns_proxy_host_per_context() to return true; if its exits are \
+             selected through the username (gateway providers), make build_config() and \
+             get_context_proxy() agree on the host.",
+            self.proxy_provider.name(),
+            assigned,
+            launch_proxy_host.as_deref().unwrap_or("<none>"),
+        );
     }
 
     pub fn start_lifecycle_monitor(&self) {
@@ -476,6 +683,8 @@ impl BrowserPool {
         let tab_init_middlewares = self.tab_init_middlewares.clone();
         let context_isolation = self.scope_config.context_isolation;
         let session_mode = self.scope_config.session_mode;
+        let cdp_client = self.cdp_client.clone();
+        let launch_proxy_host = self.proxy_config.build_proxy_server();
 
         // Standalone background task: the request span never reaches it, so it opens its own.
         // `scope` matches the request span's field, and `ray_id` keeps the sentinel value these
@@ -568,13 +777,38 @@ impl BrowserPool {
                             }
                         }
 
+                        let context_proxy_host = metadata
+                            .assigned_proxy_config
+                            .as_ref()
+                            .and_then(ProxyConfig::build_proxy_server);
+                        let proxy_host = if cdp_client.is_some() {
+                            context_proxy_host
+                                .clone()
+                                .or_else(|| launch_proxy_host.clone())
+                        } else {
+                            launch_proxy_host.clone()
+                        };
+
                         // Create tab based on isolation mode
                         let (tab, cdp_context_id) = match context_isolation {
                             ContextIsolation::Isolated => {
-                                // Create isolated CDP BrowserContext
-                                match browser.new_context() {
-                                    Ok(cdp_context) => {
-                                        let ctx_id = cdp_context.get_id().to_string();
+                                // Recycling must route the new context exactly like the request
+                                // path does. Creating it with the plain call for a provider that
+                                // routes per context would drop it onto the launch proxy, so the
+                                // pool would stop rotating after the first lifecycle tick.
+                                let created = match (&cdp_client, &context_proxy_host) {
+                                    (Some(client), Some(host)) => client
+                                        .create_browser_context(host)
+                                        .map_err(|e| e.to_string()),
+                                    _ => browser
+                                        .new_context()
+                                        .map(|cdp_context| cdp_context.get_id().to_string())
+                                        .map_err(|e| e.to_string()),
+                                };
+
+                                match created {
+                                    Ok(ctx_id) => {
+                                        let cdp_context = CdpContext::new(&browser, ctx_id.clone());
                                         match cdp_context.new_tab() {
                                             Ok(new_tab) => {
                                                 // Apply tab init middlewares
@@ -590,11 +824,20 @@ impl BrowserPool {
                                                 (Some(new_tab), Some(ctx_id))
                                             }
                                             Err(e) => {
+                                                // Keep the context id: the CDP BrowserContext was
+                                                // created and carries this slot's proxy, only the
+                                                // tab failed. Dropping the id here would send the
+                                                // next request's lazy tab creation into the
+                                                // browser's default context - no isolation, and
+                                                // the launch proxy instead of the assigned host.
                                                 tracing::warn!(
-                                                    "Failed to create tab in isolated context: {}",
+                                                    "Failed to create tab in isolated context {} - \
+                                                     keeping the context, the tab is created lazily \
+                                                     on the next request: {}",
+                                                    ctx_id,
                                                     e
                                                 );
-                                                (None, None)
+                                                (None, Some(ctx_id))
                                             }
                                         }
                                     }
@@ -646,6 +889,7 @@ impl BrowserPool {
                             metadata,
                             tab: Arc::new(Mutex::new(tab)),
                             cdp_context_id,
+                            proxy_host,
                         };
 
                         contexts_guard[*idx] = Arc::new(new_context);
@@ -881,7 +1125,9 @@ impl BrowserPool {
     /// Remove a context from the pool by its ID.
     ///
     /// This is used in SessionMode::AlwaysNew to destroy the context after
-    /// the request completes, freeing up the slot for the next request.
+    /// the request completes, freeing up the slot for the next request — and in any mode to drop
+    /// a slot that can no longer be served correctly (an isolated context whose CDP context is
+    /// gone), so the next request builds a fresh one instead of meeting the same broken slot.
     ///
     /// The tab is closed in Chrome as well — removing the context from the pool `Vec` alone
     /// leaks it, see `close_tab_detached`. Idempotent: a second call finds neither the context
@@ -907,7 +1153,7 @@ impl BrowserPool {
                     ""
                 };
                 info!(
-                    "Destroyed context (AlwaysNew mode) {}{} ({} contexts remaining)",
+                    "Destroyed context {}{} ({} contexts remaining)",
                     context_id,
                     isolation_info,
                     contexts.len()
@@ -969,6 +1215,19 @@ impl BrowserPool {
 
     pub fn get_proxy_provider_name(&self) -> &str {
         self.proxy_provider.name()
+    }
+
+    /// Whether each pool context owns a CDP BrowserContext rather than sharing the default one.
+    ///
+    /// Callers that create a tab need this to tell "no tab yet" from "no tab and nowhere correct
+    /// to put one": under isolation, cookies, storage and (for providers that route per context)
+    /// the proxy all live on the CDP context, so a tab in the default context silently has none
+    /// of them.
+    pub fn uses_isolated_contexts(&self) -> bool {
+        matches!(
+            self.scope_config.context_isolation,
+            ContextIsolation::Isolated
+        )
     }
 
     /// Create a new tab in an existing CDP BrowserContext.
@@ -1076,7 +1335,8 @@ mod tests {
     use super::*;
 
     /// Build a context without touching a browser: an AlwaysNew pool slot is fully described
-    /// by its metadata, so `tab`/`cdp_context_id` may stay empty for reclamation tests.
+    /// by its metadata, so `tab`/`cdp_context_id`/`proxy_host` may stay empty for reclamation
+    /// tests.
     fn make_context(busy: bool) -> Arc<BrowserContext> {
         let metadata = BrowserContextMetadata::new();
         metadata.is_busy.store(busy, Ordering::SeqCst);
@@ -1084,7 +1344,159 @@ mod tests {
             metadata,
             tab: Arc::new(Mutex::new(None)),
             cdp_context_id: None,
+            proxy_host: None,
         })
+    }
+
+    /// Provider that claims per-context routing without needing any real proxy: the guards under
+    /// test run before the browser is launched, so nothing here is ever connected to.
+    ///
+    /// `supports_per_context_proxy` is a field rather than a constant so the inconsistent
+    /// combination (routing per host, but no per-context config to take the host from) can be
+    /// built at all — the trait's defaults make it easy to write by accident.
+    #[derive(Debug, Clone)]
+    struct HostPoolProvider {
+        supports_per_context_proxy: bool,
+    }
+
+    impl browser_hive_common::ProxyProvider for HostPoolProvider {
+        fn build_config(&self) -> Result<ProxyConfig> {
+            Ok(ProxyConfig {
+                proxy_url: Some("http://user:pass@203.0.113.1:60000".to_string()),
+                scheme: browser_hive_common::ProxyScheme::Http,
+                address: None,
+                port: None,
+                username: None,
+                password: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "host_pool_test"
+        }
+
+        fn clone_box(&self) -> Box<dyn ProxyProvider> {
+            Box::new(self.clone())
+        }
+
+        fn supports_per_context_proxy(&self) -> bool {
+            self.supports_per_context_proxy
+        }
+
+        fn assigns_proxy_host_per_context(&self) -> bool {
+            true
+        }
+    }
+
+    /// Provider that hands back a config with nothing in it — the shape every misconfiguration
+    /// collapses into (unparseable port, empty URL, empty pool) by the time the pool sees it.
+    #[derive(Debug, Clone)]
+    struct ProxylessProvider;
+
+    impl browser_hive_common::ProxyProvider for ProxylessProvider {
+        fn build_config(&self) -> Result<ProxyConfig> {
+            Ok(ProxyConfig {
+                proxy_url: None,
+                scheme: browser_hive_common::ProxyScheme::Http,
+                address: None,
+                port: None,
+                username: None,
+                password: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "proxyless_test"
+        }
+
+        fn clone_box(&self) -> Box<dyn ProxyProvider> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn scope_with(isolation: ContextIsolation, supports_per_context_proxy: bool) -> ScopeConfig {
+        scope_with_provider(
+            Box::new(HostPoolProvider {
+                supports_per_context_proxy,
+            }),
+            isolation,
+        )
+    }
+
+    fn scope_with_provider(
+        proxy_provider: Box<dyn ProxyProvider>,
+        isolation: ContextIsolation,
+    ) -> ScopeConfig {
+        ScopeConfig {
+            name: "guard_test".to_string(),
+            proxy_provider,
+            min_contexts: 0,
+            max_contexts: 1,
+            session_mode: SessionMode::AlwaysNew,
+            headless: true,
+            lifecycle: ContextLifecycleConfig::default(),
+            browser_path: None,
+            diagnostics: browser_hive_common::DiagnosticsConfig::default(),
+            binary_params_middlewares: vec![],
+            tab_init_middlewares: vec![],
+            context_isolation: isolation,
+        }
+    }
+
+    /// Shared isolation runs every request in the browser's default context, which no CDP call
+    /// can re-point at another proxy — a provider that routes per context would silently serve
+    /// one address from its pool. The refusal has to happen before the browser is launched,
+    /// which is also what makes this testable without one.
+    #[tokio::test]
+    async fn refuses_per_context_proxy_hosts_in_shared_isolation() {
+        let Err(error) = BrowserPool::new(scope_with(ContextIsolation::Shared, true)).await else {
+            panic!("shared isolation must not start with per-context proxy hosts");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("host_pool_test") && message.contains("isolated"),
+            "the error must name the provider and the required isolation mode: {message}"
+        );
+    }
+
+    /// The host to route by comes from `get_context_proxy`, which is only consulted when
+    /// `supports_per_context_proxy()` is true. With only the routing flag set there is no host to
+    /// use, so every context would quietly fall back to the browser-wide proxy — while startup
+    /// logs "each context gets its own proxy from the pool". Refusing beats routing nothing.
+    #[tokio::test]
+    async fn refuses_per_context_proxy_hosts_without_per_context_configs() {
+        let Err(error) = BrowserPool::new(scope_with(ContextIsolation::Isolated, false)).await
+        else {
+            panic!("per-context routing must not start without per-context proxy configs");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("host_pool_test") && message.contains("supports_per_context_proxy"),
+            "the error must name the provider and the flag that is missing: {message}"
+        );
+    }
+
+    /// The launch proxy is the floor under every in-request fallback: a tab that ends up in the
+    /// default context still leaves through it. Without one, those same fallbacks - and the happy
+    /// path too - scrape from the pod's own public IP, and nothing about the response says so.
+    ///
+    /// The opt-in half of this guard cannot be asserted here (starting successfully means
+    /// launching a real browser); it is pinned by `NoProxyProvider`'s own test instead.
+    #[tokio::test]
+    async fn refuses_to_start_without_a_proxy() {
+        let scope = scope_with_provider(Box::new(ProxylessProvider), ContextIsolation::Isolated);
+
+        let Err(error) = BrowserPool::new(scope).await else {
+            panic!("a provider with no proxy must not start a browser that scrapes directly");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("proxyless_test") && message.contains("allows_direct_connection"),
+            "the error must name the provider and the opt-in that would allow this: {message}"
+        );
     }
 
     #[test]

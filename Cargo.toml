@@ -24,7 +24,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -49,6 +49,12 @@ k8s-openapi = { version = "0.23", features = ["latest"] }
 
 # Browser automation
 headless_chrome = "1.0"
+# Second CDP client for browser-level methods headless_chrome does not expose
+# (see worker/src/browser_cdp.rs). The browser endpoint is plain ws:// on loopback,
+# so no TLS backend is needed. Kept on the same version headless_chrome resolves,
+# so the two clients sharing one browser also share one WebSocket implementation
+# instead of linking two copies of it.
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 
 # Metrics
 prometheus = "0.13"

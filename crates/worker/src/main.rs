@@ -6,8 +6,11 @@
 
 mod providers;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use browser_hive_worker::run_worker;
+use std::env;
+use std::fmt::Display;
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,6 +27,44 @@ async fn main() -> Result<()> {
     run_worker(config).await
 }
 
+/// Read an optional environment variable, failing loudly on a malformed value.
+///
+/// An unset variable yields the default; a variable that is set but cannot be parsed aborts
+/// startup. The alternative — `.ok().and_then(parse).unwrap_or(default)` — turns a typo into a
+/// silent default: the worker comes up with settings nobody chose and nothing in the logs says
+/// so. A manifest that sets `WORKER_MAX_CONTEXTS: "ten"` should not run at 3.
+fn env_parsed<T>(key: &str, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|e| anyhow!("{key}: invalid value '{}' ({e})", raw.trim())),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(anyhow!("{key}: {e}")),
+    }
+}
+
+/// Same as [`env_parsed`], for the library's config enums.
+///
+/// Their `FromStr::Err` is `()`, which carries no message, so the accepted values have to be
+/// spelled out by the caller.
+fn env_enum<T: FromStr>(key: &str, default: T, allowed: &str) -> Result<T> {
+    match env::var(key) {
+        Ok(raw) => raw.trim().parse().map_err(|_| {
+            anyhow!(
+                "{key}: invalid value '{}' (expected one of: {allowed})",
+                raw.trim()
+            )
+        }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(anyhow!("{key}: {e}")),
+    }
+}
+
 fn load_config_from_env(
     proxy_provider: Box<dyn browser_hive_common::ProxyProvider>,
 ) -> Result<browser_hive_common::WorkerConfig> {
@@ -31,39 +72,29 @@ fn load_config_from_env(
         ContextIsolation, ContextLifecycleConfig, DefaultBinaryParamsMiddleware, ScopeConfig,
         SessionMode, WorkerConfig,
     };
-    use std::env;
     use std::path::PathBuf;
     use std::time::Duration;
 
     let scope_name = env::var("WORKER_SCOPE_NAME").unwrap_or_else(|_| "local_dev".to_string());
-    let grpc_port = env::var("WORKER_GRPC_PORT")
-        .unwrap_or_else(|_| "50052".to_string())
-        .parse::<u16>()?;
+    let grpc_port = env_parsed::<u16>("WORKER_GRPC_PORT", 50052)?;
     let pod_name = env::var("POD_NAME").unwrap_or_else(|_| "worker-local".to_string());
     let pod_ip = env::var("POD_IP").unwrap_or_else(|_| "0.0.0.0".to_string());
 
     // Maximum concurrent browser contexts per worker
-    let max_contexts = env::var("WORKER_MAX_CONTEXTS")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(3);
+    let max_contexts = env_parsed::<u16>("WORKER_MAX_CONTEXTS", 3)?;
 
-    let min_contexts = env::var("WORKER_MIN_CONTEXTS")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(max_contexts); // Default: min = max (for ReusablePreinit)
+    // Default: min = max (for ReusablePreinit)
+    let min_contexts = env_parsed::<u16>("WORKER_MIN_CONTEXTS", max_contexts)?;
 
     // Session mode: "always_new", "reusable", or "reusable_preinit"
     // Default is defined by SessionMode's #[default] attribute (Reusable)
-    let session_mode: SessionMode = env::var("WORKER_SESSION_MODE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_default();
+    let session_mode = env_enum::<SessionMode>(
+        "WORKER_SESSION_MODE",
+        SessionMode::default(),
+        "always_new, reusable, reusable_preinit",
+    )?;
 
-    let headless = env::var("WORKER_HEADLESS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(true);
+    let headless = env_parsed::<bool>("WORKER_HEADLESS", true)?;
 
     // Browser diagnostics: all knobs in one call so downstream binaries, which have their own
     // main.rs, do not have to re-implement the parsing. Disabled unless
@@ -72,20 +103,18 @@ fn load_config_from_env(
 
     // Context isolation mode: "shared" or "isolated"
     // Default is defined by ContextIsolation's #[default] attribute (Isolated)
-    let context_isolation: ContextIsolation = env::var("WORKER_CONTEXT_ISOLATION")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_default();
+    let context_isolation = env_enum::<ContextIsolation>(
+        "WORKER_CONTEXT_ISOLATION",
+        ContextIsolation::default(),
+        "shared, isolated",
+    )?;
 
     // Custom browser path (e.g., /usr/bin/brave-browser for Brave)
     // If not set, uses default Chrome/Chromium auto-detection
     let browser_path: Option<PathBuf> = env::var("WORKER_BROWSER_PATH").ok().map(PathBuf::from);
 
     // Lifecycle configuration
-    let max_idle_time_secs = env::var("WORKER_MAX_IDLE_TIME_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5 * 60); // Default: 5 minutes
+    let max_idle_time_secs = env_parsed::<u64>("WORKER_MAX_IDLE_TIME_SECS", 5 * 60)?;
 
     // Create default binary params middleware
     // Users in production can replace this with custom implementations

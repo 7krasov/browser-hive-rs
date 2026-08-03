@@ -29,6 +29,7 @@ url = { workspace = true }
 psl = { workspace = true }
 
 headless_chrome = { workspace = true }
+tungstenite = { workspace = true }
 prometheus = { workspace = true }
 axum = { workspace = true }
 sha2 = "0.10"

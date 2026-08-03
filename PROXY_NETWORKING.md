@@ -117,17 +117,162 @@ numbers), so verify them against whichever provider a scope uses:
   on its next request. The pin expires silently; nothing in our logs marks the moment.
 
 `tab.enable_fetch()` + `tab.authenticate()` answer the proxy's 407 challenge and nothing more —
-they neither establish nor hold a connection. Per-context proxy identity travels exclusively
-through the username:
+they neither establish nor hold a connection. For a **gateway** provider, exit identity travels
+exclusively through the username:
 
 - `worker/src/browser_pool.rs` — `get_context_proxy_with_params(&metadata.id.to_string(), …)`
   builds the username, session ID = context UUID
 - `worker/src/service.rs` — reads `assigned_proxy_config`, then `tab.authenticate(user, pass)`
 
-The `--proxy-server` host:port is identical for every context in the browser.
+For those providers the `--proxy-server` host:port is identical for every context in the browser,
+and that is correct: one gateway fronts every exit.
 
 Relying on connection reuse for IP stability would never have worked: Chromium opens parallel
 connections, closes idle ones, and partitions pools by privacy mode.
+
+## One proxy for the whole browser is a mode; no proxy is an accident
+
+Two routing modes are legitimate, and the difference is not visible in a response:
+
+| Mode | How | Who uses it |
+|---|---|---|
+| One proxy per **browser process** | `--proxy-server` at launch; every CDP context inherits it | every provider that does not override `assigns_proxy_host_per_context()` — including every gateway provider, where the exit is selected by the *username*, so contexts still differ |
+| One proxy per **context** | `Target.createBrowserContext { proxyServer }` | providers whose pool is a list of distinct hosts (opt-in, see below) |
+
+The first is not a degraded version of the second. For a gateway provider it is exactly right: one
+host fronts every exit, and rotation happens through the credentials. As of 2026-07-31 **no
+provider in either repository sets the routing flag**, so every deployed scope runs the first mode.
+
+What is never legitimate is *neither*: a browser launched with no proxy at all. That is the one
+remaining path by which a scrape can leave through the pod's own public IP, because every
+in-request fallback — a tab created in the browser's default context, a slot whose recycling
+failed, a tab recreated after a dead CDP session — lands on the launch proxy. If the launch proxy
+exists, no request can escape it; if it does not, they all go out directly, every page loads
+normally, and the only signal is the origin's blocklist learning the cluster's egress IP.
+
+**Therefore `BrowserPool::new` refuses to start when `build_config()` yields no proxy server**,
+unless the provider overrides `ProxyProvider::allows_direct_connection()` (only the base worker's
+`NoProxyProvider` does, for local development). An empty or whitespace-only proxy string counts as
+none: Chrome reads `--proxy-server=` as "connect directly". This also enforces what the per-context
+flag documents but could not check on its own — a provider that routes per context still has to
+return a usable proxy from `build_config()`, since that one carries the default context.
+
+The misconfigurations this catches all collapse into the same empty value before the pool sees
+them: an unparseable `PROXY_PORT` (previously swallowed by `.parse().ok()`, now an error naming
+the variable), `PROXY_ADDRESS` without `PROXY_PORT`, an empty `PROXY_URL`, an empty pool.
+
+Which mode is in force is logged once at startup, next to the host, so it never has to be inferred
+by correlating `span_proxy_host` across requests.
+
+## Pools of distinct hosts: per-context proxy
+
+A provider whose pool is a list of **hosts** (dedicated IP pools) does not fit the model above,
+and until 2026-07-31 it was silently broken by it. `supports_per_context_proxy()` delivers
+credentials per context; the host of the returned config was discarded, so one entry was drawn at
+browser launch for `--proxy-server` and carried every request until the process restarted. The
+pool was advertised as rotating and used exactly one address per browser.
+
+Two consequences, both invisible in logs at the time:
+
+- **Credentials and host came from different pool entries.** The launch host was one random draw,
+  the credentials `tab.authenticate` sent were another. Harmless only while every entry shares one
+  username and password — the day they differ it is a fleet-wide 407 with nothing pointing at why.
+- **One bad address took down a whole pod** until the browser died of idle timeout, instead of
+  costing 1/N of requests.
+
+`ProxyProvider::assigns_proxy_host_per_context()` (default `false`) opts a provider into real
+routing: each CDP BrowserContext is created with its own `proxyServer`, so the pool is rotated per
+context. Gateway providers do not set it and take the unchanged path.
+
+### Measured before implementing (Brave 150, real pool, `api.ipify.org`)
+
+| Launch argument | context with own `proxyServer` | plain `new_context()` |
+|---|---|---|
+| none | its own IP | **the machine's own IP** — this is the leak case |
+| `--proxy-server=per-context` | its own IP | `ERR_PROXY_CONNECTION_FAILED` |
+| `--proxy-server=<real proxy>` | its own IP | the launch proxy, unchanged |
+
+**Decided 2026-07-31: keep launching with a real proxy** (the third row). The Puppeteer-style
+`per-context` sentinel is unnecessary here and actively harmful — it leaves the default context
+without a usable proxy, which breaks `shared` isolation. Launching with a real proxy keeps the
+default context working, so nothing outside the opted-in path changes.
+
+Verified end to end through `BrowserPool` itself: three `AlwaysNew` contexts reported three
+distinct exit IPs with the flag on, and one shared IP with it off.
+
+### Constraints that come with the flag
+
+- **`ContextIsolation::Isolated` is required.** Shared isolation serves every request from the
+  browser's default context, which no CDP call can re-point. The worker **refuses to start** on
+  that combination rather than quietly serving one host.
+- **`supports_per_context_proxy()` must be true as well.** The host comes from the config
+  `get_context_proxy()` returns, and that call only happens when the other flag is set — the
+  routing flag alone would leave nothing to route by and every context would fall back to the
+  launch proxy, under a startup line announcing rotation. Also a **refusal to start**.
+- **`build_config()` must still return a usable proxy**, because it launches the browser and
+  therefore carries the default context. Enforced for every provider, not just this one — see the
+  startup refusal in the previous section.
+- **No fallback on failure.** If `Target.createBrowserContext` is rejected, context creation
+  fails. Falling back to the plain call would put the request on the launch proxy while the logs
+  claimed rotation — the original bug, restored.
+- **Recycling follows the same path.** A recycled context is created with its own proxy too;
+  otherwise a `reusable` pool would stop rotating after the first lifecycle tick.
+
+### A context is only ever served from its own CDP context
+
+Both refusals above exist because a request served from the browser's **default** context leaves
+through the launch proxy while its span still names the assigned host — the failure is invisible
+in exactly the way the flag was added to prevent. The same rule is enforced at the one remaining
+place a tab can be created outside the normal path: a slot left without a tab by a failed
+recycling.
+
+- If the CDP BrowserContext was created and only the tab failed, the recycler **keeps the context
+  id**, and the next request creates its tab back inside it.
+- If the CDP context itself could not be created, the slot is **removed from the pool** on the
+  next request (which fails with `BROWSER_ERROR` and can be retried); a fresh, correctly routed
+  context is built for the request after it. Serving it from the default context would have
+  worked, silently and wrongly, and — since `last_used_at` is refreshed before that point — the
+  broken slot would never have gone idle long enough to be recycled away.
+
+The **browser process dying** mid-request used to be the exception: the pool is replaced, the old
+CDP context is gone with the process, and the request carried on in the new browser's default
+context — losing isolation and, for concurrent requests recovering from the same death, sharing
+that one default context between them. It is now handled the same way as everything else: the
+attempt ends, and the **whole request is retried once** against a context from the new pool. The
+signal is a `pool_generation` counter on `WorkerService`, bumped under the write lock in
+`recreate_browser_pool` and compared across the attempt in the `scrape_page` handler.
+
+The two conditions for a retry — generation moved **and** the response is a failure — are precise
+rather than heuristic: every context in a pool lives in the same browser process, so whoever
+replaced the pool, a replacement plus a failure means this request's own browser died and nothing
+was scraped. A successful response is never retried, so no page is loaded twice. Exactly one
+retry: a second death during it is a browser that cannot stay alive. This mirrors what
+`acquire_context_with_recovery` already did when the browser died *before* a context was bound —
+the correct behaviour was in the codebase, it just was not reachable once the context was held.
+
+### Why a second CDP client
+
+`headless_chrome::Browser::new_context()` hardcodes `proxy_server: None` and `Browser::call_method`
+is private, so the parameter is unreachable through the crate. `worker/src/browser_cdp.rs` attaches
+a second CDP client to `Browser::get_ws_url()` for that one call; the returned context id is handed
+to the crate's own `Context`, so tabs, Fetch auth and navigation stay on the crate's transport.
+Chosen over forking the crate — no fork to maintain, and the browser-level client is also the only
+route to `Target.disposeBrowserContext`, which is rejected over a page session (see CLAUDE.md on
+contexts that are removed from the pool but never disposed).
+
+Two CDP clients against one browser do not race — CDP delivers a response to the connection that
+sent the request, so the two id spaces are independent — but that safety rests on rules the module
+documents as invariants: one call at a time on that socket (the mutex spans send *and* read, since
+the read loop skips frames that are not its own), no target creation there (tab lifetime keeps a
+single owner), `disposeOnDetach` left unset so contexts outlive the socket, and no CDP domain
+enabled on it. Read `worker/src/browser_cdp.rs` before changing anything in it.
+
+### Which host actually carried a request
+
+`span_proxy_host` on the worker's `scrape_page` span, credentials stripped. It records the host
+that carried the traffic, not the one the provider nominated — with the flag off those differ, and
+that difference is what hid the bug. A provider that hands out non-routing hosts also logs a
+one-time warning naming both.
 
 ## Consequences for session modes
 

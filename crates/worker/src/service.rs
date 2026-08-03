@@ -24,7 +24,7 @@ use browser_hive_proto::worker::{
     ScrapePageRequest, ScrapePageResponse, WorkerStatsResponse,
 };
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -348,6 +348,15 @@ pub struct WorkerService {
     is_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Worker-wide cap on how often diagnostics may be logged (see `diagnostics` module).
     diagnostics_limiter: Arc<DiagnosticsLimiter>,
+    /// Bumped every time the browser process dies and the pool is replaced.
+    ///
+    /// A request holds an `Arc<BrowserContext>` taken from the pool it started with. When the
+    /// browser dies mid-request that context belongs to a dead process — its CDP context is gone
+    /// and cannot be recreated — so the request must start over against the new pool rather than
+    /// carry on with a stale handle. Comparing this counter across the attempt is what detects
+    /// that, and it is precise rather than heuristic: whoever replaced the pool, a pool replaced
+    /// during the request means *this* request's context is stale too.
+    pool_generation: Arc<AtomicU64>,
 }
 
 impl WorkerService {
@@ -381,6 +390,7 @@ impl WorkerService {
             cancellation_token,
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             diagnostics_limiter,
+            pool_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -438,8 +448,75 @@ impl WorkerService {
         let mut pool_guard = self.browser_pool.write().await;
         *pool_guard = new_pool;
 
-        info!("Browser pool successfully recreated");
+        // Bumped under the write lock, so no request can observe the new pool with the old
+        // generation and conclude its context is still valid.
+        let generation = self.pool_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        drop(pool_guard);
+
+        info!("Browser pool successfully recreated (generation {generation})");
         Ok(())
+    }
+
+    /// Arm the AlwaysNew cleanup guard for a context, or nothing outside AlwaysNew mode.
+    ///
+    /// A helper because the retry path has to arm a second one for the replacement context, and
+    /// the two must stay identical.
+    fn always_new_guard_for(
+        &self,
+        is_always_new: bool,
+        context: &Arc<BrowserContext>,
+        ray_id: &str,
+    ) -> Option<AlwaysNewContextGuard> {
+        is_always_new.then(|| AlwaysNewContextGuard {
+            browser_pool: self.browser_pool.clone(),
+            context_id: context.metadata.id,
+            ray_id: ray_id.to_string(),
+            scope: self.config.scope.name.clone(),
+        })
+    }
+
+    /// End the attempt after the browser process died and the pool was replaced under it.
+    ///
+    /// The context this request holds came from the old pool, and its CDP BrowserContext died
+    /// with the process — it cannot be recreated, only replaced. Creating the tab in the *new*
+    /// browser's default context would let the request finish, which is what this code used to
+    /// do, at the cost of quietly dropping the context's isolation and, for providers that route
+    /// per context, its proxy: the request would leave through the launch proxy while its span
+    /// still named the assigned host, and concurrent requests recovering from the same death
+    /// would share that one default context with each other.
+    ///
+    /// So the attempt ends instead. The handler sees the pool generation moved and retries the
+    /// whole request against a context from the new pool, which is what
+    /// `acquire_context_with_recovery` already does when the browser dies *before* a context is
+    /// bound. A client normally never sees this response — it surfaces only if the retry itself
+    /// cannot get a context.
+    fn browser_restarted_response(
+        &self,
+        context: &Arc<BrowserContext>,
+        ray_id: &str,
+        start_time: Instant,
+    ) -> ScrapePageResponse {
+        warn!(
+            "Browser pool was replaced while this request was running - context {} belonged to \
+             the dead process, retrying the request with a fresh context",
+            context.metadata.id
+        );
+
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        ScrapePageResponse {
+            success: false,
+            status_code: 0,
+            content: String::new(),
+            error_message: format!(
+                "Browser process died and the pool was recreated; context {} is stale (after {}ms)",
+                context.metadata.id, execution_time_ms
+            ),
+            error_code: ErrorCode::BrowserError as i32,
+            response_headers: std::collections::HashMap::new(),
+            execution_time_ms,
+            context_id: context.metadata.id.to_string(),
+            ray_id: ray_id.to_string(),
+        }
     }
 
     /// Check if an error indicates the browser process is dead.
@@ -718,8 +795,10 @@ impl WorkerService {
         // 1. Context was just recycled but Chrome WebSocket connection was dead
         // 2. Browser process was restarted or died due to idle_browser_timeout
         // In such cases, we lazily create a new tab on-demand.
-        let mut browser_pool_guard = self.browser_pool.read().await;
-        let mut browser = browser_pool_guard.get_browser();
+        // Neither is reassigned any more: a request never continues against a pool that was
+        // replaced under it, so there is no "re-acquire with the new pool" step.
+        let browser_pool_guard = self.browser_pool.read().await;
+        let browser = browser_pool_guard.get_browser();
 
         // Use context-specific proxy if available, otherwise use global proxy
         let proxy_config = match context.metadata.assigned_proxy_config.as_ref() {
@@ -760,8 +839,51 @@ impl WorkerService {
                 context.metadata.id
             );
 
+            // An isolated slot whose CDP BrowserContext is gone has nowhere correct to put a tab:
+            // cookies, storage and - for providers that route per context - the proxy all live on
+            // that context, so a tab in the browser's default context would quietly have none of
+            // them and the request would leave through the launch proxy while its span named the
+            // assigned host. Drop the slot instead; the next request builds a correct one, whereas
+            // keeping it would hand the same broken slot out on every request.
+            if context.cdp_context_id.is_none() && browser_pool_guard.uses_isolated_contexts() {
+                warn!(
+                    "Context {} has no CDP context to create a tab in (its recycling failed) - \
+                     removing it from the pool instead of serving the request from the browser's \
+                     default context",
+                    context.metadata.id
+                );
+                drop(tab_guard); // destroy_context closes the tab and needs this lock
+                browser_pool_guard
+                    .destroy_context(&context.metadata.id)
+                    .await;
+
+                let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                return Ok(ScrapePageResponse {
+                    success: false,
+                    status_code: 0,
+                    content: String::new(),
+                    error_message: format!(
+                        "Context {} lost its isolated CDP context and was removed from the pool; \
+                         retry to get a fresh one (after {}ms)",
+                        context.metadata.id, execution_time_ms
+                    ),
+                    error_code: ErrorCode::BrowserError as i32,
+                    response_headers: std::collections::HashMap::new(),
+                    execution_time_ms,
+                    context_id: context.metadata.id.to_string(),
+                    ray_id: ray_id.to_string(),
+                });
+            }
+
             // Try to create tab. If it fails, the browser process might be dead.
-            match browser.new_tab() {
+            //
+            // Isolated slots keep their CDP context across a failed recycling, so the tab goes
+            // back inside it - same reasoning as the dead-tab recovery further down.
+            let created = match &context.cdp_context_id {
+                Some(cdp_ctx_id) => browser_pool_guard.create_tab_in_context(cdp_ctx_id),
+                None => browser.new_tab(),
+            };
+            match created {
                 Ok(new_tab) => {
                     *tab_guard = Some(new_tab);
                 }
@@ -797,35 +919,10 @@ impl WorkerService {
                             });
                         }
 
-                        // Re-acquire locks with new pool
-                        browser_pool_guard = self.browser_pool.read().await;
-                        browser = browser_pool_guard.get_browser();
-                        tab_guard = context.tab.lock().await;
-
-                        // Try again with new browser
-                        match browser.new_tab() {
-                            Ok(new_tab) => {
-                                *tab_guard = Some(new_tab);
-                                debug!("Successfully created tab after browser pool recreation");
-                            }
-                            Err(e) => {
-                                let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                                return Ok(ScrapePageResponse {
-                                    success: false,
-                                    status_code: 0,
-                                    content: String::new(),
-                                    error_message: format!(
-                                        "Failed to create tab after pool recreation for context {} (domain: {}): {} (after {}ms)",
-                                        context.metadata.id, domain, e, execution_time_ms
-                                    ),
-                                    error_code: ErrorCode::BrowserError as i32,
-                                    response_headers: std::collections::HashMap::new(),
-                                    execution_time_ms,
-                                    context_id: context.metadata.id.to_string(),
-                                    ray_id: ray_id.to_string(),
-                                });
-                            }
-                        }
+                        // The browser we just replaced took this request's context with it, so
+                        // this attempt is over - see `browser_restarted_response`. The handler
+                        // retries against the new pool.
+                        return Ok(self.browser_restarted_response(&context, ray_id, start_time));
                     } else {
                         // Some other error
                         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -954,7 +1051,17 @@ impl WorkerService {
                     );
 
                     // Try to create new tab. If this also fails, browser process might be dead.
-                    match browser.new_tab() {
+                    //
+                    // Only the tab's socket is suspect here, so an isolated slot's CDP context is
+                    // still alive and the tab goes back inside it - same rule as the branch above
+                    // and as the lazy creation earlier: a request is never served from the
+                    // browser's default context, which would silently cost it its isolation and,
+                    // for providers that route per context, its proxy.
+                    let recreated = match &context.cdp_context_id {
+                        Some(cdp_ctx_id) => browser_pool_guard.create_tab_in_context(cdp_ctx_id),
+                        None => browser.new_tab(),
+                    };
+                    match recreated {
                         Ok(new_tab) => {
                             tab = new_tab.clone();
                             *tab_guard = Some(new_tab);
@@ -1006,55 +1113,12 @@ impl WorkerService {
                                     });
                                 }
 
-                                // Re-acquire locks with new pool
-                                browser_pool_guard = self.browser_pool.read().await;
-                                browser = browser_pool_guard.get_browser();
-                                tab_guard = context.tab.lock().await;
-
-                                // Create new tab and enable fetch
-                                let new_tab = match browser.new_tab() {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        let execution_time_ms =
-                                            start_time.elapsed().as_millis() as u64;
-                                        return Ok(ScrapePageResponse {
-                                            success: false,
-                                            status_code: 0,
-                                            content: String::new(),
-                                            error_message: format!(
-                                                "Failed to create tab after pool recreation for context {} (domain: {}): {} (after {}ms)",
-                                                context.metadata.id, domain, e, execution_time_ms
-                                            ),
-                                            error_code: ErrorCode::BrowserError as i32,
-                                            response_headers: std::collections::HashMap::new(),
-                                            execution_time_ms,
-                                            context_id: context.metadata.id.to_string(),
-                                            ray_id: ray_id.to_string(),
-                                        });
-                                    }
-                                };
-                                tab = new_tab.clone();
-                                *tab_guard = Some(new_tab);
-
-                                if let Err(e) = tab.enable_fetch(None, Some(true)) {
-                                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                                    return Ok(ScrapePageResponse {
-                                        success: false,
-                                        status_code: 0,
-                                        content: String::new(),
-                                        error_message: format!(
-                                            "Failed to enable fetch after pool recreation for context {} (domain: {}): {} (after {}ms)",
-                                            context.metadata.id, domain, e, execution_time_ms
-                                        ),
-                                        error_code: ErrorCode::BrowserError as i32,
-                                        response_headers: std::collections::HashMap::new(),
-                                        execution_time_ms,
-                                        context_id: context.metadata.id.to_string(),
-                                        ray_id: ray_id.to_string(),
-                                    });
-                                }
-
-                                debug!("Successfully recreated pool and enabled fetch");
+                                // Same as the lazy-creation path above: the replaced browser took
+                                // this request's context with it, so the attempt ends here and
+                                // the handler retries against the new pool.
+                                return Ok(
+                                    self.browser_restarted_response(&context, ray_id, start_time)
+                                );
                             } else {
                                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                                 return Ok(ScrapePageResponse {
@@ -1838,6 +1902,7 @@ impl WorkerServiceTrait for WorkerService {
             wait_strategy = tracing::field::Empty,
             wait_timeout_ms = tracing::field::Empty,
             context_id = tracing::field::Empty,
+            proxy_host = tracing::field::Empty,
         );
         if !req.wait_selector.is_empty() {
             span.record("wait_selector", req.wait_selector.as_str());
@@ -1969,24 +2034,73 @@ impl WorkerServiceTrait for WorkerService {
         // subsequent log line carries it.
         tracing::Span::current().record("context_id", context.metadata.id.to_string().as_str());
 
+        // The exit the response came through. Without it, correlating a block or a rate limit
+        // with an address means reproducing the request by hand — which is how the pool's
+        // effective host went unnoticed for months. Credentials are never part of this value.
+        if let Some(proxy_host) = context.proxy_host.as_deref() {
+            tracing::Span::current().record("proxy_host", proxy_host);
+        }
+
         // Guaranteed cleanup (AlwaysNew mode): tie the context's removal to this scope's
         // lifetime rather than to control flow, so it also runs when the handler future is
         // dropped mid-request or panics. Idempotent with the early destroy below.
-        let _always_new_guard = if is_always_new {
-            Some(AlwaysNewContextGuard {
-                browser_pool: self.browser_pool.clone(),
-                context_id: context.metadata.id,
-                ray_id: ray_id.clone(),
-                scope: self.config.scope.name.clone(),
-            })
-        } else {
-            None
-        };
+        let mut always_new_guard = self.always_new_guard_for(is_always_new, &context, &ray_id);
+
+        // Read *after* the context is bound, so only a pool replacement that happens during the
+        // attempt below counts - `acquire_context_with_recovery` may legitimately have replaced
+        // the pool while getting us this context, and that one is already recovered from.
+        let generation_at_start = self.pool_generation.load(Ordering::SeqCst);
 
         // Execute scraping
         // NOTE: In AlwaysNew mode, context is destroyed inside scrape_page_internal
         // immediately after getting content (before diagnostics) for faster slot release
-        let result = self.scrape_page_internal(&req, context, &ray_id).await;
+        let mut result = self.scrape_page_internal(&req, context, &ray_id).await;
+
+        // The browser process died mid-request and the pool was replaced, so the context that
+        // attempt held belonged to a dead process: retry the whole thing once against the new
+        // pool. The two conditions together are precise, not a heuristic - whoever replaced the
+        // pool, it is the same browser process every context in it lived in, so a replacement
+        // plus a failure means this request's own browser died and nothing was scraped. A
+        // *successful* response is never retried, so no page is ever loaded twice.
+        //
+        // Exactly once: a second death during the retry is a browser that cannot stay alive, and
+        // looping on it would only hold the slot.
+        let pool_was_replaced = self.pool_generation.load(Ordering::SeqCst) != generation_at_start;
+        if pool_was_replaced && matches!(&result, Ok(response) if !response.success) {
+            // The old context's tab lives in the dead browser, so there is nothing to close; the
+            // guard would only look for it in the new pool and find nothing.
+            drop(always_new_guard);
+
+            match self
+                .acquire_context_with_recovery(start_time, &ray_id, &proxy_params)
+                .await
+            {
+                Ok(fresh_context) => {
+                    info!(
+                        "Retrying with context {} from the recreated pool",
+                        fresh_context.metadata.id
+                    );
+                    // Re-record: the span must name the context that produced the response.
+                    let span = tracing::Span::current();
+                    span.record("context_id", fresh_context.metadata.id.to_string().as_str());
+                    if let Some(proxy_host) = fresh_context.proxy_host.as_deref() {
+                        span.record("proxy_host", proxy_host);
+                    }
+
+                    always_new_guard =
+                        self.always_new_guard_for(is_always_new, &fresh_context, &ray_id);
+                    result = self
+                        .scrape_page_internal(&req, fresh_context, &ray_id)
+                        .await;
+                }
+                Err(response) => {
+                    self.record_failed_if_5xxx(response.get_ref());
+                    return Ok(response);
+                }
+            }
+        }
+        // The scrape is finished and its response is in hand, so the AlwaysNew context can go.
+        drop(always_new_guard);
 
         // Update metrics
         match &result {

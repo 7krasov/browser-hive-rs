@@ -40,6 +40,14 @@ impl ProxyProvider for NoProxyProvider {
     fn clone_box(&self) -> Box<dyn ProxyProvider> {
         Box::new(self.clone())
     }
+
+    /// The one provider for which a direct connection is the point rather than a broken config.
+    ///
+    /// Without this the worker refuses to start with no proxy, which is what protects every
+    /// other provider from a misconfiguration that would scrape from the pod's own IP.
+    fn allows_direct_connection(&self) -> bool {
+        true
+    }
 }
 
 /// Generic HTTP proxy provider with environment variable configuration
@@ -88,9 +96,16 @@ pub struct GenericProxyProvider {
 
 impl GenericProxyProvider {
     /// Create provider from environment variables
+    ///
+    /// Every parse failure here is an error rather than a `None`. A swallowed `PROXY_PORT` (one
+    /// typo away) leaves the config with no host:port pair at all, which is indistinguishable
+    /// from "no proxy wanted" by the time it reaches Chrome. Startup then refuses (see
+    /// `ProxyProvider::allows_direct_connection`), but the message would blame the pool rather
+    /// than the variable that is actually wrong.
     pub fn from_env() -> Result<Self> {
-        // Check if complete URL is provided
-        if let Ok(url) = env::var("PROXY_URL") {
+        // Check if complete URL is provided. An empty value is treated as unset: it reaches
+        // Chrome as `--proxy-server=`, which means "connect directly".
+        if let Some(url) = Self::env_non_empty("PROXY_URL") {
             return Ok(Self {
                 proxy_url: Some(url),
                 scheme: ProxyScheme::default(),
@@ -102,10 +117,13 @@ impl GenericProxyProvider {
         }
 
         // Otherwise, build from components
-        let address = env::var("PROXY_ADDRESS").ok();
-        let port = env::var("PROXY_PORT")
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok());
+        let address = Self::env_non_empty("PROXY_ADDRESS");
+        let port = match Self::env_non_empty("PROXY_PORT") {
+            Some(raw) => Some(raw.parse::<u16>().with_context(|| {
+                format!("PROXY_PORT must be a number in 1..=65535, got '{raw}'")
+            })?),
+            None => None,
+        };
 
         let username = env::var("PROXY_USERNAME").ok();
         let password = env::var("PROXY_PASSWORD").ok();
@@ -128,6 +146,14 @@ impl GenericProxyProvider {
             username,
             password,
         })
+    }
+
+    /// Read a variable, treating an empty or whitespace-only value as unset.
+    fn env_non_empty(key: &str) -> Option<String> {
+        env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -200,5 +226,37 @@ pub fn create_from_env() -> Result<Box<dyn ProxyProvider>> {
                 proxy_type
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `BrowserPool::new` refuses to start a browser with no proxy unless the provider asks for
+    /// it. This is the other half of that guard: without the opt-in, local development
+    /// (`PROXY_TYPE=none`, the docker-compose default) would stop working.
+    #[test]
+    fn no_proxy_provider_opts_into_direct_connections() {
+        assert!(NoProxyProvider.allows_direct_connection());
+        assert!(!NoProxyProvider.build_config().unwrap().is_proxy_enabled());
+    }
+
+    /// A misconfigured generic proxy must not silently become a direct connection: every field
+    /// missing is what an unset `PROXY_ADDRESS`/`PROXY_PORT` pair produces, and the provider does
+    /// not opt in, so startup fails instead of scraping from the pod's own IP.
+    #[test]
+    fn generic_provider_never_allows_a_direct_connection() {
+        let empty = GenericProxyProvider {
+            proxy_url: None,
+            scheme: ProxyScheme::Http,
+            address: None,
+            port: None,
+            username: None,
+            password: None,
+        };
+
+        assert!(!empty.allows_direct_connection());
+        assert!(empty.build_config().unwrap().build_proxy_server().is_none());
     }
 }

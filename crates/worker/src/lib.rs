@@ -1,3 +1,4 @@
+mod browser_cdp;
 mod browser_pool;
 mod diagnostics;
 mod metrics;

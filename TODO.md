@@ -2,18 +2,50 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## WebRTC can reveal the pod's real IP — flag not set, effect on blocking unknown
+
+**Status**: open, needs a decision backed by a measurement (raised 2026-07-31)
+
+`--proxy-server` and `Target.createBrowserContext { proxyServer }` govern the TCP/HTTP stack only.
+WebRTC gathers ICE candidates over **UDP, outside the proxy**: a page that opens an
+`RTCPeerConnection` against a STUN server receives a host candidate (the pod's IP) and a
+server-reflexive candidate (the cluster's public egress IP). Anti-bot vendors do probe this. It is
+the one real-IP disclosure path left after the startup guard (see PROXY_NETWORKING.md, "One proxy
+for the whole browser is a mode"), because it does not go through the network stack the proxy sits
+in.
+
+Nothing in the current launch arguments addresses it: neither `DefaultBinaryParamsMiddleware` nor
+`BraveBinaryParamsMiddleware` (`common/src/browser_middleware.rs`) nor `headless_chrome`'s own
+`DEFAULT_ARGS` sets a WebRTC policy, and `--disable-brave-extension` additionally turns off the
+browser's built-in protection.
+
+**The decision is not obvious, which is why this is a TODO and not a patch.**
+`--force-webrtc-ip-handling-policy=disable_non_proxied_udp` closes the leak, but a browser that
+refuses non-proxied UDP is itself a fingerprintable deviation from a normal consumer browser — it
+may raise the block rate, i.e. make the anti-bot situation worse in exchange for hiding an IP that
+most scraped origins never probe. Neither direction should be assumed.
+
+**How to decide**:
+
+1. Measure exposure first — does a page actually get a usable srflx candidate from inside the
+   pod? (UDP egress may already be blocked by the cluster.) If not, there is nothing to fix.
+2. If it is exposed, ship the flag as an **opt-in env var**, enable it on one scope, and compare
+   block rates against an identical scope without it.
+3. Consider the alternative that costs no fingerprint at all: a NetworkPolicy allowing egress
+   only to the proxy hosts over TCP. That closes this *and* every future variant of the same
+   problem, and it fails closed. It belongs to DevOps (`ops/deployment-chart` has no
+   NetworkPolicy today).
+
 ## Confirm sticky proxy sessions are not metered separately
 
-**Status**: open, non-technical (raised 2026-07-27, technical side resolved and applied 2026-07-30)
+**Status**: open, non-technical (raised 2026-07-27; nothing further is needed in code)
 
-Sticky sessions are now on in every session mode for the deployed datacenter provider — the
-reasoning, the production evidence and what it does *not* buy are in PROXY_NETWORKING.md
-("Consequences for session modes"). Nothing further is needed in code.
-
-What is left is a billing question for whoever owns the proxy contract: whether the plan meters
-sessions separately from plain requests. `AlwaysNew` opens one session per request, so if sessions
-are metered, the request count and the session count are now the same number. If they are billed
-per session **and** per request, this doubles the line items without changing the traffic.
+A billing question for whoever owns the proxy contract: whether the plan meters sessions
+separately from plain requests. Sticky sessions are on in every session mode for the deployed
+datacenter provider (reasoning and evidence in PROXY_NETWORKING.md, "Consequences for session
+modes"), and `AlwaysNew` opens one session per request — so if sessions are metered, the request
+count and the session count are now the same number. Billed per session **and** per request, this
+doubles the line items without changing the traffic.
 
 Also worth passing on if the residential provider is ever deployed: it is still mode-driven, and
 turning it sticky has the same argument but a different cost profile (session idle expiry on the
@@ -62,16 +94,49 @@ over a page session (`Not allowed`), and headless_chrome exposes no browser-leve
 (`Transport::call_method_on_browser` exists but is unreachable from the public API).
 
 Low priority — an empty context holds no renderer, no sockets and no proxy tunnel, which is what
-the memory and connection pressure actually came from. Fixing it needs either an upstream PR
-exposing browser-level calls, or a raw CDP call over the browser WebSocket alongside
-headless_chrome.
+the memory and connection pressure actually came from.
 
-**Verification level of the tab fix**: `tab.close(false)` was measured to hold the browser's tab
-count flat over 5 create/use/drop cycles (`2 → 3 → 4 → 5 → 6` before, `1 → 1 → 1 → 1 → 1` after)
-in a standalone reproduction. The wiring into `BrowserPool` itself is covered only by
-`cargo test` + build; no end-to-end check against a running worker was made. A production pod on
-an `AlwaysNew` scope should now show flat memory over its lifetime instead of growing with
-request count.
+**The blocker is gone as of 2026-07-31**: `worker/src/browser_cdp.rs` is exactly the "raw CDP call
+over the browser WebSocket" this item was waiting for, added for per-context proxy hosts. Disposing
+a context is now a matter of calling `Target.disposeBrowserContext` through that client at the
+removal sites — with the caveat that the client only exists for providers that route per context,
+so it would have to be created unconditionally first.
+
+## Per-context proxy hosts are verified on macOS Brave only
+
+**Status**: open (raised 2026-07-31, when the feature was added)
+
+`assigns_proxy_host_per_context()` was measured against **Brave 150.1.92.144 on macOS**: three
+`AlwaysNew` contexts driven through `BrowserPool` reported three distinct exit IPs, and one shared
+IP with the flag off. Production runs Brave from `apt stable` inside the worker image, which is the
+same Chromium line but not the same build, and the image does not pin a version.
+
+`Target.createBrowserContext { proxyServer }` is Chromium behaviour, so the risk is low — but the
+failure mode is quiet in the wrong direction: a build that ignores the parameter would route every
+context through the launch proxy while the logs report per-context hosts. Run the same check inside
+the image before the first scope opts in, and treat `span_proxy_host` in production as the standing
+verification (a scope that rotates should show many distinct values).
+
+No provider in this repository sets the flag; the first user is a downstream dedicated-IP pool.
+
+## `country_code` is silently ignored by providers that cannot geo-target
+
+**Status**: open (raised 2026-07-31)
+
+`ProxyParams::requires_dedicated_context()` (`common/src/request_context.rs`) is derived from the
+request alone: any `country_code` forces a dedicated context in `reusable`/`reusable_preinit`,
+because country affects connection identity. For a provider that cannot act on it at all — a
+dedicated IP pool, where geography is a property of the purchased addresses — this is pure cost:
+the scope loses a warm idle context and pays for a new one, and the client's parameter still does
+nothing.
+
+Two halves, both open:
+
+- **Cost**: gate the decision on provider capability (e.g. `supports_country_targeting()`,
+  default `true` so gateway providers are unaffected) instead of on the request alone.
+- **Honesty**: a client sending `country_code` to a provider that ignores it gets no signal. At
+  minimum a warning naming the provider; an error is arguably more correct but needs an error code
+  and a client change, so it is not obviously worth it.
 
 ## Generalize the response observer into a `ResponseObserver` trait
 
@@ -92,16 +157,12 @@ endpoints.
 vectors), hold `Vec<Box<dyn ResponseObserver>>` on `ScopeConfig`, and fan the single
 `Network.enable` + listener out to all observers. Sketch in RESPONSE_OBSERVERS.md.
 
-## Redirect follow-ups (off-domain detection is DONE)
+## Redirect follow-ups
 
-**Status**: off-domain detection shipped 2026-07-23; two optional follow-ups remain
+**Status**: both optional (raised 2026-07-23, when off-domain detection shipped)
 
-Off-domain redirect detection is implemented: the worker returns
-`ERROR_CODE_REDIRECT_TO_ANOTHER_DOMAIN` (4050) when the main navigation lands on a different
-registrable domain (eTLD+1 via the `psl` crate), overriding the wait result so no selector
-error surfaces. Returns the landing page's status. See RESPONSE_OBSERVERS.md.
-
-Remaining, both optional:
+Off-domain redirect detection itself is implemented and documented in RESPONSE_OBSERVERS.md.
+What is left:
 
 1. **Avoid wasting the wait budget on the foreign page.** The check currently runs *after*
    the wait strategy, so a request with a `wait_selector` that redirects off-domain still

@@ -253,7 +253,68 @@ pub trait ProxyProvider: Debug + Send + Sync {
     ///
     /// Default: false (all contexts use the same proxy from build_config)
     /// Override to return true for providers with proxy pools
+    ///
+    /// **This means per-context *credentials*, not a per-context proxy host.** The config
+    /// returned by [`get_context_proxy`](Self::get_context_proxy) is read for its credentials
+    /// only; its host is discarded. That is the right model for gateway providers, where every
+    /// exit lives behind one host and the identity of the exit is encoded in the username
+    /// (session ID, country, …). A provider whose pool encodes identity in the *host* must also
+    /// override [`assigns_proxy_host_per_context`](Self::assigns_proxy_host_per_context),
+    /// otherwise its pool is silently unused.
     fn supports_per_context_proxy(&self) -> bool {
+        false
+    }
+
+    /// Whether the host of the per-context config must actually route the context's traffic.
+    ///
+    /// Default: false — the browser-wide `--proxy-server` carries every context, and only the
+    /// credentials from [`get_context_proxy`](Self::get_context_proxy) vary per context.
+    ///
+    /// Override to `true` only for providers whose pool is a list of distinct proxy *hosts*
+    /// (dedicated IP pools). The worker then creates each CDP BrowserContext with its own
+    /// `proxyServer`, so the pool is genuinely rotated instead of one entry being picked at
+    /// browser launch and used by every request until the process restarts.
+    ///
+    /// # Constraints when this returns true
+    ///
+    /// * **Requires [`supports_per_context_proxy`](Self::supports_per_context_proxy) to be
+    ///   `true` as well.** The host is read off the config
+    ///   [`get_context_proxy`](Self::get_context_proxy) returns, and that call only happens when
+    ///   the other flag is set. The worker refuses to start on this flag alone.
+    /// * **Requires `ContextIsolation::Isolated`.** Shared isolation runs every request in the
+    ///   browser's default context, which no CDP call can re-point at another proxy. The worker
+    ///   refuses to start on that combination rather than silently serving one host.
+    /// * **`build_config()` must still return a usable proxy.** It launches the browser and
+    ///   therefore carries the default context. Returning nothing here would send any traffic
+    ///   outside a per-context context — including a `shared`-mode request — straight out of the
+    ///   pod's own IP.
+    /// * **Credentials still travel over CDP** (`Fetch.authRequired`), unchanged by this flag.
+    fn assigns_proxy_host_per_context(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider is allowed to leave the browser without a proxy at all.
+    ///
+    /// Default: `false` — a provider whose [`build_config`](Self::build_config) yields no usable
+    /// proxy server aborts worker startup. One browser-wide `--proxy-server` carrying every
+    /// context is a legitimate mode (it is what every gateway provider uses, and what every
+    /// provider that does not override
+    /// [`assigns_proxy_host_per_context`](Self::assigns_proxy_host_per_context) gets); *no*
+    /// proxy is a legitimate mode too, but only when it is asked for. The two are one typo apart:
+    /// an unparseable port, an empty `PROXY_URL` or a pool that came back empty all reduce to the
+    /// same "no proxy server" value, and the browser then scrapes every URL from the pod's own
+    /// public IP with nothing but an INFO line to say so.
+    ///
+    /// Fail-closed is the default because the failure is invisible in the right direction: pages
+    /// load, selectors match, requests succeed. It surfaces only as the origin's blocklist
+    /// learning the egress IP of the cluster.
+    ///
+    /// Override to `true` only for a provider whose *purpose* is a direct connection (the base
+    /// worker's `NoProxyProvider`, used for local development).
+    ///
+    /// Note this is about the **absence** of a proxy, not about how many there are. A provider
+    /// that returns one host for the whole browser passes this check with nothing to override.
+    fn allows_direct_connection(&self) -> bool {
         false
     }
 
