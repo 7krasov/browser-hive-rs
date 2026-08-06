@@ -21,3 +21,5 @@ tracing-subscriber = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 uuid = { workspace = true }
+prometheus = { workspace = true }
+axum = { workspace = true }

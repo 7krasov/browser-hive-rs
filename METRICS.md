@@ -78,6 +78,58 @@ Two ways to measure `peak_busy_contexts`, with different robustness:
 The gauge and Little's Law numbers should agree; if the gauge peak is consistently lower,
 your scrape interval is too coarse to catch the true peak.
 
+## Coordinator Metrics
+
+The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (implementation: `crates/coordinator/src/metrics.rs`). Controlled by `COORDINATOR_ENABLE_METRICS` (default `true`) and `COORDINATOR_METRICS_PORT` (default `9090`).
+
+**Why these exist at all:** there is no queue anywhere in Browser Hive. When no worker has a free slot, the coordinator answers `ERROR_CODE_NO_WORKERS_AVAILABLE` (5001) immediately and the request is gone. That rejection never touches a worker, so it leaves **no trace in any `browser_hive_worker_*` series** — a fleet at 100% utilization and a fleet turning away half its traffic are indistinguishable from the worker side. Worker metrics measure supply; these measure the demand that supply failed to meet.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `browser_hive_coordinator_requests_total` | Counter | `scope` | Scrape requests received, counted on completion (including futures dropped mid-request) |
+| `browser_hive_coordinator_requests_rejected_total` | Counter | `scope`, `reason` | Requests refused **without reaching a worker**. See the reason table below |
+| `browser_hive_coordinator_request_duration_seconds` | Histogram | `scope` | End-to-end coordinator duration: worker time plus routing, retries and the fresh-stats round trip. Buckets: 0.005 … 60 |
+| `browser_hive_coordinator_scope_workers_total` | Gauge | `scope` | Worker pods discovered per scope, as the coordinator sees them |
+| `browser_hive_coordinator_scope_workers_healthy` | Gauge | `scope` | Of those, the pods that passed the last health check |
+| `browser_hive_coordinator_scope_available_slots` | Gauge | `scope` | Free slots per scope from the coordinator's discovery cache |
+
+**`reason` values**, split by what they mean for action:
+
+| Reason | Capacity? | Meaning |
+|---|---|---|
+| `no_slots` | **yes** | Workers exist, every slot is taken (confirmed against fresh worker stats, so not a stale cache). **The "add replicas" signal.** |
+| `no_workers` | **yes** | The scope has no pods, or none that routing could select (all unhealthy / scaled to zero) |
+| `scope_not_found` | no | The scope is unknown to discovery — label or configuration mismatch |
+| `session_not_found` | no | Client sent an expired `session_id`, or its worker is gone |
+| `terminating` | no | The coordinator itself is shutting down |
+| `worker_unreachable` | no | Routing picked a worker but the gRPC connection failed |
+
+Notes:
+
+- **Gauges are refreshed on every scrape** (same rule as the worker's pool gauges), so they cannot drift when discovery or the health monitor changes state. They deliberately show the **coordinator's own view** — that is what routing decides on, and a disagreement with the workers' own `available_slots` *is* the bug (a stale discovery cache).
+- **Counters are recorded by an RAII guard**, so a request whose future is dropped (client disconnect, gRPC deadline) is still counted.
+- The `scope` label of a `scope_not_found` rejection is reported as `unknown`. It is the one label value fed from client input, and an unknown scope is by definition not from the configured set — collapsing it keeps a buggy client from minting unbounded time series. The real name is in the logs (`span_scope`).
+- Every `reason` series is pre-created per discovered scope, so `rate()` over a rejection that has not happened yet returns 0 rather than no data.
+- Worker errors (selector not found, timeouts, browser errors) are **not** rejections: those requests did reach a worker and are already counted by `browser_hive_worker_requests_failed`.
+
+Useful queries:
+
+```promql
+# Demand refused for lack of capacity, per scope (the actionable signal)
+sum by (scope) (rate(browser_hive_coordinator_requests_rejected_total{reason=~"no_slots|no_workers"}[5m]))
+
+# As a share of all traffic
+sum by (scope) (rate(browser_hive_coordinator_requests_rejected_total{reason=~"no_slots|no_workers"}[5m]))
+/ clamp_min(sum by (scope) (rate(browser_hive_coordinator_requests_total[5m])), 0.0001)
+
+# Requests actually lost over the last hour
+sum by (scope) (increase(browser_hive_coordinator_requests_rejected_total{reason=~"no_slots|no_workers"}[1h]))
+```
+
+The Grafana "Refused demand (coordinator)" row in `ops/grafana/browser-hive-dashboard.json` renders all of this.
+
+⚠️ **Prometheus must scrape the coordinator pod as well.** The worker `PodMonitor` selects `app: browser-hive-worker` and will not match it; the coordinator needs its own scrape target on a container port named `metrics`.
+
 ## Coordinator Stats (gRPC)
 
 The coordinator can query per-worker stats via the gRPC `GetStats` endpoint (`WorkerStatsResponse`): total/available slots, active requests, contexts created/recycled, success rate. This is used internally for load balancing and is independent of the Prometheus endpoint.
@@ -128,6 +180,24 @@ spec:
 ```
 
 With `WORKER_MAX_CONTEXTS=3` and `threshold: "2.4"`, KEDA keeps average utilization around 80%: 7 claimed contexts → `ceil(7 / 2.4) = 3` pods.
+
+### Choosing the threshold, and what it cannot do
+
+`threshold` is **per-pod capacity, in contexts** — it must be recomputed whenever `WORKER_MAX_CONTEXTS` changes. It is not a portable number, so **never copy a threshold between environments that run different `WORKER_MAX_CONTEXTS`**: carrying `0.7` (correct for a 1-context dev pod) over to a 10-context production pod silently turns a 70% utilization target into 7%, and a single busy pod then asks for 15 replicas.
+
+| `WORKER_MAX_CONTEXTS` | target utilization | `threshold` |
+|---|---|---|
+| 1 | 0.7 | `"0.7"` |
+| 5 | 0.7 | `"3.5"` |
+| 10 | 0.7 | `"7"` |
+
+Fractional thresholds are fine (KEDA converts them to milli-quantities).
+
+**Lower threshold = earlier scale-up = more idle headroom.** The free slots the target buys are `(1 − utilization) × WORKER_MAX_CONTEXTS × replicas`. That is the whole effect; in particular the threshold does **not** control scale-down damping (`scaleDown.stabilizationWindowSeconds` does) and does **not** create a queue.
+
+⚠️ **A threshold cannot absorb a burst.** By Little's Law free slots absorb *concurrency*, not rate: `spare_slots / mean_request_duration` is the extra arrival rate they cover, and only until a new pod is serving — Chrome launch, readiness probe and the coordinator's 10s discovery poll put that at tens of seconds. Buying meaningful burst protection by lowering the threshold means running permanently over-provisioned pods through a knob that expresses it indirectly. Use `minReplicaCount` for that instead, and treat the threshold as the steady-state growth target.
+
+So when capacity rejections appear (`browser_hive_coordinator_requests_rejected_total{reason=~"no_slots|no_workers"}`, see above), the fix is **`minReplicaCount` / `maxReplicaCount`, not a lower threshold**. Without the coordinator metrics scraped there is no signal at all: rejected requests never reach a worker.
 
 For dashboards and alerting, the utilization ratio is more readable:
 

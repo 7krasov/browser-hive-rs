@@ -1,4 +1,5 @@
 mod local_worker_discovery;
+mod metrics;
 mod service;
 mod worker_discovery;
 
@@ -12,7 +13,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio_cancellation_ext::CancellationToken;
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 // gRPC server timeout - maximum time for a single request
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
@@ -102,8 +103,11 @@ async fn run_coordinator() -> Result<()> {
         concat!("Browser Hive library version=", env!("CARGO_PKG_VERSION"))
     );
 
-    // Load configuration
-    let config = CoordinatorConfig::default();
+    // Load configuration. Parse failures fall back to defaults but are never silent.
+    let (config, config_warnings) = CoordinatorConfig::from_env();
+    for warning in &config_warnings {
+        warn!("Coordinator config: {}", warning);
+    }
 
     info!("Starting Coordinator service on port {}", config.grpc_port);
 
@@ -116,6 +120,22 @@ async fn run_coordinator() -> Result<()> {
 
     // Get active requests counter for shutdown monitoring
     let active_requests = coordinator_service.active_requests();
+
+    // Prometheus metrics server. Long-lived background task, so it opens its own span with a
+    // sentinel ray_id (a spawned task does not inherit the lifetime span).
+    if let Some(metrics) = coordinator_service.metrics() {
+        let (workers, healthy) = coordinator_service.fleet_view();
+        let metrics_port = config.metrics_port;
+        let span = tracing::info_span!("metrics_server", ray_id = "metrics-server");
+        tokio::spawn(
+            async move {
+                if let Err(e) = metrics.start_server(metrics_port, workers, healthy).await {
+                    warn!("Metrics server error: {}", e);
+                }
+            }
+            .instrument(span),
+        );
+    }
 
     // Start gRPC server
     let addr: SocketAddr = format!("0.0.0.0:{}", config.grpc_port)

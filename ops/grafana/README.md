@@ -27,6 +27,31 @@ observed daily peak.
   histogram. Cross-check against the busy-contexts peak; if it is consistently higher,
   shorten the worker scrape interval.
 
+### Refused demand row (coordinator metrics)
+
+The four panels in this row come from `browser_hive_coordinator_*` and require the
+coordinator to be scraped as well - see METRICS.md. They answer the one question the worker
+metrics structurally cannot: **how much demand was turned away**. There is no queue in
+Browser Hive, so a request refused with `NO_WORKERS_AVAILABLE` (5001) never reaches a worker
+and leaves no trace in any `browser_hive_worker_*` series. A fleet at 100% utilization and a
+fleet rejecting half its traffic look identical from the worker side.
+
+- **Rejected requests/sec by reason** - split by cause. `no_slots`/`no_workers` mean
+  capacity; `scope_not_found`/`session_not_found` mean a client or configuration problem and
+  no amount of scaling will change them.
+- **Capacity rejection rate %** - the actionable ratio. Sustained above zero = the scope is
+  under-provisioned.
+- **Requests lost to capacity** - the same thing in absolute requests over the range: the
+  cost of the current replica settings.
+- **Coordinator view: free slots and healthy workers** - the discovery cache routing
+  actually decides on. Free slots pinned at zero with rejections rising is genuine
+  saturation; healthy workers collapsing while pods run is a discovery/health problem
+  wearing a capacity costume.
+
+The fix for capacity rejections is `minReplicaCount`/`maxReplicaCount`, **not** a lower KEDA
+threshold: the threshold sets steady-state utilization, and no threshold can conjure a pod
+faster than it boots. See the KEDA section of METRICS.md.
+
 ## `browser-hive-workers-dashboard.json` - Workers per Scope
 
 Per-scope view of **how many worker instances run over time** (the autoscaling picture -

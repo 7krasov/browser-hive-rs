@@ -1,4 +1,5 @@
 use crate::local_worker_discovery::LocalWorkerDiscovery;
+use crate::metrics::{CoordinatorMetrics, RejectReason, RequestMetrics};
 use crate::worker_discovery::WorkerDiscovery;
 use anyhow::Result;
 use browser_hive_common::{CoordinatorConfig, SessionId, SessionManager, WorkerEndpoint};
@@ -157,6 +158,8 @@ pub struct CoordinatorService {
     active_requests: Arc<AtomicUsize>,
     cancellation_token: tokio_cancellation_ext::CancellationToken,
     healthy_workers: Arc<RwLock<HashSet<String>>>,
+    /// `None` when `COORDINATOR_ENABLE_METRICS` is off.
+    metrics: Option<CoordinatorMetrics>,
 }
 
 impl CoordinatorService {
@@ -186,6 +189,13 @@ impl CoordinatorService {
         let session_manager = Arc::new(SessionManager::default());
         let healthy_workers = Arc::new(RwLock::new(HashSet::new()));
 
+        let metrics = if config.enable_metrics {
+            Some(CoordinatorMetrics::new()?)
+        } else {
+            info!("Coordinator metrics are disabled (COORDINATOR_ENABLE_METRICS=false)");
+            None
+        };
+
         let service = Self {
             _config: config,
             worker_discovery,
@@ -193,6 +203,7 @@ impl CoordinatorService {
             active_requests: Arc::new(AtomicUsize::new(0)),
             cancellation_token: cancellation_token.clone(),
             healthy_workers: healthy_workers.clone(),
+            metrics,
         };
 
         // Start health monitoring background task
@@ -204,6 +215,25 @@ impl CoordinatorService {
     /// Get the active requests counter for shutdown monitoring
     pub fn active_requests(&self) -> Arc<AtomicUsize> {
         self.active_requests.clone()
+    }
+
+    /// The metrics registry, or `None` when metrics are disabled.
+    pub fn metrics(&self) -> Option<CoordinatorMetrics> {
+        self.metrics.clone()
+    }
+
+    /// Discovery cache and health set, for the metrics server's scrape-time gauge refresh.
+    #[allow(clippy::type_complexity)]
+    pub fn fleet_view(
+        &self,
+    ) -> (
+        Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
+        Arc<RwLock<HashSet<String>>>,
+    ) {
+        (
+            self.worker_discovery.get_workers(),
+            self.healthy_workers.clone(),
+        )
     }
 
     /// Start background task that monitors worker health every 1 second
@@ -343,10 +373,15 @@ impl ScraperCoordinator for CoordinatorService {
         // Track active request (automatically decrements on drop)
         let _active_guard = ActiveRequestGuard::new(self.active_requests.clone());
 
+        // Counts the request and records its duration on drop, so a future dropped mid-request
+        // (client disconnect, gRPC deadline) is still counted. `reject()` marks the reason.
+        let mut request_metrics = RequestMetrics::new(self.metrics.clone(), &req.scope_name);
+
         let start_time = std::time::Instant::now();
 
         // Check if coordinator is terminating - return immediately
         if self.cancellation_token.is_cancelled() {
+            request_metrics.reject(RejectReason::Terminating);
             let execution_time_ms = start_time.elapsed().as_millis() as u64;
             return Ok(Response::new(ScrapePageResponse {
                 success: false,
@@ -379,8 +414,9 @@ impl ScraperCoordinator for CoordinatorService {
 
             if let Some(session_info) = self.session_manager.get_session(&req.session_id).await {
                 // Routing follows the session's scope, not the request's — keep the span field
-                // pointing at the scope the request is actually served from.
+                // and the metric label pointing at the scope the request is actually served from.
                 tracing::Span::current().record("scope", session_info.scope_name.as_str());
+                request_metrics.set_scope(&session_info.scope_name);
 
                 // Check that worker still exists
                 let scope_workers = workers.get(&session_info.scope_name);
@@ -401,6 +437,7 @@ impl ScraperCoordinator for CoordinatorService {
                     warn!("Session worker not available, creating new session");
                     self.session_manager.remove_session(&req.session_id).await;
 
+                    request_metrics.reject(RejectReason::SessionNotFound);
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(Response::new(ScrapePageResponse {
                         success: false,
@@ -420,6 +457,7 @@ impl ScraperCoordinator for CoordinatorService {
                     }));
                 }
             } else {
+                request_metrics.reject(RejectReason::SessionNotFound);
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(Response::new(ScrapePageResponse {
                     success: false,
@@ -441,6 +479,7 @@ impl ScraperCoordinator for CoordinatorService {
                 Some(w) => w,
                 None => {
                     warn!("Scope not found: {}", req.scope_name);
+                    request_metrics.reject(RejectReason::ScopeNotFound);
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(Response::new(ScrapePageResponse {
                         success: false,
@@ -460,6 +499,7 @@ impl ScraperCoordinator for CoordinatorService {
             };
 
             if scope_workers.is_empty() {
+                request_metrics.reject(RejectReason::NoWorkers);
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(Response::new(ScrapePageResponse {
                     success: false,
@@ -490,6 +530,7 @@ impl ScraperCoordinator for CoordinatorService {
                     s
                 }
                 None => {
+                    request_metrics.reject(RejectReason::NoWorkers);
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(Response::new(ScrapePageResponse {
                         success: false,
@@ -534,7 +575,9 @@ impl ScraperCoordinator for CoordinatorService {
                         // Continue with the request
                     }
                     _ => {
-                        // Fresh stats confirm no slots, or fetch failed - reject
+                        // Fresh stats confirm no slots, or fetch failed - reject.
+                        // This is the capacity signal: demand that existed and was refused.
+                        request_metrics.reject(RejectReason::NoSlots);
                         let execution_time_ms = start_time.elapsed().as_millis() as u64;
                         return Ok(Response::new(ScrapePageResponse {
                             success: false,
@@ -585,6 +628,7 @@ impl ScraperCoordinator for CoordinatorService {
             {
                 Ok(client) => client,
                 Err(e) => {
+                    request_metrics.reject(RejectReason::WorkerUnreachable);
                     return Err(Status::internal(format!(
                         "Failed to connect to worker: {}",
                         e

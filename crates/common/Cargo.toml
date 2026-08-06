@@ -13,5 +13,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 humantime-serde = "1.1"
+humantime = "2.3"
 headless_chrome = { workspace = true }
 tokio-cancellation-ext = { path = "../tokio-cancellation-ext" }

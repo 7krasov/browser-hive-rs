@@ -390,6 +390,7 @@ pub struct CoordinatorConfig {
     #[serde(with = "humantime_serde")]
     pub worker_cache_ttl: Duration,
     pub enable_metrics: bool,
+    pub metrics_port: u16,
 }
 
 impl Default for CoordinatorConfig {
@@ -398,7 +399,84 @@ impl Default for CoordinatorConfig {
             grpc_port: 50051,
             worker_cache_ttl: Duration::from_secs(5),
             enable_metrics: true,
+            metrics_port: 9090,
         }
+    }
+}
+
+impl CoordinatorConfig {
+    /// Build the configuration from environment variables.
+    ///
+    /// | Variable | Default |
+    /// |---|---|
+    /// | `COORDINATOR_GRPC_PORT` | `50051` |
+    /// | `COORDINATOR_WORKER_CACHE_TTL` (humantime, e.g. `5s`) | `5s` |
+    /// | `COORDINATOR_ENABLE_METRICS` | `true` |
+    /// | `COORDINATOR_METRICS_PORT` | `9090` |
+    ///
+    /// An unparseable value falls back to the default rather than failing: the coordinator has
+    /// no scope validation phase, and refusing to start over a malformed metrics port would take
+    /// down routing for the whole cluster. Every fallback is logged by the caller-visible
+    /// `warnings()` list so a typo is never silent.
+    pub fn from_env() -> (Self, Vec<String>) {
+        let defaults = Self::default();
+        let mut warnings = Vec::new();
+
+        fn parse_var<T: std::str::FromStr>(
+            name: &str,
+            default: T,
+            warnings: &mut Vec<String>,
+        ) -> T {
+            match std::env::var(name) {
+                Err(_) => default,
+                Ok(raw) => match raw.parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "{}='{}' could not be parsed, using the default",
+                            name, raw
+                        ));
+                        default
+                    }
+                },
+            }
+        }
+
+        let grpc_port = parse_var("COORDINATOR_GRPC_PORT", defaults.grpc_port, &mut warnings);
+        let enable_metrics = parse_var(
+            "COORDINATOR_ENABLE_METRICS",
+            defaults.enable_metrics,
+            &mut warnings,
+        );
+        let metrics_port = parse_var(
+            "COORDINATOR_METRICS_PORT",
+            defaults.metrics_port,
+            &mut warnings,
+        );
+
+        let worker_cache_ttl = match std::env::var("COORDINATOR_WORKER_CACHE_TTL") {
+            Err(_) => defaults.worker_cache_ttl,
+            Ok(raw) => match humantime::parse_duration(&raw) {
+                Ok(d) => d,
+                Err(_) => {
+                    warnings.push(format!(
+                        "COORDINATOR_WORKER_CACHE_TTL='{}' could not be parsed, using the default",
+                        raw
+                    ));
+                    defaults.worker_cache_ttl
+                }
+            },
+        };
+
+        (
+            Self {
+                grpc_port,
+                worker_cache_ttl,
+                enable_metrics,
+                metrics_port,
+            },
+            warnings,
+        )
     }
 }
 
