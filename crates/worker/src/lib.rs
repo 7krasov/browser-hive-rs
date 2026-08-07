@@ -69,7 +69,7 @@ pub const LIBRARY_VERSION_BANNER: &str =
 ///             binary_params_middlewares: vec![],
 ///             tab_init_middlewares: vec![],
 ///             context_isolation: ContextIsolation::Isolated,
-///             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated
+///             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated (set true there)
 ///         },
 ///         grpc_port: 50052,
 ///         pod_name: "worker-1".to_string(),

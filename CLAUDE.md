@@ -330,7 +330,7 @@ The coordinator supports two deployment modes (selected via `COORDINATOR_MODE`):
 **Optional worker variables**:
 - `WORKER_MIN_CONTEXTS` - Browser contexts pre-created on startup (default: `0`). Only `reusable` pre-creates; in the other modes a pre-created context has no client, so `validate()` warns
 - `WORKER_SESSION_MODE` - Session management mode (see table below)
-- `WORKER_DESTROY_SESSION_ON_BLOCK` - Release a `dedicated` session's context on HTTP 403/429 (default: `false`)
+- `WORKER_DESTROY_SESSION_ON_BLOCK` - Release a `dedicated` session's context on HTTP 403/429. Default follows the mode: **`true` in `dedicated`**, `false` elsewhere (where it is inert and a flat `true` would make `validate()` warn on every start). An explicit value always wins
 - `WORKER_ENABLE_BROWSER_DIAGNOSTICS` - Master switch for browser diagnostics (default: `false`). See "Browser Diagnostics" below for the other `WORKER_DIAGNOSTICS_*` knobs
 - `WORKER_HEADLESS` - Run browser in headless mode (default: `true`)
 - `WORKER_MAX_IDLE_TIME_SECS` - Max idle time before a context is recycled (`reusable`) or removed (`dedicated`). Default: 300, but **60 in `dedicated`**

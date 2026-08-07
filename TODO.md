@@ -24,9 +24,9 @@ changes underneath a live context, the origin answers the now-mismatched cookies
 the client drops the session — the system self-corrects at a cost of one wasted page load, which
 is why `max_lifetime` is deliberately left at its default rather than guessed (SESSION_MODES.md).
 
-To replace the guess with a number: set `WORKER_DESTROY_SESSION_ON_BLOCK=true` on a `dedicated`
-scope and collect the **context age** from the `Releasing dedicated context … after HTTP 403`
-lines. If those ages cluster, the cluster is the provider's sticky TTL and `max_lifetime` can be
+To replace the guess with a number: collect the **context age** from the `Releasing dedicated
+context … after HTTP 403` lines of any `dedicated` scope — `WORKER_DESTROY_SESSION_ON_BLOCK`
+defaults to `true` there, so the lines are already being emitted. If those ages cluster, the cluster is the provider's sticky TTL and `max_lifetime` can be
 set just below it. Note this is a per-provider fact — a dedicated IP pool
 has no sticky TTL and needs no ceiling.
 

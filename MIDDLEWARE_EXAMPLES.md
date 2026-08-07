@@ -266,7 +266,7 @@ fn create_scope_config() -> ScopeConfig {
         binary_params_middlewares,
         tab_init_middlewares,
         context_isolation: ContextIsolation::Isolated,
-        destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated
+        destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated (set true there)
     }
 }
 ```

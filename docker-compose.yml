@@ -59,7 +59,7 @@ services:
       # - WORKER_MIN_CONTEXTS=0           # pre-created contexts belong to nobody here
       # - WORKER_MAX_CONTEXTS=5           # = 5 concurrent sessions
       # - WORKER_MAX_IDLE_TIME_SECS=60    # the only thing that frees a slot (default in this mode)
-      # - WORKER_DESTROY_SESSION_ON_BLOCK=true  # release the context on HTTP 403/429
+      # - WORKER_DESTROY_SESSION_ON_BLOCK=false # keep the context on HTTP 403/429 (default: true here)
 
       # Proxy configuration
       # Option 1: No proxy (direct connection)

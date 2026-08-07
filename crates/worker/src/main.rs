@@ -131,7 +131,16 @@ fn load_config_from_env(
 
     // Release a dedicated session's context as soon as its page comes back 403/429, instead of
     // holding the slot (and the refused exit IP) until the idle timeout.
-    let destroy_session_on_block = env_parsed::<bool>("WORKER_DESTROY_SESSION_ON_BLOCK", false)?;
+    //
+    // Like max_idle_time above, the default follows the mode: in `dedicated` a blocked context is
+    // a slot nobody will ever come back for (the client drops its session id on those statuses and
+    // there is no release RPC), so releasing it is the right default; in the other modes the
+    // setting does nothing, and defaulting to `true` there would only make validate() warn on
+    // every start. An explicit value always wins.
+    let destroy_session_on_block = env_parsed::<bool>(
+        "WORKER_DESTROY_SESSION_ON_BLOCK",
+        session_mode == SessionMode::Dedicated,
+    )?;
 
     // Create default binary params middleware
     // Users in production can replace this with custom implementations

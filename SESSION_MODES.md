@@ -43,7 +43,7 @@ There is no release RPC (see [Design decisions](#design-decisions)), so three th
 |---|---|---|
 | Idle timeout | 1 min (`WORKER_MAX_IDLE_TIME_SECS`) | The only mechanism that needs no cooperation from anyone. Checked by the lifecycle monitor, which ticks every 60 s — so removal happens up to a minute after expiry. |
 | `max_lifetime` / `max_requests` | 6 h / 10 000 | The ordinary lifecycle thresholds. |
-| HTTP 403 / 429 | off (`WORKER_DESTROY_SESSION_ON_BLOCK`) | Opt-in, see below. |
+| HTTP 403 / 429 | **on** in `dedicated` (`WORKER_DESTROY_SESSION_ON_BLOCK`) | See below. |
 
 Idle time is measured from the **end** of the last request, not its start: `ContextBusyGuard`
 re-stamps `last_used_at` on drop. Without that, a request taking longer than the idle timeout
@@ -70,9 +70,16 @@ clients actually pause, not up front.
 
 ### Destroying the context on 403/429
 
-`WORKER_DESTROY_SESSION_ON_BLOCK=true` releases a session's context as soon as its page comes back
+`WORKER_DESTROY_SESSION_ON_BLOCK` releases a session's context as soon as its page comes back
 403 or 429 — the same statuses the wait strategy already exits early on
 (`EARLY_EXIT_STATUS_CODES`, `common/src/wait_strategy.rs`), so the signal costs nothing extra.
+
+**It defaults to on in `dedicated`** (and to off in the other modes, where it does nothing —
+see the default table above). The default follows the mode for the same reason `max_idle_time`
+does: in `dedicated` a blocked context is a slot nobody is coming back for, and nothing but the
+idle timeout would ever free it. An explicit value always wins, so a scope that scrapes a site
+where 403 is an ordinary answer (a paywalled or permission-gated page rather than a block) can set
+`WORKER_DESTROY_SESSION_ON_BLOCK=false` and keep the session's cookies and warm-up.
 
 This is what replaces an explicit release. A client drops its session on those statuses anyway, so
 nothing still in use is taken away; without it the worker would keep the slot — and the exit IP the
@@ -82,8 +89,12 @@ The response of that request carries **no `context_id`**, so the coordinator cac
 it. A later request that still presents the old `session_id` gets `SESSION_NOT_FOUND`, which is
 true.
 
-It is an **option**, not a rule: a 403 on one page does not universally mean the session is dead.
-It has no effect in the other modes, and `validate()` says so at startup rather than ignoring it.
+It stays an **option** because a 403 on one page does not universally mean the session is dead —
+but that is the rarer case, and it costs one extra warm-up, while the opposite mistake costs a
+slot out of `max_contexts` for up to two minutes on a scope whose capacity *is* its slot count.
+The setting has no effect in the other modes, and `validate()` says so at startup rather than
+ignoring it — which is also why the default is mode-dependent rather than a flat `true`, since a
+flat `true` would make every `reusable` scope warn on every start.
 
 **`max_lifetime` is left at its default and measured, not guessed.** For a gateway provider the
 useful session length is bounded by the provider's sticky TTL, which providers generally do not
@@ -130,7 +141,7 @@ CLAUDE.md, "Context Lifecycle Monitoring".
 | `WORKER_MAX_CONTEXTS` | 3 | all — but counts **sessions** in `dedicated` |
 | `WORKER_MIN_CONTEXTS` | **0** | `reusable` only (pre-creates contexts at startup) |
 | `WORKER_MAX_IDLE_TIME_SECS` | 300, **60 in `dedicated`** | `reusable`, `dedicated` |
-| `WORKER_DESTROY_SESSION_ON_BLOCK` | `false` | `dedicated` only |
+| `WORKER_DESTROY_SESSION_ON_BLOCK` | `true` in `dedicated`, `false` elsewhere | `dedicated` only |
 | `WORKER_CONTEXT_ISOLATION` | `isolated` | all — `dedicated` requires `isolated` |
 
 Pre-initialization is an option, not a mode. `min_contexts > 0` fills the pool at startup, which
