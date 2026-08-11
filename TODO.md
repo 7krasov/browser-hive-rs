@@ -118,6 +118,38 @@ strategies are therefore no longer silent, but the underlying oddity stands: an 
 three values disable other configuration, still hardcoded, still unexposed. The argument above is
 unchanged.
 
+## `max_cache_size_mb` is a threshold nothing can ever cross
+
+**Status**: open, confirmed by reading the code (raised 2026-08-11)
+
+`BrowserContextMetadata::cache_size_mb` (`common/src/types.rs`) is initialised to `0` and is
+**never written** anywhere in the workspace — the only readers are
+`should_recycle_context` (`worker/src/browser_pool.rs`) and one diagnostic log line in
+`worker/src/service.rs`. So `cache_too_large` is permanently `false`: `Hybrid` effectively ORs
+**three** predicates (age, requests, idle), not four, and `WORKER_MAX_CACHE_SIZE_MB` /
+`max_cache_size_mb` (default 500) is inert configuration in every session mode.
+
+This is not currently harmful — no scope relies on cache-driven rotation, and `max_idle_time`
+recycles a `reusable` context long before its disk cache could matter. It is on this list because
+the setting *reads* as working: CLAUDE.md, SESSION_MODES.md and the strategy table above all list
+it next to the three thresholds that do fire, so anyone tuning it would get no rotation and no
+warning.
+
+**Three ways out**, in increasing cost:
+
+1. **Delete it.** Drop the field from `ContextLifecycleConfig`, the predicate from
+   `should_recycle_context`, and the mentions from the docs. Honest, and the strategy table
+   collapses to three knobs.
+2. **Populate it** from CDP — per-context disk/memory usage is not directly exposed;
+   `Network.getResponseBodyForInterception` accounting or `Browser.getBrowserCommandLine`-era
+   cache-size APIs do not give it either, so this needs research before it is promised.
+3. **Leave it and mark it inert** in `ScopeConfig::validate()`, the way non-`Hybrid` strategies
+   are already warned about — cheapest, and consistent with the existing "never inert in silence"
+   rule.
+
+Whichever is chosen, the docs must change with it: the four-threshold wording in CLAUDE.md
+("all four, OR-ed") and the `rotation_strategy` table above are both wrong today.
+
 ## Empty CDP BrowserContexts are never disposed
 
 **Status**: residue of the tab-leak fix; needs an upstream change (raised 2026-07-27)
