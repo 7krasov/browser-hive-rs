@@ -66,6 +66,50 @@ path (`coordinator/src/service.rs`, `response_headers: worker_response.response_
 the client receives it in `ScrapePageResponse.response_headers` (field 6 in both
 `worker.proto` and `coordinator.proto`). Error paths return empty headers.
 
+### Header map format — what a client must do
+
+`response_headers` is the **CDP header map passed through verbatim**, not an HTTP header
+list. `map<string, string>` cannot express a repeated header, and CDP resolves that the same
+way for every field: it emits **one entry per name** whose values are joined with `"\n"`.
+Two rules follow, and both bite silently when ignored.
+
+**1. Split repeated values on `"\n"`.** A server that sends
+
+```http
+Cache-Control: no-store, no-cache, must-revalidate, post-check=0, pre-check=0
+Cache-Control: max-age=31536000
+```
+
+reaches the client as a single entry:
+
+```json
+{"cache-control": "no-store, no-cache, must-revalidate, post-check=0, pre-check=0\nmax-age=31536000"}
+```
+
+A client that greps `max-age=(\d+)` out of that value caches for a year a page the origin
+said not to store at all. `Set-Cookie` is the case that hits most often — three cookies are
+one entry with two newlines in it.
+
+The `"\n"` join is **lossless**: a literal newline cannot occur inside a header value (it is
+the protocol's own line delimiter, and Chromium folds obs-fold continuations into spaces
+before we ever see them), so splitting recovers the exact original lines. **Never split on
+`","`**, even though RFC 9110 §5.3 permits comma-joining list-based fields: values legally
+contain commas (the date in `Expires`, or in a `Set-Cookie` `expires=` attribute), so a comma
+split cuts them in half. This is also why the worker does not comma-join them for you.
+
+**2. Look names up case-insensitively.** CDP reports the name in the case the *server* used:
+always lowercase over HTTP/2 and HTTP/3 (the protocols require it), arbitrary over HTTP/1.1
+(`Cache-Control`). An exact-case lookup therefore works on one site and returns nothing on
+the next, which reads as "the site did not send the header" rather than as a bug.
+
+Nothing is merged or normalised on the way out **on purpose**. Two `Cache-Control` lines are
+a fact of the wire; deciding which one wins is HTTP policy, and neither `common` nor the
+worker holds HTTP policy (same rule as the 403/429 early exit, which returns the status and
+lets the client decide what it means). A `repeated HeaderEntry` field was considered and not
+added: it would carry the same two values in a second representation of the same data, would
+still leave the client to decide what they mean, and costs a proto change across every
+consumer — while the format note above costs nothing on the wire.
+
 ## Design decision: `Network` domain, not `Fetch` (recorded 2026-07-23)
 
 **Decision**: use the `Network` domain with a client-side filter, **not** the `Fetch` domain
@@ -179,9 +223,10 @@ diagnostics, not only the gRPC response — see METRICS.md.
 - **Overhead is per request and unconditional.** Every scrape now enables the `Network`
   domain. See the design decision above; gate behind a config flag (mirroring
   `WORKER_ENABLE_BROWSER_DIAGNOSTICS`) only if this becomes a measured problem.
-- **Header values are strings.** Multi-value headers that Chrome joins (e.g. `Set-Cookie`)
-  arrive newline-joined in a single map entry; non-string JSON values fall back to their
-  JSON string form.
+- **Header values are strings, and repeated headers are newline-joined** into a single map
+  entry (`Set-Cookie`, `Cache-Control`, …), with names in the server's own case. See
+  "Header map format" above for what a client must do about it; non-string JSON values fall
+  back to their JSON string form.
 - **Empty is a valid result.** Clients must treat missing `response_headers` as "not
   captured", not as an error.
 - **Headers describe the wire response, not the returned `content`.** They are forwarded

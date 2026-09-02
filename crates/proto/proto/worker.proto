@@ -79,6 +79,21 @@ message ScrapePageResponse {
   // not sub-resources or iframes. Captured via CDP. Empty when unavailable
   // (capture disabled/failed, or an error path). See RESPONSE_OBSERVERS.md.
   //
+  // FORMAT: this is the CDP header map passed through verbatim, not an HTTP header
+  // list. Two consequences for every reader:
+  //   1. A header the server sent MORE THAN ONCE arrives as ONE entry whose values are
+  //      joined with "\n" (Set-Cookie is the common case; also Cache-Control, Link,
+  //      Vary). Split the value on "\n" to recover the individual header lines. That
+  //      join is lossless - a literal newline cannot appear inside a header value.
+  //      Never split on ",": values may legally contain commas (the date in Expires or
+  //      in a Set-Cookie attribute).
+  //   2. Names carry the case the server used: always lowercase over HTTP/2 and HTTP/3,
+  //      arbitrary over HTTP/1.1 ("Cache-Control"). Look them up case-insensitively -
+  //      an exact-case lookup silently misses on some sites and looks like the header
+  //      was never sent.
+  // Values are deliberately neither merged nor normalised: which of two Cache-Control
+  // lines wins is the client's policy decision, and the worker holds no HTTP policy.
+  //
   // WARNING: these headers describe the wire response, NOT the `content` field above.
   // `content-length` is the size of the COMPRESSED body (often absent entirely) and
   // `content-encoding` reports what the server sent before Chrome decompressed it,

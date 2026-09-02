@@ -151,7 +151,9 @@ message ScrapePageResponse {
   string content = 3;             // Empty or partial content
   string error_message = 4;       // Detailed human-readable error
   ErrorCode error_code = 5;       // Machine-readable error code
-  map<string, string> response_headers = 6;
+  map<string, string> response_headers = 6;  // Main-document headers, CDP format:
+                                  // repeated headers joined with "\n", server-case names
+                                  // (see RESPONSE_OBSERVERS.md)
   string session_id = 7;          // Session ID for reuse ("{worker_id}:{context_id}", may be empty)
   string worker_id = 8;           // Worker pod ID (component of session_id, for debugging)
   string context_id = 9;          // Browser context ID (component of session_id, for debugging)
