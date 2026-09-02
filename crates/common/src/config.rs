@@ -67,6 +67,27 @@ pub struct ScopeConfig {
     /// request (`AlwaysNew`) or shared by everyone (`Reusable`); [`ScopeConfig::validate`] warns
     /// when it is set there.
     pub destroy_session_on_block: bool,
+
+    /// How long a [`SessionMode::Reusable`] context stays out of the running for **one origin**
+    /// after that origin answered it 403 or 429. `Duration::ZERO` disables the mechanism.
+    ///
+    /// A block is a property of the pair (exit IP, origin). For a provider that pins one exit IP
+    /// per context, handing the next request for the same site back to the refused context is
+    /// certain to be refused again — and since a `reusable` context is otherwise rotated only by
+    /// `max_lifetime` / `max_idle_time` (hours), a transient block becomes a multi-hour outage.
+    ///
+    /// Deliberately *not* the same tool as [`Self::destroy_session_on_block`]: destroying the
+    /// context would throw away the warm cookies of every other site it serves to solve one, and
+    /// would churn the pool — and the provider's address pool with it — if the origin is blocking
+    /// on something other than the IP. A quarantine costs nothing to hold: the context keeps
+    /// serving everything else, and the entry expires on its own.
+    ///
+    /// Only `reusable` can act on it. In `dedicated` the context is addressed by its session id,
+    /// so there is nowhere to reroute to — a blocked session is finished, which is what
+    /// `destroy_session_on_block` already does; in `always_new` the context dies with the request.
+    /// [`ScopeConfig::validate`] warns when it is set elsewhere.
+    #[allow(rustdoc::private_intra_doc_links)]
+    pub block_quarantine: Duration,
 }
 
 /// Controls how browser contexts share state within a Chrome process
@@ -191,6 +212,15 @@ pub const DEFAULT_MAX_IDLE_TIME_SECS: u64 = 5 * 60;
 /// exactly this long. A client that is genuinely working a site comes back far sooner than a
 /// minute; one that does not was finished anyway.
 pub const DEFAULT_DEDICATED_MAX_IDLE_TIME_SECS: u64 = 60;
+
+/// Default cooldown of a per-origin block quarantine in [`SessionMode::Reusable`], in seconds.
+///
+/// Five minutes is a compromise with no measurement behind it, and it is meant to be tuned per
+/// scope: long enough that a rate limit computed over a short window has expired, short enough
+/// that a context is not held out of a small pool for a whole shift. It is only a cooldown — the
+/// context serves every other origin throughout, and the first request after it expires decides
+/// whether the block is really over.
+pub const DEFAULT_BLOCK_QUARANTINE_SECS: u64 = 5 * 60;
 
 impl std::fmt::Debug for ScopeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -329,6 +359,30 @@ impl ScopeConfig {
                 "scope '{}': rotation_strategy={:?} ignores max_idle_time and max_cache_size_mb; \
                  only Hybrid consults all four thresholds.",
                 self.name, self.lifecycle.rotation_strategy
+            ));
+        }
+
+        if !self.block_quarantine.is_zero() && self.session_mode != SessionMode::Reusable {
+            warnings.push(format!(
+                "scope '{}': block_quarantine has no effect in {} mode - only reusable chooses \
+                 between contexts, so only there can a blocked one be skipped.",
+                self.name, mode
+            ));
+        }
+
+        // A pool that only grows on contention never grows under a client that sends one request
+        // at a time, so a provider that pins an exit IP per context serves the whole pod from a
+        // single address - and the quarantine above then has nothing to reroute to.
+        if self.session_mode == SessionMode::Reusable
+            && self.min_contexts < self.max_contexts
+            && self.proxy_provider.assigns_proxy_host_per_context()
+        {
+            warnings.push(format!(
+                "scope '{}': min_contexts ({}) < max_contexts ({}) with a per-context proxy host. \
+                 The pool only creates a context when every existing one is busy, so a client \
+                 sending one request at a time will run the whole scope on one exit IP. Set \
+                 WORKER_MIN_CONTEXTS=WORKER_MAX_CONTEXTS for IP diversity.",
+                self.name, self.min_contexts, self.max_contexts
             ));
         }
 
@@ -781,6 +835,7 @@ mod tests {
             tab_init_middlewares: vec![],
             context_isolation: ContextIsolation::Isolated,
             destroy_session_on_block: false,
+            block_quarantine: Duration::ZERO,
         }
     }
 
@@ -882,6 +937,70 @@ mod tests {
                 "{mode:?} warned about defaults: {warnings:?}"
             );
         }
+    }
+
+    /// The quarantine can only reroute where the pool chooses between contexts. Elsewhere the
+    /// setting is inert and must say so, exactly like `destroy_session_on_block` in reverse.
+    #[test]
+    fn test_warns_about_quarantine_outside_reusable() {
+        let mut dedicated = scope(SessionMode::Dedicated);
+        dedicated.block_quarantine = Duration::from_secs(300);
+        let warnings = dedicated.validate().expect("valid, just pointless");
+        assert!(warnings.iter().any(|w| w.contains("block_quarantine")));
+
+        let mut reusable = scope(SessionMode::Reusable);
+        reusable.block_quarantine = Duration::from_secs(300);
+        assert!(reusable
+            .validate()
+            .expect("valid")
+            .iter()
+            .all(|w| !w.contains("block_quarantine")));
+    }
+
+    /// A pool that only grows on contention never grows under a client that sends one request at
+    /// a time, so a per-context proxy host would serve the whole pod from a single exit IP —
+    /// invisible on every dashboard, because the scope looks healthy and idle.
+    #[test]
+    fn test_warns_when_a_per_context_proxy_pool_cannot_grow() {
+        #[derive(Debug, Clone)]
+        struct PerContextProvider;
+
+        impl crate::proxy::ProxyProvider for PerContextProvider {
+            fn build_config(&self) -> anyhow::Result<crate::proxy::ProxyConfig> {
+                TestProvider.build_config()
+            }
+
+            fn name(&self) -> &str {
+                "per_context"
+            }
+
+            fn supports_per_context_proxy(&self) -> bool {
+                true
+            }
+
+            fn assigns_proxy_host_per_context(&self) -> bool {
+                true
+            }
+
+            fn clone_box(&self) -> Box<dyn crate::proxy::ProxyProvider> {
+                Box::new(self.clone())
+            }
+        }
+
+        let mut config = scope(SessionMode::Reusable);
+        config.proxy_provider = Box::new(PerContextProvider);
+        config.min_contexts = 0;
+        config.max_contexts = 4;
+        let warnings = config.validate().expect("valid, just single-IP");
+        assert!(warnings.iter().any(|w| w.contains("one exit IP")));
+
+        // Pre-creating the whole pool is the fix, and must silence the warning.
+        config.min_contexts = 4;
+        assert!(config
+            .validate()
+            .expect("valid")
+            .iter()
+            .all(|w| !w.contains("one exit IP")));
     }
 
     #[test]

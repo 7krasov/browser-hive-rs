@@ -2,6 +2,36 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## Tune the block quarantine cooldown from real block durations
+
+**Status**: open, waiting for production numbers (raised 2026-09-02)
+
+`WORKER_BLOCK_QUARANTINE_SECS` defaults to 300 s in `reusable` (SESSION_MODES.md). That number is a
+compromise with no measurement behind it: long enough for a rate limit computed over a short window
+to expire, short enough not to hold a context out of a small pool for a whole shift.
+
+To replace the guess: after a quarantine expires, the next request to that origin either succeeds
+(the block was shorter than the cooldown) or is refused again and re-arms it. Count the re-arms per
+context+origin — a high rate means the cooldown is too short for this origin, a cooldown that never
+re-arms means it can come down. Only then consider a backoff, which was deliberately left out
+because it needs failure history the pool has no other use for.
+
+## A claimed-slot-seconds counter for `dedicated` autoscaling
+
+**Status**: open, low priority (raised 2026-09-02)
+
+Pool gauges are recomputed inside the Prometheus scrape handler (`refresh_pool_gauges`), so they
+report occupancy **at that instant**, not over the interval. `always_new`/`reusable` have a
+rate-based alternative — `sum(rate(browser_hive_worker_request_duration_seconds_sum[1m]))` is mean
+requests in flight, in the same unit a slot threshold already uses, and immune to scrape sampling.
+`dedicated` autoscales on `claimed_contexts`, which has no such equivalent: a slot stays claimed
+between a session's requests.
+
+The sampling error there is small (slots are held far longer than a scrape interval), which is why
+this is not urgent. If one signal that is correct in every mode is ever wanted, it would be a
+monotonic counter of claimed-slot-seconds alongside the gauge — computable exactly at scrape time
+from the contexts' own timestamps plus an accumulator for the ones already removed.
+
 ## Align the coordinator's session TTL with `dedicated`'s idle removal
 
 **Status**: open, deliberately unresolved (raised 2026-08-03, still open after `dedicated` shipped)

@@ -11,7 +11,7 @@ use headless_chrome::{Browser, LaunchOptions};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn, Instrument};
 
@@ -92,12 +92,42 @@ fn reclaim_leaked_always_new_contexts(
 /// Free function rather than a method so both lookups — the optimistic one under the read lock
 /// and the double-check under the write lock — select identically. Ties keep the earlier
 /// context, which only matters for a pool that has just started and where every count is 0.
-fn select_least_used_idle(contexts: &[Arc<BrowserContext>]) -> Option<Arc<BrowserContext>> {
+///
+/// `origin` is the registrable domain the request is for. A context this origin has recently
+/// refused (403/429) is skipped **for that origin only** — it stays fully eligible for every
+/// other site, because a block belongs to the pair (exit IP, origin), not to the context. Pass
+/// `None` to ignore quarantines (the caller has no origin, or the feature is off).
+fn select_least_used_idle(
+    contexts: &[Arc<BrowserContext>],
+    origin: Option<&str>,
+) -> Option<Arc<BrowserContext>> {
     contexts
         .iter()
         .filter(|c| !c.metadata.is_busy.load(Ordering::SeqCst))
+        .filter(|c| match origin {
+            Some(origin) => c.metadata.quarantined_until(origin).is_none(),
+            None => true,
+        })
         .min_by_key(|c| c.metadata.total_requests.load(Ordering::SeqCst))
         .cloned()
+}
+
+/// Of the idle contexts quarantined for `origin`, the one whose quarantine ends soonest.
+///
+/// The last resort when the pool is at `max_contexts` and every idle context is quarantined for
+/// this origin. Serving the request from a refused context is a poor outcome, but it is the
+/// outcome the caller already gets today, whereas failing the request would be a new one — the
+/// client is answered with the origin's own status either way and decides what it means.
+fn select_soonest_unquarantined(
+    contexts: &[Arc<BrowserContext>],
+    origin: &str,
+) -> Option<(Arc<BrowserContext>, Instant)> {
+    contexts
+        .iter()
+        .filter(|c| !c.metadata.is_busy.load(Ordering::SeqCst))
+        .filter_map(|c| c.metadata.quarantined_until(origin).map(|until| (c, until)))
+        .min_by_key(|(_, until)| *until)
+        .map(|(c, until)| (c.clone(), until))
 }
 
 fn close_tab_detached(tab: Arc<Tab>, context_id: uuid::Uuid) {
@@ -1019,30 +1049,39 @@ impl BrowserPool {
     /// requests on the first exit IP — the opposite of why a pool of addresses is bought.
     pub async fn find_least_busy_context(&self) -> Option<Arc<BrowserContext>> {
         let contexts = self.contexts.read().await;
-        select_least_used_idle(&contexts)
+        select_least_used_idle(&contexts, None)
     }
 
     /// Get or create a new context on-demand.
     ///
     /// This method is used in on-demand mode to create contexts when needed.
     /// It will:
-    /// 1. Try to find an idle existing context
+    /// 1. Try to find an idle existing context that this origin has not just refused
     /// 2. If none found and under max_contexts limit, create a new one
-    /// 2. If none found and under max_contexts limit, create a new one
-    /// 3. If at max_contexts limit, return None (resource exhausted)
+    /// 3. If at max_contexts limit, fall back to a quarantined idle context, or return None
+    ///    (resource exhausted) when every context is busy
     ///
     /// # Parameters
     /// * `proxy_params` - Proxy parameters (country_code, etc.) for context creation
+    /// * `origin` - Registrable domain of the request, or `None` when quarantines do not apply
+    ///   (feature disabled, or the URL has no domain). Step 1 skips contexts quarantined for it,
+    ///   which is what turns step 2 into "grow the pool because the current exit IP is refused"
+    ///   rather than only "grow the pool because everything is busy".
     pub async fn get_or_create_context(
         &self,
         proxy_params: &ProxyParams,
+        origin: Option<&str>,
     ) -> Result<Option<Arc<BrowserContext>>> {
         // If request has proxy routing overrides (e.g. country_code), we must create
         // a dedicated context because these params affect the proxy connection identity
         // (exit IP, geo) and can't be changed on an existing context.
         if !proxy_params.requires_dedicated_context() {
-            // No routing overrides - try to reuse an idle context
-            if let Some(context) = self.find_least_busy_context().await {
+            // No routing overrides - try to reuse an idle context this origin has not refused
+            let reusable = {
+                let contexts = self.contexts.read().await;
+                select_least_used_idle(&contexts, origin)
+            };
+            if let Some(context) = reusable {
                 info!(
                     "Reusing idle context: {} (total_requests: {})",
                     context.metadata.id,
@@ -1065,7 +1104,7 @@ impl BrowserPool {
 
         if !proxy_params.requires_dedicated_context() {
             // Double-check after acquiring write lock (another task might have created one)
-            if let Some(context) = select_least_used_idle(&contexts) {
+            if let Some(context) = select_least_used_idle(&contexts, origin) {
                 return Ok(Some(context));
             }
         }
@@ -1087,16 +1126,34 @@ impl BrowserPool {
             let context_arc = Arc::new(context);
             contexts.push(context_arc.clone());
 
-            Ok(Some(context_arc))
-        } else {
-            // At maximum capacity
-            info!(
-                "Cannot create new context - at max capacity ({}/{})",
-                contexts.len(),
-                self.scope_config.max_contexts
-            );
-            Ok(None)
+            return Ok(Some(context_arc));
         }
+
+        // At maximum capacity. If the only reason nothing was selected is that every idle context
+        // is quarantined for this origin, serve the request from the one that recovers soonest:
+        // the pool has nothing better to offer, and the alternative — refusing the request — would
+        // report a capacity problem the scope does not have.
+        if let Some(origin) = origin.filter(|_| !proxy_params.requires_dedicated_context()) {
+            if let Some((context, until)) = select_soonest_unquarantined(&contexts, origin) {
+                warn!(
+                    "All {} contexts are quarantined for {} - reusing context {} anyway \
+                     (quarantine ends in {:?}); the pool is at max_contexts, so no fresh exit IP \
+                     is available",
+                    contexts.len(),
+                    origin,
+                    context.metadata.id,
+                    until.saturating_duration_since(Instant::now())
+                );
+                return Ok(Some(context));
+            }
+        }
+
+        info!(
+            "Cannot create new context - at max capacity ({}/{})",
+            contexts.len(),
+            self.scope_config.max_contexts
+        );
+        Ok(None)
     }
 
     /// Create a context that will belong to one session (Dedicated mode).
@@ -1545,6 +1602,7 @@ mod tests {
             tab_init_middlewares: vec![],
             context_isolation: isolation,
             destroy_session_on_block: false,
+            block_quarantine: Duration::ZERO,
         }
     }
 
@@ -1623,7 +1681,7 @@ mod tests {
         // `heavily_used` comes first, which is exactly what the old implementation returned.
         let contexts = vec![heavily_used, barely_used.clone()];
 
-        let selected = select_least_used_idle(&contexts).expect("one context is idle");
+        let selected = select_least_used_idle(&contexts, None).expect("one context is idle");
         assert_eq!(selected.metadata.id, barely_used.metadata.id);
     }
 
@@ -1639,10 +1697,90 @@ mod tests {
 
         let contexts = vec![busy_and_fresh, idle_and_worn.clone()];
 
-        let selected = select_least_used_idle(&contexts).expect("one context is idle");
+        let selected = select_least_used_idle(&contexts, None).expect("one context is idle");
         assert_eq!(selected.metadata.id, idle_and_worn.metadata.id);
 
-        assert!(select_least_used_idle(&[make_context(true)]).is_none());
+        assert!(select_least_used_idle(&[make_context(true)], None).is_none());
+    }
+
+    /// A context the origin has just refused must not be the one this origin gets next: with one
+    /// exit IP pinned per context that request is refused too, and nothing else rotates a
+    /// `reusable` context for hours.
+    #[test]
+    fn skips_contexts_quarantined_for_this_origin() {
+        let blocked = make_context(false);
+        blocked
+            .metadata
+            .quarantine_origin("example.com", Duration::from_secs(300));
+        let fresh = make_context(false);
+        fresh.metadata.total_requests.store(500, Ordering::SeqCst);
+
+        let contexts = vec![blocked.clone(), fresh.clone()];
+
+        // `blocked` has the lower request count and would win on capacity alone.
+        let selected =
+            select_least_used_idle(&contexts, Some("example.com")).expect("one context is idle");
+        assert_eq!(selected.metadata.id, fresh.metadata.id);
+    }
+
+    /// The quarantine is a property of the pair (context, origin), not of the context: throwing
+    /// away a context's warm cookies for every other site it serves is what this exists to avoid.
+    #[test]
+    fn a_quarantined_context_still_serves_other_origins() {
+        let blocked = make_context(false);
+        blocked
+            .metadata
+            .quarantine_origin("example.com", Duration::from_secs(300));
+
+        let contexts = vec![blocked.clone()];
+
+        assert!(select_least_used_idle(&contexts, Some("example.com")).is_none());
+        let selected = select_least_used_idle(&contexts, Some("example.org"))
+            .expect("another origin is unaffected");
+        assert_eq!(selected.metadata.id, blocked.metadata.id);
+    }
+
+    /// An expired quarantine is simply gone — the first request after the cooldown is what decides
+    /// whether the block is really over.
+    #[test]
+    fn quarantine_expires() {
+        let context = make_context(false);
+        context
+            .metadata
+            .quarantine_origin("example.com", Duration::ZERO);
+
+        assert!(select_least_used_idle(&[context], Some("example.com")).is_some());
+    }
+
+    /// The last resort when the pool is at `max_contexts` and every idle context is quarantined:
+    /// the one that recovers soonest, rather than refusing a request over a capacity problem the
+    /// scope does not have.
+    #[test]
+    fn falls_back_to_the_soonest_recovering_context() {
+        let long = make_context(false);
+        long.metadata
+            .quarantine_origin("example.com", Duration::from_secs(600));
+        let short = make_context(false);
+        short
+            .metadata
+            .quarantine_origin("example.com", Duration::from_secs(30));
+        let busy = make_context(true);
+        busy.metadata
+            .quarantine_origin("example.com", Duration::from_secs(1));
+
+        let contexts = vec![long, short.clone(), busy];
+
+        let (selected, _) = select_soonest_unquarantined(&contexts, "example.com")
+            .expect("a quarantined idle context is available");
+        assert_eq!(
+            selected.metadata.id, short.metadata.id,
+            "a busy context is never a candidate, however soon its quarantine ends"
+        );
+
+        assert!(
+            select_soonest_unquarantined(&contexts, "example.org").is_none(),
+            "no fallback is needed for an origin nothing is quarantined for"
+        );
     }
 
     #[test]

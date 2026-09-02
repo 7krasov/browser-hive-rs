@@ -9,7 +9,7 @@ use browser_hive_proto::coordinator::{
 };
 use browser_hive_proto::worker::worker_service_client::WorkerServiceClient;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -54,9 +54,13 @@ pub struct SelectedWorker<'a> {
 /// # Returns
 /// - `Some(SelectedWorker)` with the best worker and whether fallback was used
 /// - `None` if no workers available
+/// # Parameters
+/// * `rotation` - a counter that advances once per routing decision; it selects among the workers
+///   that tie on `available_slots`. See the round-robin note in the body.
 pub fn select_best_worker<'a>(
     scope_workers: &'a [WorkerEndpoint],
     healthy_workers: &HashSet<String>,
+    rotation: u64,
 ) -> Option<SelectedWorker<'a>> {
     if scope_workers.is_empty() {
         return None;
@@ -74,13 +78,37 @@ pub fn select_best_worker<'a>(
         (healthy, false)
     };
 
-    candidates
+    let best_slots = candidates
+        .iter()
+        .map(|w| w.stats.available_slots)
+        .max()
+        .expect("candidates is non-empty: scope_workers was checked above");
+
+    // Rotate between the workers that tie on free capacity instead of always taking the same one.
+    //
+    // `max_by_key` returns the *last* maximum, and every pod of an idle scope reports the same
+    // `available_slots` — so under a client that sends one request at a time (the steady state for
+    // many scopes) one pod served all the traffic while its replicas idled. That is invisible on
+    // every dashboard: the scope looks healthy and has spare capacity. It also quietly cancels
+    // replica count as a way to spread exit IPs, since a proxy identity is per worker context.
+    //
+    // Round-robin rather than a random pick: it needs no RNG dependency, and it is exactly the
+    // sequential case that random choice serves worst (over n pods a random pick still lands on
+    // the same one 1/n of the time in a row). Candidates are ordered by pod name first, because
+    // discovery rebuilds its vector every 10 s and its order is not stable — round-robin over an
+    // unstable order is not round-robin. Selection stays a pure function of its inputs plus the
+    // caller's counter, so it remains testable.
+    let mut tied: Vec<&WorkerEndpoint> = candidates
         .into_iter()
-        .max_by_key(|w| w.stats.available_slots)
-        .map(|worker| SelectedWorker {
-            worker,
-            used_fallback,
-        })
+        .filter(|w| w.stats.available_slots == best_slots)
+        .collect();
+    tied.sort_by(|a, b| a.pod_name.cmp(&b.pod_name));
+
+    let index = (rotation % tied.len() as u64) as usize;
+    tied.get(index).map(|worker| SelectedWorker {
+        worker,
+        used_fallback,
+    })
 }
 
 /// Fetch fresh stats from a worker to verify slot availability
@@ -160,6 +188,10 @@ pub struct CoordinatorService {
     healthy_workers: Arc<RwLock<HashSet<String>>>,
     /// `None` when `COORDINATOR_ENABLE_METRICS` is off.
     metrics: Option<CoordinatorMetrics>,
+    /// Advances once per routing decision and breaks ties in [`select_best_worker`]. Shared by
+    /// every scope on purpose: it is a rotation, not a per-scope cursor, and the alternative
+    /// (a counter per scope) would need a map, a lock, and eviction to say the same thing.
+    routing_rotation: Arc<AtomicU64>,
 }
 
 impl CoordinatorService {
@@ -204,6 +236,7 @@ impl CoordinatorService {
             cancellation_token: cancellation_token.clone(),
             healthy_workers: healthy_workers.clone(),
             metrics,
+            routing_rotation: Arc::new(AtomicU64::new(0)),
         };
 
         // Start health monitoring background task
@@ -519,7 +552,8 @@ impl ScraperCoordinator for CoordinatorService {
 
             // Select best worker using routing logic
             let healthy_guard = self.healthy_workers.read().await;
-            let selected = select_best_worker(scope_workers, &healthy_guard);
+            let rotation = self.routing_rotation.fetch_add(1, Ordering::Relaxed);
+            let selected = select_best_worker(scope_workers, &healthy_guard, rotation);
             drop(healthy_guard);
 
             let selected = match selected {
@@ -893,7 +927,7 @@ mod tests {
         let workers: Vec<WorkerEndpoint> = vec![];
         let healthy = HashSet::new();
 
-        let result = select_best_worker(&workers, &healthy);
+        let result = select_best_worker(&workers, &healthy, 0);
         assert!(result.is_none());
     }
 
@@ -902,7 +936,7 @@ mod tests {
         let workers = vec![make_worker("worker-1", 5)];
         let healthy: HashSet<String> = ["worker-1".to_string()].into_iter().collect();
 
-        let result = select_best_worker(&workers, &healthy).unwrap();
+        let result = select_best_worker(&workers, &healthy, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-1");
         assert!(!result.used_fallback);
     }
@@ -919,7 +953,7 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let result = select_best_worker(&workers, &healthy).unwrap();
+        let result = select_best_worker(&workers, &healthy, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-2");
         assert_eq!(result.worker.stats.available_slots, 5);
         assert!(!result.used_fallback);
@@ -938,7 +972,7 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let result = select_best_worker(&workers, &healthy).unwrap();
+        let result = select_best_worker(&workers, &healthy, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-3");
         assert_eq!(result.worker.stats.available_slots, 5);
         assert!(!result.used_fallback);
@@ -950,7 +984,7 @@ mod tests {
         // Empty healthy set - should fall back to all workers
         let healthy: HashSet<String> = HashSet::new();
 
-        let result = select_best_worker(&workers, &healthy).unwrap();
+        let result = select_best_worker(&workers, &healthy, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-2");
         assert!(result.used_fallback);
     }
@@ -964,7 +998,7 @@ mod tests {
             .collect();
 
         // Should still select a worker (any of them)
-        let result = select_best_worker(&workers, &healthy).unwrap();
+        let result = select_best_worker(&workers, &healthy, 0).unwrap();
         assert_eq!(result.worker.stats.available_slots, 0);
         assert!(!result.used_fallback);
     }
@@ -979,24 +1013,87 @@ mod tests {
         // Only worker-1 is healthy
         let healthy: HashSet<String> = ["worker-1"].into_iter().map(String::from).collect();
 
-        let result = select_best_worker(&workers, &healthy).unwrap();
+        let result = select_best_worker(&workers, &healthy, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-1");
         assert_eq!(result.worker.stats.available_slots, 1);
         assert!(!result.used_fallback);
     }
 
+    /// Workers that tie on free capacity are used in turn. This is the steady state of a scope
+    /// driven one request at a time: every pod is idle and reports the same `available_slots`, and
+    /// before the rotation the same pod took all of the traffic while its replicas sat idle.
     #[test]
-    fn test_select_best_worker_tie_breaker() {
-        // When multiple workers have same available_slots, max_by_key returns the last one
-        let workers = vec![make_worker("worker-1", 5), make_worker("worker-2", 5)];
+    fn test_select_best_worker_rotates_between_ties() {
+        let workers = vec![
+            make_worker("worker-1", 5),
+            make_worker("worker-2", 5),
+            make_worker("worker-3", 5),
+        ];
+        let healthy: HashSet<String> = ["worker-1", "worker-2", "worker-3"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let picked: Vec<String> = (0..6)
+            .map(|rotation| {
+                select_best_worker(&workers, &healthy, rotation)
+                    .unwrap()
+                    .worker
+                    .pod_name
+                    .clone()
+            })
+            .collect();
+
+        assert_eq!(
+            picked,
+            vec!["worker-1", "worker-2", "worker-3", "worker-1", "worker-2", "worker-3"]
+        );
+    }
+
+    /// The rotation must never cost capacity: a worker with fewer free slots is not part of the
+    /// tie, however the counter happens to fall.
+    #[test]
+    fn test_rotation_never_picks_a_worker_with_fewer_slots() {
+        let workers = vec![
+            make_worker("worker-1", 5),
+            make_worker("worker-2", 1),
+            make_worker("worker-3", 5),
+        ];
+        let healthy: HashSet<String> = ["worker-1", "worker-2", "worker-3"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        for rotation in 0..6 {
+            let selected = select_best_worker(&workers, &healthy, rotation).unwrap();
+            assert_eq!(selected.worker.stats.available_slots, 5);
+            assert_ne!(selected.worker.pod_name, "worker-2");
+        }
+    }
+
+    /// Discovery rebuilds its worker vector on every round and does not promise an order, so the
+    /// rotation is taken over a stable one — otherwise the same counter would revisit the same pod.
+    #[test]
+    fn test_rotation_is_independent_of_discovery_order() {
         let healthy: HashSet<String> = ["worker-1", "worker-2"]
             .into_iter()
             .map(String::from)
             .collect();
 
-        let result = select_best_worker(&workers, &healthy).unwrap();
-        // Both have 5 slots, either is acceptable
-        assert!(result.worker.stats.available_slots == 5);
-        assert!(!result.used_fallback);
+        let one_order = vec![make_worker("worker-1", 5), make_worker("worker-2", 5)];
+        let other_order = vec![make_worker("worker-2", 5), make_worker("worker-1", 5)];
+
+        for rotation in 0..4 {
+            assert_eq!(
+                select_best_worker(&one_order, &healthy, rotation)
+                    .unwrap()
+                    .worker
+                    .pod_name,
+                select_best_worker(&other_order, &healthy, rotation)
+                    .unwrap()
+                    .worker
+                    .pod_name
+            );
+        }
     }
 }

@@ -583,12 +583,34 @@ impl WorkerService {
         &self,
         pool: &BrowserPool,
         proxy_params: &ProxyParams,
+        origin: Option<&str>,
     ) -> anyhow::Result<Option<Arc<BrowserContext>>> {
         match self.config.scope.session_mode {
             SessionMode::AlwaysNew => pool.create_always_new_context(proxy_params).await,
-            SessionMode::Reusable => pool.get_or_create_context(proxy_params).await,
+            SessionMode::Reusable => pool.get_or_create_context(proxy_params, origin).await,
             SessionMode::Dedicated => pool.create_dedicated_context(proxy_params).await,
         }
+    }
+
+    /// The key a block is remembered under: the registrable domain (eTLD+1) of the request URL.
+    ///
+    /// eTLD+1 rather than the exact host, because a block is decided by the site: an origin that
+    /// refuses `www.example.com` refuses `shop.example.com` from the same address, and the CDN
+    /// deciding it is usually shared across both. The same unit the off-domain redirect check
+    /// uses, for the same reason.
+    ///
+    /// `None` — no quarantine bookkeeping at all — when the scope has the feature off, when the
+    /// mode cannot act on it (only `reusable` chooses between contexts), or when the URL has no
+    /// registrable domain (an IP literal, a non-HTTP scheme). Erring toward `None` keeps the
+    /// mechanism from ever inventing a key it would then never match again.
+    fn quarantine_origin(&self, url: &str) -> Option<String> {
+        if self.config.scope.block_quarantine.is_zero()
+            || self.config.scope.session_mode != SessionMode::Reusable
+        {
+            return None;
+        }
+        let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+        psl::domain_str(&host).map(str::to_string)
     }
 
     /// Why no context could be acquired, in the terms of the mode the client is talking to.
@@ -632,6 +654,7 @@ impl WorkerService {
         start_time: Instant,
         ray_id: &str,
         proxy_params: &ProxyParams,
+        origin: Option<&str>,
     ) -> Result<Arc<BrowserContext>, Response<ScrapePageResponse>> {
         let mode_name = self.config.scope.session_mode.as_str();
 
@@ -643,7 +666,7 @@ impl WorkerService {
         let browser_pool_guard = self.browser_pool.read().await;
 
         match self
-            .acquire_context(&browser_pool_guard, proxy_params)
+            .acquire_context(&browser_pool_guard, proxy_params, origin)
             .await
         {
             Ok(Some(ctx)) => Ok(ctx),
@@ -694,7 +717,10 @@ impl WorkerService {
 
                     // Retry with new pool
                     let new_pool_guard = self.browser_pool.read().await;
-                    match self.acquire_context(&new_pool_guard, proxy_params).await {
+                    match self
+                        .acquire_context(&new_pool_guard, proxy_params, origin)
+                        .await
+                    {
                         Ok(Some(ctx)) => {
                             debug!("Successfully acquired context after browser pool recovery");
                             Ok(ctx)
@@ -1894,6 +1920,22 @@ impl WorkerService {
             }
         }
 
+        // A `reusable` context the origin has just refused must not be the one handed to the next
+        // request for that same origin: with one exit IP pinned per context that request is
+        // certain to be refused too, and nothing else would rotate the context for hours. The
+        // context is *not* destroyed — it is still warm for every other site it serves, and
+        // destroying it would churn the provider's address pool if the block is not about the IP.
+        if let Some(origin) = self.quarantine_origin(&req.url) {
+            if browser_hive_common::should_exit_early(status_code) {
+                let cooldown = self.config.scope.block_quarantine;
+                context.metadata.quarantine_origin(&origin, cooldown);
+                info!(
+                    "Context {} quarantined for {} after HTTP {} ({:?}); it keeps serving other origins",
+                    context.metadata.id, origin, status_code, cooldown
+                );
+            }
+        }
+
         // A blocked session is a finished session: release its slot now instead of holding it —
         // along with the exit IP the origin has just refused — until the idle timeout. The client
         // drops its session on these statuses anyway, so nothing is taken away that was still in
@@ -2060,6 +2102,11 @@ impl WorkerServiceTrait for WorkerService {
         // shared-session confusion that removing session ids from that mode got rid of.
         let browser_pool_guard = self.browser_pool.read().await;
         let is_always_new = self.config.scope.session_mode == SessionMode::AlwaysNew;
+
+        // The site this request is for, as far as blocked-context bookkeeping is concerned.
+        // `None` in every mode but `reusable` and whenever the feature is off, which is what
+        // keeps the whole mechanism inert for scopes that did not ask for it.
+        let quarantine_origin = self.quarantine_origin(&req.url);
         let should_use_existing_context =
             !req.context_id.is_empty() && self.config.scope.session_mode.returns_session_id();
 
@@ -2092,7 +2139,7 @@ impl WorkerServiceTrait for WorkerService {
             drop(browser_pool_guard); // Release read lock before context acquisition
 
             match self
-                .acquire_context_with_recovery(start_time, &ray_id, &proxy_params)
+                .acquire_context_with_recovery(start_time, &ray_id, &proxy_params, quarantine_origin.as_deref())
                 .await
             {
                 Ok(ctx) => ctx,
@@ -2145,7 +2192,7 @@ impl WorkerServiceTrait for WorkerService {
             drop(always_new_guard);
 
             match self
-                .acquire_context_with_recovery(start_time, &ray_id, &proxy_params)
+                .acquire_context_with_recovery(start_time, &ray_id, &proxy_params, quarantine_origin.as_deref())
                 .await
             {
                 Ok(fresh_context) => {

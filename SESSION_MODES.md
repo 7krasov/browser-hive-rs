@@ -121,6 +121,64 @@ For a dedicated IP pool there is no sticky TTL, so no ceiling is needed at all.
   `BrowserContextMetadata::primary_domains`, which nothing read. Reasoning below.
 - Contexts are **recycled** (replaced by a fresh context in the same slot) by the lifecycle
   monitor, so recycling never frees a slot — it only resets state.
+- **A context the origin has refused is quarantined for that origin**, see below.
+
+### Retiring a blocked context, one origin at a time
+
+`WORKER_BLOCK_QUARANTINE_SECS` (default **300 in `reusable`**, 0 elsewhere; 0 disables it) keeps a
+context out of *one origin's* selection after that origin answered it 403 or 429 — the same
+statuses `destroy_session_on_block` and the wait strategy's early exit act on
+(`EARLY_EXIT_STATUS_CODES`).
+
+The problem it solves: with a provider that pins one exit IP per context, the next request for the
+same site was handed the same refused address, and nothing else rotates a `reusable` context for
+hours (`max_lifetime` is 6 h, `max_idle_time` 5 min *of idleness*, which a busy pool never
+reaches). A block that would have lasted minutes became an outage that lasted until the pod was
+restarted.
+
+**Why a quarantine and not `destroy_session_on_block` extended to `reusable`.** A block belongs to
+the pair (exit IP, origin), not to the context. The same context is dead for one site and perfectly
+warm — cookies, storage, a completed anti-bot challenge — for every other site the pool serves, and
+a `reusable` pool routinely serves several. Destroying it throws all of that away to solve one
+origin. Worse, destroying has no natural end: if the origin is blocking on something other than the
+IP (a fingerprint, a per-domain quota), the pool would churn destroy/create indefinitely and work
+through the provider's address pool doing it. A quarantine costs nothing to hold, and the entry
+expires by itself.
+
+**The key is the registrable domain (eTLD+1)**, the same unit the off-domain redirect check uses:
+an origin that refuses `www.example.com` refuses `shop.example.com` from the same address, and the
+CDN deciding it is usually shared. A URL with no registrable domain (an IP literal, a non-HTTP
+scheme) is not quarantined at all rather than under a key that would never match again.
+
+**Where the state lives.** In `BrowserContextMetadata::blocked_origins`, a map of origin →
+expiry, so it dies with the context and needs no sweeper: expired entries are dropped on the read
+path. It is bounded (`MAX_BLOCKED_ORIGINS`, 32) because a `reusable` context can outlive thousands
+of requests across many hosts — expired entries go first, and only if all of them are live does the
+soonest-expiring one make room.
+
+**When every context is quarantined for one origin.** Selection first tries to create a *new*
+context, which is the right answer: a fresh context is a fresh exit IP, and this is the one case
+where growing the pool on something other than contention is justified. If the pool is already at
+`max_contexts`, the request is served from the quarantined context whose cooldown ends soonest, and
+one WARN line says so. Deliberately **not** a new error code: the client is answered with the
+origin's own `status_code` either way and decides what it means, and refusing the request would
+report a capacity problem the scope does not have. There is also **no retry inside the request** —
+the quarantine is recorded after the response is in hand, and it is the client's *next* attempt
+that benefits. Clients already retry; adding a hidden second page load inside one request would
+double its latency to say the same thing.
+
+**No backoff, deliberately.** Re-blocking re-stamps the deadline. An escalating cooldown would need
+failure history the pool has no other use for, and the cost of a quarantine that is too short is
+one cheap request (a block early-exits in ~40 ms) that simply re-arms it.
+
+**Not for `dedicated`.** There the context is addressed by its `session_id`, so there is nowhere to
+reroute to: a quarantine would mark a context that only its own session can reach. A blocked
+session is a finished session, which is exactly what `destroy_session_on_block` already does.
+`validate()` warns if the setting is given to any mode but `reusable`.
+
+**It needs a pool to work with.** See "Interaction with the two kinds of proxy provider" below:
+a scope whose pool never grew past one context has nothing to reroute *to*, and the quarantine
+degrades to the fallback path above.
 
 ---
 
@@ -142,6 +200,7 @@ CLAUDE.md, "Context Lifecycle Monitoring".
 | `WORKER_MIN_CONTEXTS` | **0** | `reusable` only (pre-creates contexts at startup) |
 | `WORKER_MAX_IDLE_TIME_SECS` | 300, **60 in `dedicated`** | `reusable`, `dedicated` |
 | `WORKER_DESTROY_SESSION_ON_BLOCK` | `true` in `dedicated`, `false` elsewhere | `dedicated` only |
+| `WORKER_BLOCK_QUARANTINE_SECS` | **300 in `reusable`**, 0 elsewhere (0 = off) | `reusable` only |
 | `WORKER_CONTEXT_ISOLATION` | `isolated` | all — `dedicated` requires `isolated` |
 
 Pre-initialization is an option, not a mode. `min_contexts > 0` fills the pool at startup, which
@@ -241,6 +300,17 @@ Two consequences worth stating explicitly:
    purchased addresses, two contexts share one address: their cookie jars stay isolated, but the
    per-address request rate is a multiple of what the capacity numbers suggest. Size such scopes
    with `max_contexts ≤ pool size`. The worker cannot check this — it does not know the pool size.
+3. **The pool grows on contention, so a sequential client never leaves one exit IP.**
+   `get_or_create_context` creates a context only when no idle one is available (or the one that
+   is, is quarantined for this origin). A client that sends one request at a time always finds
+   context #1 idle, so context #2 is never created and the whole scope runs on a single address
+   for the life of the pod — while every dashboard shows a healthy worker with free capacity.
+   The fix is configuration, not code: set **`WORKER_MIN_CONTEXTS = WORKER_MAX_CONTEXTS`** on any
+   `reusable` scope whose provider assigns a host per context, so the pool is pre-created at
+   startup and `find_least_busy_context` has something to spread across. `validate()` warns at
+   startup when it is not set that way. Growing the pool on IP-diversity grounds alone was
+   rejected: "how many addresses should this scope use" is a purchasing decision the worker cannot
+   infer, and `min_contexts` already states it exactly.
 
 ---
 

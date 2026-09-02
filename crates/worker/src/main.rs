@@ -142,6 +142,24 @@ fn load_config_from_env(
         session_mode == SessionMode::Dedicated,
     )?;
 
+    // Keep a `reusable` context out of one origin's rotation after that origin refused it with
+    // 403/429, instead of handing the same (refused) exit IP to the next request for that site.
+    //
+    // Like the two settings above, the default follows the mode: only `reusable` picks between
+    // contexts, so only there can a quarantine reroute anything — in `dedicated` the context is
+    // addressed by its session id (and `destroy_session_on_block` above is the right tool), and in
+    // `always_new` it dies with the request. Defaulting to non-zero elsewhere would only make
+    // validate() warn on every start. `WORKER_BLOCK_QUARANTINE_SECS=0` disables it.
+    let default_block_quarantine_secs = if session_mode == SessionMode::Reusable {
+        browser_hive_common::DEFAULT_BLOCK_QUARANTINE_SECS
+    } else {
+        0
+    };
+    let block_quarantine = Duration::from_secs(env_parsed::<u64>(
+        "WORKER_BLOCK_QUARANTINE_SECS",
+        default_block_quarantine_secs,
+    )?);
+
     // Create default binary params middleware
     // Users in production can replace this with custom implementations
     let binary_params_middlewares: Vec<
@@ -175,6 +193,7 @@ fn load_config_from_env(
         tab_init_middlewares,
         context_isolation,
         destroy_session_on_block,
+        block_quarantine,
     };
 
     Ok(WorkerConfig {
