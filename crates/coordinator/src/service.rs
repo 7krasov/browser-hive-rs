@@ -37,6 +37,16 @@ const GRPC_CLIENT_TIMEOUT: Duration = Duration::from_secs(330); // 10 seconds mo
 // Timeout for fetching fresh stats from worker (used to avoid stale cache rejections)
 const FRESH_STATS_TIMEOUT: Duration = Duration::from_secs(2);
 
+// Maximum size of a worker response the coordinator will decode.
+//
+// A scraped page is post-JavaScript `outerHTML` and can run to tens of MB, far past
+// tonic's 4 MiB default for *received* messages — past which the call fails with
+// `OutOfRange` and nothing is returned. Only the receiving side needs raising: the
+// send side defaults to unbounded, so the worker already encodes any size and the
+// coordinator already forwards it. A client of the coordinator has its own receive
+// limit (4 MiB in most gRPC implementations) and must raise it to match.
+const MAX_WORKER_RESPONSE_SIZE: usize = 70 * 1024 * 1024;
+
 /// Result of worker selection
 #[derive(Debug, Clone)]
 pub struct SelectedWorker<'a> {
@@ -660,7 +670,7 @@ impl ScraperCoordinator for CoordinatorService {
             // Connect to worker
             let mut client = match WorkerServiceClient::connect(last_worker_endpoint.clone()).await
             {
-                Ok(client) => client,
+                Ok(client) => client.max_decoding_message_size(MAX_WORKER_RESPONSE_SIZE),
                 Err(e) => {
                     request_metrics.reject(RejectReason::WorkerUnreachable);
                     return Err(Status::internal(format!(
