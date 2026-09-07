@@ -99,7 +99,8 @@ The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (imp
 |---|---|---|
 | `no_slots` | **yes** | Workers exist, every slot is taken (confirmed against fresh worker stats, so not a stale cache). **The "add replicas" signal.** |
 | `no_workers` | **yes** | The scope has no pods, or none that routing could select (all unhealthy / scaled to zero) |
-| `scope_not_found` | no | The scope is unknown to discovery — label or configuration mismatch |
+| `scope_unavailable` | no | The scope's pods exist but **none is currently routable** — a pod restart, not a capacity problem. Adding replicas does not shorten it; it clears itself within ~10-20 s. A **sustained** rate here means pods are crash-looping |
+| `scope_not_found` | no | No pod in the cluster carries this scope name — label or configuration mismatch |
 | `session_not_found` | no | Client sent an expired `session_id`, or its worker is gone |
 | `terminating` | no | The coordinator itself is shutting down |
 | `worker_unreachable` | no | Routing picked a worker but the gRPC connection failed |
@@ -108,7 +109,7 @@ Notes:
 
 - **Gauges are refreshed on every scrape** (same rule as the worker's pool gauges), so they cannot drift when discovery or the health monitor changes state. They deliberately show the **coordinator's own view** — that is what routing decides on, and a disagreement with the workers' own `available_slots` *is* the bug (a stale discovery cache).
 - **Counters are recorded by an RAII guard**, so a request whose future is dropped (client disconnect, gRPC deadline) is still counted.
-- The `scope` label of a `scope_not_found` rejection is reported as `unknown`. It is the one label value fed from client input, and an unknown scope is by definition not from the configured set — collapsing it keeps a buggy client from minting unbounded time series. The real name is in the logs (`span_scope`).
+- `scope_unavailable` keeps the real scope name: it is only reached after the name matched a scope discovery found in the cluster, so its cardinality is bounded by the deployments rather than by client input. The `scope` label of a `scope_not_found` rejection is reported as `unknown`. It is the one label value fed from client input, and an unknown scope is by definition not from the configured set — collapsing it keeps a buggy client from minting unbounded time series. The real name is in the logs (`span_scope`).
 - Every `reason` series is pre-created per discovered scope, so `rate()` over a rejection that has not happened yet returns 0 rather than no data.
 - Worker errors (selector not found, timeouts, browser errors) are **not** rejections: those requests did reach a worker and are already counted by `browser_hive_worker_requests_failed`.
 

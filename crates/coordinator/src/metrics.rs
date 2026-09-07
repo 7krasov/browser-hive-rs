@@ -49,6 +49,11 @@ pub enum RejectReason {
     /// The scope exists but has no worker pods, or none that routing could select.
     /// Usually means the deployment scaled to zero or every pod is unhealthy.
     NoWorkers,
+    /// The cluster has pods for the scope, but none of them can currently be routed to —
+    /// they are booting, terminating, or otherwise unreachable. Separated from
+    /// [`Self::ScopeNotFound`] because it is transient and from [`Self::NoSlots`] because
+    /// adding replicas does not fix it: **this is the "a scope is restarting" signal.**
+    ScopeUnavailable,
     /// Workers exist but every slot is taken (confirmed against fresh worker stats).
     /// **This is the "add replicas" signal.**
     NoSlots,
@@ -65,6 +70,7 @@ impl RejectReason {
         match self {
             Self::ScopeNotFound => "scope_not_found",
             Self::NoWorkers => "no_workers",
+            Self::ScopeUnavailable => "scope_unavailable",
             Self::NoSlots => "no_slots",
             Self::SessionNotFound => "session_not_found",
             Self::Terminating => "terminating",
@@ -73,6 +79,10 @@ impl RejectReason {
     }
 
     /// Whether the scope label must be replaced by [`UNKNOWN_SCOPE`]. See that constant.
+    ///
+    /// [`Self::ScopeUnavailable`] is deliberately **not** in this set: that rejection is only
+    /// reached after the name matched a scope discovery found in the cluster, so its cardinality
+    /// is bounded by the deployments, not by what a client typed.
     fn scope_is_untrusted(self) -> bool {
         matches!(self, Self::ScopeNotFound)
     }
@@ -81,9 +91,10 @@ impl RejectReason {
 /// All reasons, so every series exists from process start and a `rate()` over a rejection that
 /// has not happened yet returns 0 instead of no data (which alerts and stacked graphs handle
 /// very differently).
-const ALL_REJECT_REASONS: [RejectReason; 6] = [
+const ALL_REJECT_REASONS: [RejectReason; 7] = [
     RejectReason::ScopeNotFound,
     RejectReason::NoWorkers,
+    RejectReason::ScopeUnavailable,
     RejectReason::NoSlots,
     RejectReason::SessionNotFound,
     RejectReason::Terminating,

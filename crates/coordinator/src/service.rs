@@ -1,6 +1,6 @@
 use crate::local_worker_discovery::LocalWorkerDiscovery;
 use crate::metrics::{CoordinatorMetrics, RejectReason, RequestMetrics};
-use crate::worker_discovery::WorkerDiscovery;
+use crate::worker_discovery::{ScopePresence, WorkerDiscovery};
 use anyhow::Result;
 use browser_hive_common::{CoordinatorConfig, SessionId, SessionManager, WorkerEndpoint};
 use browser_hive_proto::coordinator::{
@@ -29,6 +29,14 @@ impl WorkerDiscoveryImpl {
             WorkerDiscoveryImpl::Local(discovery) => discovery.get_workers(),
         }
     }
+
+    /// Scopes that exist at all, as opposed to scopes that can currently serve a request.
+    pub fn get_known_scopes(&self) -> Arc<RwLock<HashMap<String, ScopePresence>>> {
+        match self {
+            WorkerDiscoveryImpl::Kubernetes(discovery) => discovery.get_known_scopes(),
+            WorkerDiscoveryImpl::Local(discovery) => discovery.get_known_scopes(),
+        }
+    }
 }
 
 // gRPC client timeout when calling workers
@@ -46,6 +54,47 @@ const FRESH_STATS_TIMEOUT: Duration = Duration::from_secs(2);
 // coordinator already forwards it. A client of the coordinator has its own receive
 // limit (4 MiB in most gRPC implementations) and must raise it to match.
 const MAX_WORKER_RESPONSE_SIZE: usize = 70 * 1024 * 1024;
+
+/// How to answer a request whose scope has no routable worker.
+///
+/// The scope has left (or never entered) the map discovery routes on. That happens for two
+/// unrelated reasons, and conflating them is what made a pod restart look like a client
+/// configuration error: a worker's gRPC server comes up only after its browser pool is ready, so
+/// every pod of a scope is unreachable for the length of a restart (measured: ~9 s of browser
+/// launch, plus up to the 10 s discovery interval) and the whole scope vanishes from routing.
+///
+/// [`ScopePresence`] answers the other question — does the cluster have pods labelled with this
+/// scope at all — from the pod list discovery already fetches, so:
+///
+/// - **present** → transient. `NO_WORKERS_AVAILABLE` (5001), the code a client already treats as
+///   retryable, with the pod breakdown in the message so the client can see waiting will help.
+///   Deliberately not a new error code: 5001 already means "nothing can serve this right now",
+///   and the finer distinction (capacity vs. restart) is carried by the `reason` label on
+///   `browser_hive_coordinator_requests_rejected_total`, where operators need it, rather than by
+///   an enum every client would have to learn.
+/// - **absent** → `SCOPE_NOT_FOUND` (4003) keeps meaning only what it says: no such scope exists,
+///   retrying will never help, fix the name.
+fn classify_missing_scope(
+    scope_name: &str,
+    presence: Option<ScopePresence>,
+) -> (RejectReason, i32, String) {
+    match presence {
+        Some(presence) => (
+            RejectReason::ScopeUnavailable,
+            browser_hive_proto::coordinator::ErrorCode::NoWorkersAvailable as i32,
+            format!(
+                "Scope {} is temporarily unavailable ({}); retry shortly",
+                scope_name,
+                presence.describe()
+            ),
+        ),
+        None => (
+            RejectReason::ScopeNotFound,
+            browser_hive_proto::coordinator::ErrorCode::ScopeNotFound as i32,
+            format!("Scope not found: {}", scope_name),
+        ),
+    }
+}
 
 /// Result of worker selection
 #[derive(Debug, Clone)]
@@ -521,16 +570,35 @@ impl ScraperCoordinator for CoordinatorService {
             let scope_workers = match workers.get(&req.scope_name) {
                 Some(w) => w,
                 None => {
-                    warn!("Scope not found: {}", req.scope_name);
-                    request_metrics.reject(RejectReason::ScopeNotFound);
+                    // No routable worker — which is either a wrong scope name or a scope whose
+                    // pods are all restarting. `classify_missing_scope` decides which, and why
+                    // the two must not share an error code.
+                    let presence = self
+                        .worker_discovery
+                        .get_known_scopes()
+                        .read()
+                        .await
+                        .get(&req.scope_name)
+                        .copied();
+
+                    let (reason, error_code, error_message) =
+                        classify_missing_scope(&req.scope_name, presence);
+
+                    if reason == RejectReason::ScopeUnavailable {
+                        warn!("{}", error_message);
+                    } else {
+                        warn!("Scope not found: {}", req.scope_name);
+                    }
+                    request_metrics.reject(reason);
+
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
+
                     return Ok(Response::new(ScrapePageResponse {
                         success: false,
                         status_code: 0,
                         content: String::new(),
-                        error_message: format!("Scope not found: {}", req.scope_name),
-                        error_code: browser_hive_proto::coordinator::ErrorCode::ScopeNotFound
-                            as i32,
+                        error_message,
+                        error_code,
                         response_headers: std::collections::HashMap::new(),
                         session_id: String::new(),
                         worker_id: String::new(),
@@ -1105,5 +1173,41 @@ mod tests {
                     .pod_name
             );
         }
+    }
+
+    /// The whole point of the presence map: a scope whose pods exist but cannot yet serve must
+    /// be answered with a retryable code, never with "no such scope".
+    #[test]
+    fn known_scope_with_no_reachable_pod_is_retryable() {
+        let presence = ScopePresence {
+            pods_total: 3,
+            pods_reachable: 0,
+            pods_unreachable: 3,
+            ..Default::default()
+        };
+
+        let (reason, code, message) = classify_missing_scope("scope_a", Some(presence));
+
+        assert_eq!(reason, RejectReason::ScopeUnavailable);
+        assert_eq!(
+            code,
+            browser_hive_proto::coordinator::ErrorCode::NoWorkersAvailable as i32
+        );
+        // The client cannot query K8s; the pod breakdown is how it learns waiting will help.
+        assert!(message.contains("3 pod(s), 0 reachable"), "{message}");
+        assert!(message.contains("retry shortly"), "{message}");
+    }
+
+    /// A name no pod carries stays a configuration error — retrying it never helps.
+    #[test]
+    fn unknown_scope_stays_scope_not_found() {
+        let (reason, code, message) = classify_missing_scope("typo-from-client", None);
+
+        assert_eq!(reason, RejectReason::ScopeNotFound);
+        assert_eq!(
+            code,
+            browser_hive_proto::coordinator::ErrorCode::ScopeNotFound as i32
+        );
+        assert!(message.contains("typo-from-client"), "{message}");
     }
 }

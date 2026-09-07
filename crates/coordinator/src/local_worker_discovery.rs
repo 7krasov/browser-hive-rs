@@ -1,3 +1,4 @@
+use crate::worker_discovery::ScopePresence;
 use anyhow::Result;
 use browser_hive_common::{WorkerEndpoint, WorkerStats};
 use std::collections::HashMap;
@@ -12,6 +13,9 @@ use tracing::info;
 /// Falls back to legacy single worker format: WORKER_ENDPOINT + WORKER_SCOPE_NAME
 pub struct LocalWorkerDiscovery {
     workers: Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
+    /// Mirrors `workers`, since a locally configured endpoint never leaves the map: an unknown
+    /// scope here really is a typo. Kept so the service asks both discoveries the same question.
+    known_scopes: Arc<RwLock<HashMap<String, ScopePresence>>>,
 }
 
 impl LocalWorkerDiscovery {
@@ -116,13 +120,33 @@ impl LocalWorkerDiscovery {
             workers_map.insert(worker_scope, vec![endpoint]);
         }
 
+        let known_scopes = workers_map
+            .iter()
+            .map(|(scope, endpoints)| {
+                (
+                    scope.clone(),
+                    ScopePresence {
+                        pods_total: endpoints.len(),
+                        pods_reachable: endpoints.len(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+
         Ok(Self {
             workers: Arc::new(RwLock::new(workers_map)),
+            known_scopes: Arc::new(RwLock::new(known_scopes)),
         })
     }
 
     pub fn get_workers(&self) -> Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>> {
         self.workers.clone()
+    }
+
+    /// Scopes configured for this process. Static, unlike the K8s counterpart.
+    pub fn get_known_scopes(&self) -> Arc<RwLock<HashMap<String, ScopePresence>>> {
+        self.known_scopes.clone()
     }
 
     pub async fn start_discovery(&self) {

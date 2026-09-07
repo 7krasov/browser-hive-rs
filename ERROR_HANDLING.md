@@ -64,7 +64,7 @@ These indicate issues with the request itself.
 |------|-------|-------------|--------|
 | `ERROR_CODE_INVALID_URL` | 4001 | Invalid URL format provided | ❌ No - fix URL |
 | `ERROR_CODE_SESSION_NOT_FOUND` | 4002 | Session/context ID not found or expired | ⚠️ Retry without session |
-| `ERROR_CODE_SCOPE_NOT_FOUND` | 4003 | Specified scope does not exist | ❌ No - check scope name |
+| `ERROR_CODE_SCOPE_NOT_FOUND` | 4003 | No worker pod in the cluster carries this scope name | ❌ No - check scope name |
 | `ERROR_CODE_TIMEOUT_BROWSER` | 4041 | Browser timeout during page load | ✅ Yes - increase timeout |
 | `ERROR_CODE_SELECTOR_NOT_FOUND` | 4042 | Wait selector not found within timeout | ⚠️ Maybe - check selector |
 | `ERROR_CODE_SKIP_SELECTOR_FOUND` | 4043 | Skip selector found (content should be ignored) | ❌ No - expected behavior |
@@ -76,7 +76,7 @@ These indicate issues with the worker/browser infrastructure.
 
 | Code | Value | Description | Retry? |
 |------|-------|-------------|--------|
-| `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | No workers available or all slots busy | ✅ Yes - retry after delay or scale workers |
+| `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | No workers available, all slots busy, **or the scope's pods are all restarting** | ✅ Yes - retry after delay or scale workers |
 | `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | Worker pod not reachable from coordinator | ✅ Yes - retry after delay |
 | `ERROR_CODE_BROWSER_ERROR` | 5003 | Browser process crashed or internal failure | ✅ Yes - worker auto-recovers |
 | `ERROR_CODE_NETWORK_ERROR` | 5004 | Network error during page navigation | ✅ Yes |
@@ -506,13 +506,38 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
 1. No workers are discovered for the specified scope
 2. All discovered workers have `available_slots = 0` (all busy)
 3. Health check indicates all workers are unhealthy
+4. The cluster has pods labelled with this scope, but **none of them is currently reachable** — they are booting, terminating, or otherwise not answering `GetStats`
+
+### 5001 vs 4003: "come back later" vs "fix the name"
+
+Case 4 above is the one worth understanding, because it used to be reported as `SCOPE_NOT_FOUND`.
+
+A scope enters the map the coordinator routes on only once one of its pods answers `GetStats`, and a worker's gRPC server starts only **after** its browser pool is up. So during a pod restart — a spot node reclaimed, a rollout, an OOM kill — every pod of the scope is unreachable and the whole scope disappears from routing for roughly the browser launch time (~9 s) plus up to the 10 s discovery interval. Requests arriving in that window were told the scope did not exist, which reads as a permanent client-side configuration error and stops a well-behaved client from retrying.
+
+The coordinator now separates the two questions using the pod list it already fetches:
+
+| Question | Source | Answer |
+|---|---|---|
+| Does this scope exist at all? | the `scope` **label** on pods, present from the moment the pod object is created | no → `SCOPE_NOT_FOUND` (4003) |
+| Can any of its pods serve right now? | `GetStats` succeeded | no → `NO_WORKERS_AVAILABLE` (5001) |
+
+`error_message` carries the pod breakdown so the reason is visible without cluster access:
+
+```
+Scope brightdata_dc_shared_hl_reusable_ego is temporarily unavailable
+(3 pod(s), 0 reachable (3 starting up or unreachable)); retry shortly
+```
+
+⚠️ **Client requirement**: 5001 is retryable and 4003 is not. A client that treats both as fatal loses every request during a routine pod restart; a client that retries 4003 forever hides a real typo. The distinction is only useful if the client acts on it.
+
+⚠️ **5001 now covers four distinct situations** (no pods, none healthy, no free slots, scope restarting). All four are retryable, so a client needs no further detail — but they call for different **backoff lengths**, and an operator separating them should use the `reason` label on `browser_hive_coordinator_requests_rejected_total` (`no_workers`, `no_slots`, `scope_unavailable`), not the error code. See METRICS.md.
 
 ## Client Implementation Guidelines
 
 ### Retry Strategy
 
 **Retryable errors** (with exponential backoff):
-- `ERROR_CODE_NO_WORKERS_AVAILABLE` (5001) - all workers busy or no workers for scope
+- `ERROR_CODE_NO_WORKERS_AVAILABLE` (5001) - all workers busy, no workers for scope, or the scope's pods are restarting (a pod restart takes ~10-20 s to become routable again — back off at least that long)
 - `ERROR_CODE_BROWSER_ERROR` (5003)
 - `ERROR_CODE_NETWORK_ERROR` (5004)
 - `ERROR_CODE_CONTEXT_CREATION_FAILED` (5005)
@@ -522,7 +547,7 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
 
 **Non-retryable errors**:
 - `ERROR_CODE_INVALID_URL` (4001) - fix the URL first
-- `ERROR_CODE_SCOPE_NOT_FOUND` (4003) - check scope configuration
+- `ERROR_CODE_SCOPE_NOT_FOUND` (4003) - check scope configuration; this now means no pod in the cluster carries the name, never a restart
 - `ERROR_CODE_SKIP_SELECTOR_FOUND` (4043) - expected behavior
 
 **Special handling**:
