@@ -248,10 +248,20 @@ Driven by `ContextLifecycleConfig` (`common/src/config.rs`), evaluated in
 | `max_idle_time` | the **end** of the last request on that context | 5 min (1 min in `dedicated`) |
 | `max_lifetime` | context **creation** | 6 h |
 | `max_requests` | request counter | 10 000 |
-| `max_cache_size_mb` | estimated cache size | 500 MB |
+| `max_cache_size_mb` | estimated cache size | 500 MB — ⚠️ **inert, see below** |
+
+⚠️ **`max_cache_size_mb` never fires.** `BrowserContextMetadata::cache_size_mb`
+(`common/src/types.rs`) is initialised to `0` and is written nowhere in the workspace, so the
+`cache_too_large` predicate in `should_recycle_context` is permanently false. `Hybrid` therefore
+ORs **three** live predicates (age, requests, idle), and both `max_cache_size_mb` and
+`WORKER_MAX_CACHE_SIZE_MB` are configuration that reads as working and does nothing. Nothing
+depends on cache-driven rotation today — `max_idle_time` recycles a `reusable` context long
+before its cache could matter — but do not tune it expecting an effect. The open item in TODO.md
+lists the three ways out.
 
 ⚠️ **`rotation_strategy` gates which of these are consulted at all.** Only `Hybrid` (the value both
-worker binaries hardcode) honours all four. `TimeBasedOnly` honours `max_lifetime` alone and
+worker binaries hardcode) honours all four thresholds it knows about (three of which do anything —
+see above). `TimeBasedOnly` honours `max_lifetime` alone and
 `RequestBasedOnly` honours `max_requests` alone — under either, `max_idle_time` is silently
 ignored. This is a hard error in `dedicated` and a startup warning in `reusable`; the general
 problem is the corresponding item in TODO.md.
@@ -377,10 +387,13 @@ deleted rather than left as dead code.
 
 ## Downstream migration
 
-The production repo builds its own `ScopeConfig`, so it must be updated in the same change:
+Downstream repositories that ship their own worker binary build their own `ScopeConfig` and call
+`run_worker` with it, so they must be updated in the same change. Every path
+below is in the *downstream* repo, not in this one:
 
-- `src/bin/worker.rs`: `ScopeConfig` gains `destroy_session_on_block`; `SessionMode::ReusablePreinit`
-  no longer exists; `min_contexts` no longer defaults to `max_contexts`.
+- Its worker binary (whatever it is called there — in the production repo, `src/bin/worker.rs`):
+  `ScopeConfig` gains `destroy_session_on_block`; `SessionMode::ReusablePreinit` no longer
+  exists; `min_contexts` no longer defaults to `max_contexts`.
 - Manifests in `ops/`, `ops_local/` and `docker-compose*.yml` that set `WORKER_SESSION_MODE`
   (`reusable_preinit` is now an unknown value and **fails startup**) or rely on the old
   `WORKER_MIN_CONTEXTS` default.

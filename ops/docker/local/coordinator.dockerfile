@@ -31,5 +31,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/target/release/coordinator /usr/local/bin/coordinator
 
 EXPOSE 50051
+# Prometheus metrics (COORDINATOR_METRICS_PORT, default 9090)
+EXPOSE 9090
 
 CMD ["coordinator"]

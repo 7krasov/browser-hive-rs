@@ -48,7 +48,21 @@ This allows clients to:
 
 ## ErrorCode Reference
 
-All error codes are defined in `crates/proto/proto/worker.proto`.
+Error codes live in **two** proto files, and the split matters to a client.
+
+`crates/proto/proto/worker.proto` defines the codes a worker can produce. The client-facing
+`crates/proto/proto/coordinator.proto` repeats all of them with the same numeric values and adds
+three the coordinator alone can return, because they describe failures that happen *before* any
+worker is involved:
+
+| Code | Value | Defined in |
+|------|-------|------------|
+| `ERROR_CODE_TIMEOUT_GRPC` | 1 | `coordinator.proto` only (reserved, not currently emitted) |
+| `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | `coordinator.proto` only |
+| `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | `coordinator.proto` only |
+
+A client talks to the coordinator, so it should generate from `coordinator.proto` — it is the
+superset.
 
 ### Success
 
@@ -164,6 +178,12 @@ message ScrapePageResponse {
 
 To reuse a browser session, pass `session_id` in the next request. The internal worker-to-coordinator proto (`scraper.worker.ScrapePageResponse`) differs slightly (it returns only `context_id`); the examples below show the client-facing view.
 
+**The scenario payloads below are abridged**: every response really carries all eleven fields
+above, and the examples show only the ones the scenario is about. Absent fields are at their
+protobuf defaults (`""` for strings, `0` for numbers) — in particular `ray_id` is always
+populated in a real response, and `session_id`/`worker_id` are empty strings on the paths that
+never reached a worker or that ran in a non-`dedicated` scope.
+
 ### Error Message Format
 
 Error messages follow these patterns:
@@ -173,10 +193,22 @@ Error messages follow these patterns:
 Invalid URL: <parse error details>
 ```
 
-**SESSION_NOT_FOUND**:
+**SESSION_NOT_FOUND** — three distinct messages, from two layers. Match on the
+`error_code` (4002), never on the text:
+```
+Session not found or expired
+```
+  the coordinator has no such `session_id` in its `SessionManager` (`coordinator/src/service.rs`)
+```
+Session expired or worker unavailable. Please retry without session_id
+```
+  the session existed, but the worker that owned it is gone from discovery
+  (`coordinator/src/service.rs`)
 ```
 Context not found or expired: <context_id>
 ```
+  the worker was reached and no longer has that context (`worker/src/service.rs`). A client
+  talking to the coordinator normally sees one of the first two
 
 **BROWSER_ERROR** (context busy):
 ```

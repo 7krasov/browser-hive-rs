@@ -267,6 +267,7 @@ fn create_scope_config() -> ScopeConfig {
         tab_init_middlewares,
         context_isolation: ContextIsolation::Isolated,
         destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated (set true there)
+        block_quarantine: std::time::Duration::ZERO, // Only acted on in SessionMode::Reusable
     }
 }
 ```

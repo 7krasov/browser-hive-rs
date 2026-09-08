@@ -198,10 +198,25 @@ pub trait WaitStrategy: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Network Idle strategy - waits until network is completely quiet
+/// Network Idle strategy - waits until the network is *almost* quiet, then looks for the selector
 ///
-/// This is the default strategy. It waits for the `networkIdle` lifecycle event,
-/// which fires when there have been no network requests for ~500ms.
+/// This is the default strategy. Phase 1 waits on `Tab::wait_until_navigated`, which in
+/// headless_chrome does **not** wait for page load: it blocks on a `navigating` flag that the
+/// `init` page-lifecycle event sets and the **`networkAlmostIdle`** one clears (verified in
+/// headless_chrome 1.0.18, the pinned version, and 1.0.22, the newest published one — that code
+/// is identical in both). Chromium fires `networkAlmostIdle` when **at most 2** network requests
+/// have been in flight for ~500ms: the same condition Puppeteer exposes as `networkidle2`, not
+/// `networkidle0`.
+///
+/// Two consequences worth knowing before using it as the default:
+/// - A page holding one long-poll or SSE connection open still reaches this state — which is
+///   precisely why the event is usable as a default; `networkidle0` would never arrive there.
+/// - Reaching it is therefore not proof that the content rendered. Pair it with `wait_selector`
+///   (Phase 2 below) when that proof is needed, or use [`TimeoutStrategy`].
+///
+/// The `500ms` of the quiet window and the `500ms` poll interval of Phase 2 are unrelated
+/// numbers that happen to coincide: the first belongs to Chromium, the second is `poll_interval`
+/// in [`NetworkIdleStrategy::wait`].
 ///
 /// # Behavior
 ///

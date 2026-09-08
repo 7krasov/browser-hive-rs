@@ -35,8 +35,10 @@ spec:
           name: metrics
           protocol: TCP
 
-        # CRITICAL: gRPC readiness probe that calls health_check()
-        # This ensures terminating workers are removed from Service endpoints
+        # gRPC readiness probe that calls health_check().
+        # NOTE: this removes the pod from the Service endpoints, which the coordinator does
+        # not use — it discovers pods and polls HealthCheck itself (see "Health Check
+        # Behavior"). Kept for kubectl/rollout visibility, not as a drain mechanism.
         readinessProbe:
           grpc:
             port: 50052
@@ -57,7 +59,8 @@ spec:
           timeoutSeconds: 5
           failureThreshold: 3
 
-        # Lifecycle hook for endpoint propagation delay
+        # Lifecycle hook for endpoint propagation delay (for Service consumers; the
+        # coordinator already stops routing on the first failed HealthCheck)
         lifecycle:
           preStop:
             exec:
@@ -151,6 +154,12 @@ spec:
         - containerPort: 50051
           name: grpc
           protocol: TCP
+        # Prometheus metrics. The worker PodMonitor selects app: browser-hive-worker and
+        # will not match this pod, so the coordinator needs its own scrape target on a
+        # port named `metrics`. See METRICS.md ("Coordinator Metrics").
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
 
         # gRPC readiness probe
         readinessProbe:
@@ -182,6 +191,11 @@ spec:
           value: "kubernetes"
         - name: COORDINATOR_GRPC_PORT
           value: "50051"
+        # Metrics are on by default; both shown for clarity
+        # - name: COORDINATOR_ENABLE_METRICS
+        #   value: "true"
+        # - name: COORDINATOR_METRICS_PORT
+        #   value: "9090"
         - name: RUST_LOG
           value: "info"
         # Optional: set to "true" to surface (as WARN) the connect/stats/health-check
@@ -210,6 +224,9 @@ spec:
   - port: 50051
     targetPort: 50051
     name: grpc
+  - port: 9090
+    targetPort: 9090
+    name: metrics
 ```
 
 ### Terminating pod log noise
@@ -251,7 +268,9 @@ metadata:
   name: browser-hive-coordinator
 rules:
 - apiGroups: [""]
-  resources: ["pods", "services", "endpoints"]
+  # Pods only: discovery lists pods labelled app=browser-hive-worker and connects to
+  # pod IPs directly. It never reads Services or Endpoints.
+  resources: ["pods"]
   verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -279,7 +298,9 @@ t=0s:   SIGTERM received
         → Worker cancels all operations
 
 t=2-5s: K8s removes pod from Service endpoints
-        → New requests no longer routed to this worker
+        → Cosmetic here: the coordinator routes to pod IPs, not through the Service.
+          What stops new requests is HealthCheck reporting healthy=false (t=0s),
+          picked up by the coordinator's health monitor within ~1s
 
 t=0-60s: Worker waits for active requests to complete
          → Returns TERMINATING to new requests
@@ -312,11 +333,19 @@ The Worker's `health_check()` gRPC method returns:
 - `healthy: false` when worker receives SIGTERM
 
 The Coordinator:
-1. Uses K8s Service discovery (filtered by readiness probe)
-2. Runs background health cache (polls every 1 second)
+1. Discovers **pods** directly via the K8s API (`Api<Pod>`, label `app=browser-hive-worker`,
+   every 10s) and connects to `pod_ip:50052`. It never reads Services or Endpoints, and it
+   filters on `status.phase == Running` — **not** on the `Ready` condition
+2. Runs background health cache (polls the worker's `HealthCheck` RPC every 1 second)
 3. Filters workers by health cache when selecting
 4. Falls back to all discovered workers if cache is empty
 5. Retries on healthy workers if first returns TERMINATING
+
+⚠️ **The readiness probe does not affect routing.** It removes the pod from the Service's
+endpoints, but nothing in this system routes through that Service — the coordinator holds pod
+IPs. What actually takes a worker out of routing is `HealthCheck` returning
+`healthy = false`, which `run_worker`'s SIGTERM handler sets. Keep the probe for `kubectl`
+visibility and for anything else that consumes the Service; do not rely on it to drain a pod.
 
 ## Spot Instance Configuration
 
