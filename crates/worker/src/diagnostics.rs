@@ -16,6 +16,12 @@
 //! Events are only ever appended to a bounded in-memory buffer — nothing is logged per event.
 //! One request produces at most a handful of log lines, written once at the end.
 //!
+//! Loads dropped by the scope's own blocked-URL list (`BlockedUrlsMiddleware`) are **not** signals
+//! and are filtered out of both channels that report them — `Network.loadingFailed` with
+//! `blockedReason: inspector`, and the `ERR_BLOCKED_BY_CLIENT` console entries that accompany
+//! them. They are expected, there can be dozens per page, and they would fill the entry cap with
+//! noise. Their count lives on the `scrape_page` span as `blocked_requests` instead.
+//!
 //! # Why capture is decided before navigation
 //!
 //! Listeners must exist before the page starts loading, which is exactly when the interesting
@@ -310,7 +316,7 @@ pub fn start_capture(
     url: &str,
 ) -> Option<DiagnosticsSession> {
     use headless_chrome::protocol::cdp::types::Event;
-    use headless_chrome::protocol::cdp::{Log, Runtime};
+    use headless_chrome::protocol::cdp::{Log, Network, Runtime};
 
     if !config.is_active_for(url) {
         return None;
@@ -356,6 +362,14 @@ pub fn start_capture(
                         (Some(url), None) => format!(" @ {}", url),
                         _ => String::new(),
                     };
+                    // The same self-inflicted blocks reach the console channel too, as
+                    // "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT". Filtered on the
+                    // error text because `Log` entries carry no `blockedReason`; nothing else in
+                    // this deployment produces that code — there are no extensions and no
+                    // built-in blocker.
+                    if entry.text.contains("ERR_BLOCKED_BY_CLIENT") {
+                        return;
+                    }
                     let text = format!("[{:?}] {}{}", entry.source, entry.text, location);
                     let category = match entry.source {
                         Log::LogEntrySource::Network => Category::FailedRequest,
@@ -374,6 +388,17 @@ pub fn start_capture(
                 }
 
                 Event::NetworkLoadingFailed(ev) => {
+                    // Loads we dropped ourselves via `Network.setBlockedURLs`
+                    // (`BlockedUrlsMiddleware`) are not diagnostics. They arrive with
+                    // `blockedReason: inspector`, there can be dozens per page, and they would
+                    // fill `max_entries` and push out the failures that explain a bad page. The
+                    // per-request count lives on the `scrape_page` span instead.
+                    if matches!(
+                        ev.params.blocked_reason,
+                        Some(Network::BlockedReason::Inspector)
+                    ) {
+                        return;
+                    }
                     let url = buf
                         .request_urls
                         .get(&ev.params.request_id)

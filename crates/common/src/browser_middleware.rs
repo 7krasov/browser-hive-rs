@@ -389,3 +389,148 @@ impl TabInitMiddleware for DefaultTabInitMiddleware {
         Box::new(self.clone())
     }
 }
+
+/// Blocks matching URLs from loading, on every tab of the scope.
+///
+/// Third-party analytics, ad and session-recording scripts cost a request three ways: bandwidth
+/// through the proxy, a separate CONNECT tunnel per host (which for gateway providers can draw a
+/// *different* exit IP — see `PROXY_NETWORKING.md`), and wall-clock time, since the
+/// `network_idle` strategy waits for `networkAlmostIdle` and their beacons are exactly what keeps
+/// requests in flight. Dropping them at the browser is the cheapest place to do it.
+///
+/// # This type holds no list of its own
+///
+/// The patterns are supplied by the caller. Nothing is blocked by default and no domain is named
+/// in this crate: which third parties are safe to cut is a property of the sites a deployment
+/// scrapes, not of the library. An empty list makes the middleware a no-op.
+///
+/// # Pattern syntax
+///
+/// Patterns go to CDP `Network.setBlockedURLs` **unchanged**. They are globs matched against the
+/// **whole URL**, not against a host — the domain structure means nothing to the matcher:
+///
+/// | Intent | Pattern |
+/// |---|---|
+/// | one host, no subdomains | `*://example.com/*` |
+/// | subdomains only | `*://*.example.com/*` |
+/// | both | the two patterns above |
+/// | one path on a host | `*://example.com/tracker/*` |
+/// | one file, any subdomain | `*://*.example.com/beacon.js*` |
+///
+/// Two consequences worth knowing before writing a list:
+///
+/// - A bare host (`example.com`) matches **nothing** — a URL never equals it. [`Self::new`] warns
+///   about every pattern without a `*` for that reason, since the failure is otherwise silent.
+/// - `*example.com*` is not "the domain example.com": it also matches `notexample.com` and any
+///   URL merely *containing* the string, such as `https://other.test/?ref=example.com`.
+/// - `?` is a **single-character wildcard**, not a literal. URLs are full of them, so a pattern
+///   that reaches into a query string rarely means what it looks like.
+///
+/// # What must never be blocked
+///
+/// Anti-bot and consent scripts. Blocking an analytics endpoint costs a page nothing, but a
+/// blocked challenge script (bot detection, CAPTCHA) turns a page that would have loaded into a
+/// hard block, and a blocked consent manager can leave the content gated forever. Note that these
+/// often share a host with blockable content, which is why path-level patterns exist above.
+///
+/// # Scope of the effect
+///
+/// The list is installed per tab, in the same call that every other tab-init middleware runs
+/// (initial contexts, recycled contexts, tabs recreated after a dead CDP session), so it covers
+/// every request the scope serves. `Network` is enabled here as `setBlockedURLs` acts on that
+/// domain; this adds no CDP surface, since the worker's response observer enables `Network` on
+/// every request anyway.
+///
+/// Blocked loads are counted per request and recorded on the `scrape_page` span as
+/// `blocked_requests` (worker), which is the way to confirm from production logs that a list is
+/// actually in force — a mistyped pattern otherwise looks exactly like a page with no trackers.
+#[derive(Debug, Clone)]
+pub struct BlockedUrlsMiddleware {
+    patterns: Vec<String>,
+}
+
+impl BlockedUrlsMiddleware {
+    /// Build the middleware from a list of URL patterns. See the type docs for the syntax.
+    ///
+    /// Patterns are stored and sent verbatim. A pattern containing no `*` can never match and is
+    /// reported as a warning here — at construction, i.e. during worker startup — rather than
+    /// silently blocking nothing for the life of the pod.
+    pub fn new(patterns: Vec<String>) -> Self {
+        for pattern in patterns.iter().filter(|p| !p.contains('*')) {
+            tracing::warn!(
+                "Blocked-URL pattern '{}' contains no '*' and can never match: patterns are \
+                 matched against the whole URL, so a host has to be written as '*://{}/*'",
+                pattern,
+                pattern
+            );
+        }
+        Self { patterns }
+    }
+
+    /// The patterns this middleware installs, in the order they were given.
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+}
+
+impl TabInitMiddleware for BlockedUrlsMiddleware {
+    fn apply(&self, tab: &headless_chrome::browser::tab::Tab) -> Result<()> {
+        if self.patterns.is_empty() {
+            return Ok(());
+        }
+
+        use headless_chrome::protocol::cdp::Network;
+
+        // `setBlockedURLs` acts on the Network domain, so it has to be enabled first. Enabling it
+        // again later (the response observer does, once per request) does not clear the list.
+        tab.call_method(Network::Enable {
+            max_total_buffer_size: None,
+            max_resource_buffer_size: None,
+            max_post_data_size: None,
+        })?;
+
+        tab.call_method(Network::SetBlockedURLs {
+            urls: self.patterns.clone(),
+        })?;
+
+        tracing::debug!(
+            "Installed blocked-URL list on tab: {} pattern(s)",
+            self.patterns.len()
+        );
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "blocked_urls"
+    }
+
+    fn clone_box(&self) -> Box<dyn TabInitMiddleware> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Patterns reach CDP exactly as written. This is the decision the type documents: rewriting
+    /// a bare host into `*host*` would silently widen it to "this string anywhere in the URL",
+    /// which also matches `nothost.com` and `?ref=host`. A pattern that cannot match is reported
+    /// as a warning instead, so the mistake is loud rather than corrected into a different rule.
+    #[test]
+    fn patterns_are_stored_verbatim() {
+        let given = vec![
+            "*://example.com/*".to_string(),
+            "example.com".to_string(),
+            "*://*.example.test/beacon.js*".to_string(),
+        ];
+        let middleware = BlockedUrlsMiddleware::new(given.clone());
+        assert_eq!(middleware.patterns(), given.as_slice());
+    }
+
+    #[test]
+    fn empty_list_is_accepted() {
+        assert!(BlockedUrlsMiddleware::new(Vec::new()).patterns().is_empty());
+    }
+}

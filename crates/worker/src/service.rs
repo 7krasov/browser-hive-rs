@@ -1257,10 +1257,17 @@ impl WorkerService {
         // The same listener also records proxy/tunnel failures (see `ProxyFailures`): they
         // arrive on the already-enabled domain, and a sub-resource lost to a dead tunnel is
         // otherwise invisible — the document still returns 200.
+        //
+        // It also counts the loads dropped by the scope's blocked-URL list
+        // (`BlockedUrlsMiddleware`), which arrive on the same event with `blockedReason:
+        // inspector`. A mistyped pattern blocks nothing and looks exactly like a page that
+        // carries no trackers, so without this count there is no way to tell from production
+        // whether a list is in force.
         let main_response_holder: Arc<std::sync::Mutex<Option<MainDocumentResponse>>> =
             Arc::new(std::sync::Mutex::new(None));
         let proxy_failure_holder: Arc<std::sync::Mutex<ProxyFailures>> =
             Arc::new(std::sync::Mutex::new(ProxyFailures::default()));
+        let blocked_url_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let _header_capture_guard: Option<EventListenerGuard> = {
             use headless_chrome::protocol::cdp::types::Event;
             use headless_chrome::protocol::cdp::Network;
@@ -1281,6 +1288,7 @@ impl WorkerService {
                     let main_frame_id = tab.get_target_id().clone();
                     let holder = main_response_holder.clone();
                     let proxy_holder = proxy_failure_holder.clone();
+                    let blocked_counter = blocked_url_counter.clone();
                     let listener: Arc<
                         dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync,
                     > = Arc::new(move |event: &Event| {
@@ -1290,6 +1298,14 @@ impl WorkerService {
                                     "{:?} {}",
                                     ev.params.Type, ev.params.error_text
                                 ));
+                            }
+                            // `inspector` is the reason CDP reports for a load dropped by
+                            // `Network.setBlockedURLs` — i.e. by our own list, never by the site.
+                            if matches!(
+                                ev.params.blocked_reason,
+                                Some(Network::BlockedReason::Inspector)
+                            ) {
+                                blocked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         if let Event::NetworkResponseReceived(ev) = event {
@@ -1828,6 +1844,15 @@ impl WorkerService {
             );
         }
 
+        // Loads dropped by the scope's blocked-URL list. Recorded on the span rather than logged:
+        // it is bookkeeping whose only use is confirming the list took effect, and it must not
+        // add a line to every request. Omitted when nothing was blocked, so the field's presence
+        // is itself the signal.
+        let blocked_url_count = blocked_url_counter.load(std::sync::atomic::Ordering::Relaxed);
+        if blocked_url_count > 0 {
+            tracing::Span::current().record("blocked_requests", blocked_url_count);
+        }
+
         // Build response based on navigation result and wait result.
         // Priority: navigation error > off-domain redirect > wait result.
         let (success, error_message, error_code) = if let Err(e) = navigation_result {
@@ -2014,6 +2039,7 @@ impl WorkerServiceTrait for WorkerService {
             wait_timeout_ms = tracing::field::Empty,
             context_id = tracing::field::Empty,
             proxy_host = tracing::field::Empty,
+            blocked_requests = tracing::field::Empty,
         );
         if !req.wait_selector.is_empty() {
             span.record("wait_selector", req.wait_selector.as_str());
