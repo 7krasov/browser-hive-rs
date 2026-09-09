@@ -206,7 +206,79 @@ impl TabInitMiddleware for WebGLSpoof {
 }
 ```
 
-## Example 4: Using Middleware in Production
+## Example 4: Blocking Third-Party Requests
+
+`BlockedUrlsMiddleware` ships with the base library and needs no code of your own — only a list.
+It installs the patterns on every tab via CDP `Network.setBlockedURLs`, so matching requests never
+leave the browser.
+
+```rust
+use browser_hive_common::{BlockedUrlsMiddleware, TabInitMiddleware};
+
+/// Third-party endpoints this deployment drops. Kept in code rather than in an env var so the
+/// list is reviewable, and so a change to it goes through the same review as any other change.
+const BLOCKED_URL_PATTERNS: &[&str] = &[
+    // Analytics / telemetry
+    "*://*.analytics.example.com/*",
+    "*://metrics.example.net/*",
+    // Session recording
+    "*://*.recorder.example.org/*",
+];
+
+let tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>> = vec![
+    Box::new(DefaultTabInitMiddleware::new(headless)),
+    Box::new(BlockedUrlsMiddleware::new(
+        BLOCKED_URL_PATTERNS.iter().map(|p| p.to_string()).collect(),
+    )),
+];
+```
+
+### Pattern syntax
+
+Patterns are sent to CDP **unchanged**. They are globs matched against the **whole URL** — the
+matcher knows nothing about hosts, paths or domains:
+
+| Intent | Pattern |
+|---|---|
+| one host, no subdomains | `*://example.com/*` |
+| subdomains only | `*://*.example.com/*` |
+| both | the two patterns above |
+| one path on a host | `*://example.com/tracker/*` |
+| one file, any subdomain | `*://*.example.com/beacon.js*` |
+
+Three things to know before writing a list:
+
+- A bare host (`example.com`) matches **nothing** — a URL never equals it. `BlockedUrlsMiddleware::new`
+  logs a WARN at startup for every pattern without a `*`, because the failure is otherwise silent.
+- `*example.com*` is not "the domain example.com". It also matches `notexample.com` and any URL
+  merely containing the string, such as `https://other.test/?ref=example.com`.
+- `?` is a **single-character wildcard**, not a literal — patterns that reach into a query string
+  rarely mean what they look like.
+
+### What must never be blocked
+
+⚠️ Anti-bot, CAPTCHA and consent-manager scripts. A blocked analytics endpoint costs the page
+nothing; a blocked challenge script turns a page that would have loaded into a hard block, and a
+blocked consent manager can leave the content gated forever. These frequently live on the same
+host as blockable content, which is why path-level patterns exist.
+
+Do not block CDNs that serve the page's own assets either — a page missing its bundle fails as a
+plain `SELECTOR_NOT_FOUND` that blames the site.
+
+### Confirming a list is in force
+
+A mistyped pattern blocks nothing and looks exactly like a page with no trackers. Blocked loads
+are counted per request and recorded on the worker's `scrape_page` span as `blocked_requests`
+(omitted when zero), so in Loki:
+
+```
+{app="worker-<scope>"} | json | span_blocked_requests != ""
+```
+
+They are deliberately kept **out** of browser diagnostics: dozens of self-inflicted blocks per
+page would fill `WORKER_DIAGNOSTICS_MAX_ENTRIES` and push out the failures that explain a bad page.
+
+## Example 5: Using Middleware in Production
 
 Here's how to configure middleware in your production worker binary:
 
@@ -216,7 +288,7 @@ Here's how to configure middleware in your production worker binary:
 mod middleware;
 
 use browser_hive_common::{
-    BrowserBinaryParamsMiddleware, TabInitMiddleware,
+    BlockedUrlsMiddleware, BrowserBinaryParamsMiddleware, TabInitMiddleware,
     DefaultBinaryParamsMiddleware, DefaultTabInitMiddleware,
     ContextIsolation, ScopeConfig, SessionMode,
 };
@@ -251,6 +323,11 @@ fn create_scope_config() -> ScopeConfig {
             renderer: "Intel Iris OpenGL Engine".to_string(),
             vendor: "Intel Inc.".to_string(),
         }),
+
+        // Drop third-party analytics/ad requests (see Example 4 for the list and its rules)
+        Box::new(BlockedUrlsMiddleware::new(
+            BLOCKED_URL_PATTERNS.iter().map(|p| p.to_string()).collect(),
+        )),
     ];
 
     ScopeConfig {

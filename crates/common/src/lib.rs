@@ -9,8 +9,8 @@ pub mod utils;
 pub mod wait_strategy;
 
 pub use browser_middleware::{
-    BraveBinaryParamsMiddleware, BrowserBinaryParamsMiddleware, DefaultBinaryParamsMiddleware,
-    DefaultTabInitMiddleware, TabInitMiddleware,
+    BlockedUrlsMiddleware, BraveBinaryParamsMiddleware, BrowserBinaryParamsMiddleware,
+    DefaultBinaryParamsMiddleware, DefaultTabInitMiddleware, TabInitMiddleware,
 };
 pub use config::*;
 pub use logging::init_logging;
