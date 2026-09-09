@@ -13,12 +13,17 @@ Distributed web scraping system built in Rust with intelligent session managemen
 
 ## Quick Start (Local Development)
 
+The coordinator does **not** serve gRPC reflection, so every `grpcurl` call needs the proto
+files: `-import-path ./crates/proto/proto -proto coordinator.proto`. Without them grpcurl fails
+with `Symbol not found`. `make test` wraps the same call if you would rather not type it.
+
 ```bash
 # 1. Run with Docker Compose
 docker-compose up --build
 
 # 2. Test basic scraping
 grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d '{
     "scope_name": "local_dev",
     "url": "https://example.com",
@@ -31,6 +36,7 @@ grpcurl -plaintext \
 
 # 3. Test with wait selector
 grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d '{
     "scope_name": "local_dev",
     "url": "https://example.com/dynamic-content",
@@ -95,11 +101,17 @@ ops/
 
 ## Session Management
 
-Browser Hive supports session reuse for logged-in scraping:
+Browser Hive supports session reuse for logged-in scraping — **but only in
+`WORKER_SESSION_MODE=dedicated`**. The default mode is `reusable`, an anonymous pool whose
+contexts belong to nobody: it returns an empty `session_id` and ignores one that is sent. The
+example below therefore needs the worker started with `WORKER_SESSION_MODE=dedicated`
+(`docker-compose.yml` carries that block commented out). See [SESSION_MODES.md](SESSION_MODES.md).
 
 ```bash
-# 1. First request - returns session_id
-grpcurl -plaintext -d '{
+# 1. First request - returns session_id (dedicated mode only)
+grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
+  -d '{
   "scope_name": "local_dev",
   "url": "https://example.com/login"
 }' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
@@ -107,7 +119,9 @@ grpcurl -plaintext -d '{
 # Response includes: "session_id": "worker-local:ctx-abc123"
 
 # 2. Subsequent requests - reuse session
-grpcurl -plaintext -d '{
+grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
+  -d '{
   "scope_name": "local_dev",
   "url": "https://example.com/dashboard",
   "session_id": "worker-local:ctx-abc123"
@@ -124,7 +138,15 @@ Browser Hive supports flexible wait strategies to handle dynamic content:
 
 ### Available Strategies
 
-- **`network_idle`** (default) - Wait until network is idle (no requests for ~500ms)
+- **`network_idle`** (default) - Two phases. **Phase 1** waits for Chromium's `networkAlmostIdle`
+  page-lifecycle event, which fires when **at most 2** network requests have been in flight for
+  ~500ms — the same condition Puppeteer exposes as `networkidle2`, **not** `networkidle0`.
+  **Phase 2** then polls for `wait_selector`/`skip_selector` every 500ms until one is found or the
+  budget runs out. The two 500ms values are unrelated: the first is Chromium's quiet window, the
+  second is this strategy's poll interval. Consequence of `networkidle2`: a page holding one
+  long-poll or SSE connection open still reaches idle (which is what makes the event usable as a
+  default at all), so idle alone is not proof the content rendered — pass a `wait_selector`, or use
+  `timeout`, when it must be
 - **`timeout`** - Wait for a fixed duration
 
 Waiting for a CSS selector is not a separate strategy - use the `wait_selector` request field, which works on top of any strategy (wait for idle first, then search for the selector).
@@ -135,7 +157,9 @@ Use `wait_selector` to wait for specific elements:
 
 ```bash
 # Wait for login button to appear
-grpcurl -plaintext -d '{
+grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
+  -d '{
   "scope_name": "local_dev",
   "url": "https://example.com",
   "wait_selector": "#login-button",
@@ -154,7 +178,9 @@ Use `skip_selector` to detect unwanted content (CAPTCHA, login walls, etc.):
 
 ```bash
 # Skip if CAPTCHA appears
-grpcurl -plaintext -d '{
+grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
+  -d '{
   "scope_name": "local_dev",
   "url": "https://example.com",
   "skip_selector": ".captcha-challenge"
@@ -190,7 +216,9 @@ content and skip detection must be exhaustive.
 Use `country_code` (ISO 3166-1 alpha-2, e.g. `"US"`, `"DE"`, `"UA"`) to request a proxy exit IP from a specific country:
 
 ```bash
-grpcurl -plaintext -d '{
+grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
+  -d '{
   "scope_name": "local_dev",
   "url": "https://example.com",
   "country_code": "DE"

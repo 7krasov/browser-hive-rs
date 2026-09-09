@@ -351,13 +351,16 @@ impl ScopeConfig {
         }
 
         // The general case of the gate that is a hard error for `dedicated`: under the
-        // request/time-only strategies two thresholds are read from the config and then ignored.
+        // request/time-only strategies the thresholds the strategy does not name are read from
+        // the config and then ignored.
         if self.session_mode == SessionMode::Reusable
             && !matches!(self.lifecycle.rotation_strategy, RotationStrategy::Hybrid)
         {
             warnings.push(format!(
-                "scope '{}': rotation_strategy={:?} ignores max_idle_time and max_cache_size_mb; \
-                 only Hybrid consults all four thresholds.",
+                "scope '{}': rotation_strategy={:?} consults one threshold and silently ignores \
+                 the rest of max_lifetime/max_requests/max_idle_time; only Hybrid consults all \
+                 three. (max_cache_size_mb is inert under every strategy, Hybrid included - \
+                 cache_size_mb is never measured. See TODO.md.)",
                 self.name, self.lifecycle.rotation_strategy
             ));
         }

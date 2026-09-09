@@ -44,11 +44,13 @@
 //!             session_mode: SessionMode::Reusable, // Anonymous pool (recycled by lifecycle)
 //!             headless: true,
 //!             lifecycle: Default::default(),
+//!             browser_path: None, // Auto-detect Chrome/Chromium; Some("/usr/bin/brave-browser".into()) for Brave
 //!             diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
 //!             binary_params_middlewares: vec![],
 //!             tab_init_middlewares: vec![],
 //!             context_isolation: ContextIsolation::Isolated, // Each context has isolated cookies/storage
 //!             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated (set true there)
+//!             block_quarantine: std::time::Duration::from_secs(300), // Only acted on in SessionMode::Reusable; ZERO disables
 //!         },
 //!         grpc_port: 50052,
 //!         pod_name: "worker-1".to_string(),
@@ -68,12 +70,16 @@
 //! - **Common**: Shared types, traits, and utilities
 //! - **Proto**: gRPC protocol definitions
 //!
-//! ## Features
+//! ## What this facade re-exports
 //!
-//! - `worker` (default): Include worker functionality
-//! - `coordinator` (default): Include coordinator functionality
+//! This crate is a thin facade over the workspace libraries: [`common`], [`worker`] and
+//! [`proto`]. There are no Cargo features to select between them — all three are always
+//! present, which is what a downstream worker binary needs.
 //!
-//! Use `default-features = false` to include only what you need.
+//! The **coordinator is not among them**: `crates/coordinator` is a binary-only crate
+//! (`[[bin]] name = "coordinator"`) with no library target, so it cannot be re-exported.
+//! Run it as the `coordinator` executable, or deploy the published image; there is nothing
+//! to link against.
 
 /// Re-export of common types and traits
 pub use browser_hive_common as common;

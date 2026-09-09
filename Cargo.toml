@@ -24,7 +24,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -69,9 +69,3 @@ browser-hive-common = { path = "crates/common" }
 browser-hive-worker = { path = "crates/worker" }
 browser-hive-proto = { path = "crates/proto" }
 
-[features]
-default = ["worker", "coordinator"]
-# Enable only worker functionality
-worker = []
-# Enable only coordinator functionality
-coordinator = []

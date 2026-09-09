@@ -78,8 +78,12 @@ For provider-specific features (geo-targeting via `country_code`, sticky session
 brew install grpcurl  # macOS
 # or apt-get install grpcurl (Linux)
 
+# The coordinator does not serve gRPC reflection, so every call needs the proto files.
+# Omitting them fails with "Symbol not found". `make test` wraps the same invocation.
+
 # Basic scraping request
 grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d '{
     "scope_name": "local_dev",
     "url": "https://example.com",
@@ -92,6 +96,7 @@ grpcurl -plaintext \
 
 # Wait for specific selector
 grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d '{
     "scope_name": "local_dev",
     "url": "https://example.com/dynamic-page",
@@ -103,6 +108,7 @@ grpcurl -plaintext \
 
 # Skip if CAPTCHA detected
 grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d '{
     "scope_name": "local_dev",
     "url": "https://example.com",
@@ -114,9 +120,17 @@ grpcurl -plaintext \
 
 ### Testing Session Persistence
 
+⚠️ **Requires `WORKER_SESSION_MODE=dedicated`.** The compose default is `reusable`, an anonymous
+pool whose contexts belong to nobody: it returns an empty `session_id` and ignores one that is
+sent, so the snippet below yields an empty `$session_id` and the second request simply starts
+fresh. `docker-compose.yml` carries a commented-out `Dedicated` block — uncomment it and
+`docker-compose up -d --force-recreate worker` before running this. See
+[SESSION_MODES.md](SESSION_MODES.md).
+
 ```bash
 # Step 1: Create initial session (e.g., login page)
 response=$(grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d '{
     "scope_name": "local_dev",
     "url": "https://example.com/login"
@@ -130,6 +144,7 @@ echo "Session ID: $session_id"
 
 # Step 2: Reuse session for subsequent request
 grpcurl -plaintext \
+  -import-path ./crates/proto/proto -proto coordinator.proto \
   -d "{
     \"scope_name\": \"local_dev\",
     \"url\": \"https://example.com/dashboard\",

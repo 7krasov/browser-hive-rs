@@ -113,9 +113,9 @@ order of minutes, see PROXY_NETWORKING.md).
 
 **Status**: open question, left as-is deliberately for now (raised 2026-07-29)
 
-Both worker binaries — the base `crates/worker/src/main.rs` and the downstream
-`src/bin/worker.rs` — set `ContextLifecycleConfig::rotation_strategy` to `RotationStrategy::Hybrid`
-as a literal. It is the only lifecycle field not read from the environment, and no manifest sets
+Both worker binaries — the base `crates/worker/src/main.rs` in this repo, and the custom binary
+in the downstream repo that builds its own `ScopeConfig` — set
+`ContextLifecycleConfig::rotation_strategy` to `RotationStrategy::Hybrid` as a literal. It is the only lifecycle field not read from the environment, and no manifest sets
 it. No prior note explains whether that is a decision or simply never finished, which is why this
 item exists.
 
@@ -126,10 +126,10 @@ are consulted at all*:
 |---|---|---|
 | `TimeBasedOnly` | `max_lifetime` | `max_requests`, `max_idle_time`, `max_cache_size_mb` |
 | `RequestBasedOnly` | `max_requests` | `max_lifetime`, `max_idle_time`, `max_cache_size_mb` |
-| `Hybrid` | all four, OR-ed | — |
+| `Hybrid` | `max_lifetime`, `max_requests`, `max_idle_time`, OR-ed | `max_cache_size_mb` — inert for another reason, see the next item |
 
-**Argument for leaving it hardcoded**: `Hybrid` is the only value under which the other four knobs
-mean anything. Exposing it as `WORKER_ROTATION_STRATEGY` creates a knob that can silently disable
+**Argument for leaving it hardcoded**: `Hybrid` is the only value under which the other lifecycle
+knobs mean anything. Exposing it as `WORKER_ROTATION_STRATEGY` creates a knob that can silently disable
 three other knobs — `time_based_only` would turn `WORKER_MAX_IDLE_TIME_SECS` and
 `WORKER_MAX_CACHE_SIZE_MB` into no-ops with nothing in the logs to say so. The three restrictive
 modes have no known use case; the base enum offers them, nobody asked for them.
@@ -177,8 +177,10 @@ warning.
    are already warned about — cheapest, and consistent with the existing "never inert in silence"
    rule.
 
-Whichever is chosen, the docs must change with it: the four-threshold wording in CLAUDE.md
-("all four, OR-ed") and the `rotation_strategy` table above are both wrong today.
+The **documentation half is done** (2026-09-09): CLAUDE.md, SESSION_MODES.md, the
+`rotation_strategy` table above and the warning text in `ScopeConfig::validate()`
+(`common/src/config.rs`) all now say the threshold is inert and that `Hybrid` effectively ORs
+three predicates. What is left here is the code decision — one of the three options above.
 
 ## Empty CDP BrowserContexts are never disposed
 

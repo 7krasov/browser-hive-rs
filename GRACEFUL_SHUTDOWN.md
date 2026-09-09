@@ -32,8 +32,11 @@ When a Worker receives SIGTERM:
    - There is no internal timeout: the process waits until all requests finish; the 60s limit comes from K8s `terminationGracePeriodSeconds` (SIGKILL)
 
 4. **K8s Integration**
-   - Readiness probe removes pod from Service endpoints (2-5s propagation)
-   - `preStop` hook delays 5s for endpoint propagation
+   - Readiness probe removes pod from Service endpoints (2-5s propagation). This is **not**
+     what drains the worker: the coordinator discovers pods via the K8s API and connects to
+     pod IPs, so it never consults the Service. Routing stops because `HealthCheck` returns
+     `healthy = false` from t=0s, which the coordinator's health monitor sees within ~1s
+   - `preStop` hook delays 5s for endpoint propagation (for Service consumers)
    - `terminationGracePeriodSeconds: 60`
 
 ### Coordinator Graceful Shutdown
@@ -257,8 +260,9 @@ Workers expose Prometheus metrics on port 9090 (see [METRICS.md](METRICS.md)). D
 
 ```
 t=0s:     SIGTERM → is_ready=false, cancel token
-t=0-2s:   Readiness probe starts failing
-t=2-5s:   K8s removes pod from Service endpoints
+t=0-2s:   Readiness probe starts failing; coordinator's health monitor (1s poll)
+          sees healthy=false and stops routing to this pod
+t=2-5s:   K8s removes pod from Service endpoints (cosmetic - nothing routes via Service)
 t=5s:     preStop hook completes
 t=0-60s:  Wait for active requests (check every 500ms)
 t=60s:    SIGKILL (force termination)
@@ -322,8 +326,10 @@ t=15s:    Coordinator forwards to client
 **Solutions**:
 - Check health cache logs: "No healthy workers available for retry"
 - Increase worker replicas
-- Check K8s Service endpoints
-- Verify readiness probe configuration
+- Check worker discovery logs: pods must be labelled `app=browser-hive-worker` **and**
+  `scope=<name>`, be in phase `Running`, and answer `GetStats` on `pod_ip:50052`
+- Check the workers' own `HealthCheck` responses (the readiness probe is not what routing
+  reads)
 
 ## Implementation Files
 
@@ -344,6 +350,16 @@ t=15s:    Coordinator forwards to client
 - `K8S_DEPLOYMENT.md` - Kubernetes deployment guide
 - `LOCAL_DEV.md` - Local development setup
 
+## Already Implemented
+
+- **Metrics for TERMINATING responses** —
+  `browser_hive_coordinator_requests_rejected_total{scope, reason="terminating"}`
+  (`crates/coordinator/src/metrics.rs`); worker-side failures are counted by
+  `browser_hive_worker_requests_failed`. See [METRICS.md](METRICS.md)
+- **Request correlation across the retry flow** — both services open an `info_span!` carrying
+  `ray_id`, and the coordinator re-records `worker_id` on a TERMINATING retry, so one Loki
+  query (`| json | span_ray_id="..."`) follows a request across the retry
+
 ## Future Improvements
 
 1. **Health check caching improvements**
@@ -354,13 +370,11 @@ t=15s:    Coordinator forwards to client
    - Configurable retry attempts
    - Custom retry timeout threshold
    - Circuit breaker for problematic workers
+   - A counter for retry attempts. Nothing counts them today: a TERMINATING retry is
+     invisible in the metrics unless it also ends in a rejection, and
+     `browser_hive_coordinator_request_duration_seconds` folds the retry into one observation
 
-3. **Observability**
-   - Metrics for TERMINATING responses
-   - Metrics for retry attempts
-   - Distributed tracing for retry flow
-
-4. **Testing**
+3. **Testing**
    - Integration tests for graceful shutdown
    - Chaos testing with random pod terminations
    - Load testing during rolling updates

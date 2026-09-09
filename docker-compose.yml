@@ -8,6 +8,7 @@ services:
       dockerfile: ops/docker/local/coordinator.dockerfile
     ports:
       - "50051:50051"  # gRPC endpoint
+      - "9091:9090"    # Prometheus metrics (host 9091: the worker already holds host 9090)
     environment:
       # DEBUG only for our own code; third-party crates (h2/tonic/hyper/kube) stay at warn+.
       - RUST_LOG=warn,coordinator=debug,browser_hive_common=debug
@@ -48,7 +49,9 @@ services:
       - WORKER_MIN_CONTEXTS=2           # Pre-created on startup (default 0; only used by reusable)
       - WORKER_MAX_CONTEXTS=5           # Max concurrent contexts
       - WORKER_SESSION_MODE=reusable    # Anonymous pool (default)
-      - WORKER_MAX_IDLE_TIME_SECS=1800  # 30 minutes idle timeout (contexts recycled after this)
+      # Local-dev override: the built-in default is 300 (and 60 in dedicated mode). 30 minutes
+      # keeps a warm context alive between hand-run requests; production should not copy it.
+      - WORKER_MAX_IDLE_TIME_SECS=1800
 
       # Alternative: AlwaysNew (one-shot scraping, no session reuse)
       # - WORKER_SESSION_MODE=always_new

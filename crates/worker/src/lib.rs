@@ -50,7 +50,10 @@ pub const LIBRARY_VERSION_BANNER: &str =
 ///
 /// ```rust,ignore
 /// use browser_hive_worker::run_worker;
-/// use browser_hive_common::{WorkerConfig, ScopeConfig, ContextLifecycleConfig, SessionMode, ProxyProvider};
+/// use browser_hive_common::{
+///     ContextIsolation, ContextLifecycleConfig, DiagnosticsConfig, ProxyProvider, ScopeConfig,
+///     SessionMode, WorkerConfig,
+/// };
 ///
 /// #[tokio::main]
 /// async fn main() -> anyhow::Result<()> {
@@ -65,11 +68,13 @@ pub const LIBRARY_VERSION_BANNER: &str =
 ///             session_mode: SessionMode::Reusable,
 ///             headless: true,
 ///             lifecycle: ContextLifecycleConfig::default(),
+///             browser_path: None, // Auto-detect Chrome/Chromium; Some("/usr/bin/brave-browser".into()) for Brave
 ///             diagnostics: DiagnosticsConfig::from_env(), // Or ::default() to disable
 ///             binary_params_middlewares: vec![],
 ///             tab_init_middlewares: vec![],
 ///             context_isolation: ContextIsolation::Isolated,
 ///             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated (set true there)
+///             block_quarantine: std::time::Duration::from_secs(300), // Only acted on in SessionMode::Reusable; ZERO disables
 ///         },
 ///         grpc_port: 50052,
 ///         pod_name: "worker-1".to_string(),
