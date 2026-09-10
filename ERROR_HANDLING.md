@@ -51,8 +51,8 @@ This allows clients to:
 Error codes live in **two** proto files, and the split matters to a client.
 
 `crates/proto/proto/worker.proto` defines the codes a worker can produce. The client-facing
-`crates/proto/proto/coordinator.proto` repeats all of them with the same numeric values and adds
-three the coordinator alone can return, because they describe failures that happen *before* any
+`crates/proto/proto/coordinator.proto` repeats most of them with the same numeric values and adds
+the ones the coordinator alone can return, because they describe failures that happen *before* any
 worker is involved:
 
 | Code | Value | Defined in |
@@ -60,9 +60,65 @@ worker is involved:
 | `ERROR_CODE_TIMEOUT_GRPC` | 1 | `coordinator.proto` only (reserved, not currently emitted) |
 | `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | `coordinator.proto` only |
 | `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | `coordinator.proto` only |
+| `ERROR_CODE_CAPACITY_EXHAUSTED` | 5008 | `worker.proto` only — **never reaches a client** |
 
-A client talks to the coordinator, so it should generate from `coordinator.proto` — it is the
-superset.
+A client talks to the coordinator, so it should generate from `coordinator.proto`.
+
+### Capacity is not a malfunction: 5008 → 5001
+
+`ERROR_CODE_CAPACITY_EXHAUSTED` (5008) is the one code that travels only on the internal hop. A
+worker returns it when every slot is taken, i.e. when `acquire_context` found nothing to hand out —
+**no context was even attempted**. It exists because that answer used to be
+`ERROR_CODE_CONTEXT_CREATION_FAILED` (5005), which says the opposite: that creating a context was
+tried and the browser refused. Three things were wrong with sharing one code:
+
+- **The worker's failure metric lied.** `browser_hive_worker_requests_failed` counts the whole 5xxx
+  range, so a scope that was merely busy looked like a scope that was breaking — and `success_rate`
+  in `GetStats` sank with it. 5008 is explicitly exempt (`counts_as_failure` in
+  `worker/src/service.rs`).
+- **The autoscaling signal was missing.** `requests_rejected_total{reason="no_slots"}` only counted
+  refusals the *coordinator* decided. A refusal the worker discovered — which is real demand that
+  got nothing — was recorded nowhere at all.
+- **The client could not act.** The same situation arrived as 5001 when the coordinator saw it and
+  5005 when the worker did.
+
+The coordinator now either retries it on another pod (see below) or maps it to
+`ERROR_CODE_NO_WORKERS_AVAILABLE` (5001) and counts `reason="no_slots"`. The worker's own wording is
+kept in `error_message`, because it names the limit that has to change (`max_contexts`, and in
+`dedicated` the idle timeout).
+
+Why a client-facing code was *not* added: 5001 already means "the fleet has no room for this
+request right now", and a client that handles 5001 needs no second code for the same decision. The
+extra detail an operator needs is in the `reason` label, not in the enum.
+
+### Retrying on another worker
+
+Two worker answers are worth re-sending to a different pod, and only two (`classify_retry` in
+`coordinator/src/service.rs`):
+
+| Answer | Max attempts | Why |
+|---|---|---|
+| `ERROR_CODE_TERMINATING` (5006) | 3 | a rolling restart can hit several pods of a scope in turn |
+| `ERROR_CODE_CAPACITY_EXHAUSTED` (5008) | 2 (one retry) | covers the few seconds of staleness in the coordinator's slot cache, where another pod really does have room |
+
+Capacity deliberately gets **fewer** attempts. A 5008 answer means the scope is at its limit, and
+that is the worst moment to multiply RPCs across it — three attempts per client would turn a
+saturated scope into a self-amplifying load generator.
+
+A request carrying a `session_id` is **never** retried for capacity: the session lives in one
+context on one pod, so "somewhere else" is a different session. (TERMINATING is the exception — that
+pod is going away and the session with it.)
+
+Every retry increments `browser_hive_coordinator_requests_retried_total{scope, reason}`. Without it
+a successful retry is invisible: the client got a normal response, nothing was rejected, and the
+first worker's refusal is not a failure either — so a scope that only stays healthy because half
+its requests are retried would look comfortable. Watch it next to
+`requests_rejected_total{reason="no_slots"}`: retries rising is the early warning, rejections are
+the same problem arriving too late.
+
+Common errors are not retried on another worker (a dead browser, a missing selector, a 403): every
+pod in the scope would answer them the same way, so a retry only spends the client's deadline. Those
+are the client's own retries to make, on its own schedule.
 
 ### Success
 
@@ -79,6 +135,7 @@ These indicate issues with the request itself.
 | `ERROR_CODE_INVALID_URL` | 4001 | Invalid URL format provided | ❌ No - fix URL |
 | `ERROR_CODE_SESSION_NOT_FOUND` | 4002 | Session/context ID not found or expired | ⚠️ Retry without session |
 | `ERROR_CODE_SCOPE_NOT_FOUND` | 4003 | No worker pod in the cluster carries this scope name | ❌ No - check scope name |
+| `ERROR_CODE_SESSION_BUSY` | 4004 | The session's own context is still serving a previous request (`dedicated` only) | ⚠️ Retry the **same** session after a short pause |
 | `ERROR_CODE_TIMEOUT_BROWSER` | 4041 | Browser timeout during page load | ✅ Yes - increase timeout |
 | `ERROR_CODE_SELECTOR_NOT_FOUND` | 4042 | Wait selector not found within timeout | ⚠️ Maybe - check selector |
 | `ERROR_CODE_SKIP_SELECTOR_FOUND` | 4043 | Skip selector found (content should be ignored) | ❌ No - expected behavior |
@@ -90,13 +147,14 @@ These indicate issues with the worker/browser infrastructure.
 
 | Code | Value | Description | Retry? |
 |------|-------|-------------|--------|
-| `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | No workers available, all slots busy, **or the scope's pods are all restarting** | ✅ Yes - retry after delay or scale workers |
-| `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | Worker pod not reachable from coordinator | ✅ Yes - retry after delay |
+| `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | No workers available, all slots busy (as the coordinator saw it, or as the chosen worker reported via 5008), **or the scope's pods are all restarting** | ✅ Yes - retry after delay or scale workers |
+| `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | Routing picked a worker, but the coordinator could not connect to it, or the RPC broke mid-request (the pod died). Returned in the response body, with `worker_id` naming the pod | ✅ Yes - retry after delay |
 | `ERROR_CODE_BROWSER_ERROR` | 5003 | Browser process crashed or internal failure | ✅ Yes - worker auto-recovers |
 | `ERROR_CODE_NETWORK_ERROR` | 5004 | Network error during page navigation | ✅ Yes |
-| `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | Failed to create browser context | ✅ Yes |
+| `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | CDP refused to create a browser context — a **real malfunction**, not a full pool (that is 5008, mapped to 5001) | ✅ Yes |
 | `ERROR_CODE_TERMINATING` | 5006 | Worker/Coordinator is shutting down gracefully | ✅ Yes - retry immediately or route to another instance |
 | `ERROR_CODE_PROXY_ERROR` | 5007 | The proxy path failed: a refused/failed `CONNECT`, an unreachable proxy, or a proxy auth problem. Says nothing about the target site | ✅ Yes - a retry draws a different exit IP |
+| `ERROR_CODE_CAPACITY_EXHAUSTED` | 5008 | Every slot of the chosen worker was taken. **Internal only** — the coordinator retries it on another pod or maps it to 5001; a client never sees it | — |
 
 #### HTTP 403 and 429 are reported through `status_code`, not an error code
 
@@ -210,7 +268,7 @@ Context not found or expired: <context_id>
   the worker was reached and no longer has that context (`worker/src/service.rs`). A client
   talking to the coordinator normally sees one of the first two
 
-**BROWSER_ERROR** (context busy):
+**SESSION_BUSY**:
 ```
 Context <id> is already busy (created: <timestamp>, last_used: <timestamp>,
 total_requests: <count>, cache_size_mb: <size>) (after <ms>ms)
@@ -224,6 +282,15 @@ Failed to create tab for context <id> (domain: <domain>): <error> (after <ms>ms)
 **CONTEXT_CREATION_FAILED**:
 ```
 Failed to create new browser context: <error> (after <ms>ms)
+Failed to create context after pool recreation: <error>
+```
+
+**CAPACITY_EXHAUSTED** (internal; reaches the client as 5001 prefixed with the scope name). The
+wording follows the session mode, because what has to change differs:
+```
+No available contexts - all <N> contexts are busy                        (reusable)
+No available slots - max contexts limit (<N>) reached                    (always_new)
+No available session slots - all <N> contexts are claimed by sessions …  (dedicated)
 ```
 
 **NETWORK_ERROR**:
@@ -449,9 +516,10 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
 
 ---
 
-### Scenario 7: Context Busy
+### Scenario 7: Session Busy
 
-**Request**: Two concurrent requests to same session.
+**Request**: Two concurrent requests on the same `session_id` (`dedicated` scopes only — no other
+mode addresses a context by id, so no other mode can produce this).
 
 **Response** (second request):
 ```json
@@ -460,13 +528,21 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
   "status_code": 0,
   "content": "",
   "error_message": "Context ctx-123 is already busy (created: 2024-01-15T10:00:00Z, last_used: 2024-01-15T10:05:30Z, total_requests: 42, cache_size_mb: 128) (after 2ms)",
-  "error_code": 5003,
+  "error_code": 4004,
   "execution_time_ms": 2,
   "context_id": "ctx-123"
 }
 ```
 
-**Client Action**: Wait and retry, or use a different session.
+**Client Action**: pause briefly and retry **the same** `session_id`. After 2–3 failures, drop the
+session id and start a new session: the previous request may have hung and will hold the context
+until the idle timeout.
+
+**Why 4xxx.** This used to be `ERROR_CODE_BROWSER_ERROR` (5003), which blamed the browser, counted
+the request as a worker failure and pointed an operator at logs holding nothing. Nothing is broken:
+the context is busy with *this client's own* previous request. It is also not a capacity problem —
+adding replicas cannot help, and the coordinator must **not** retry it on another pod, because the
+session exists only in that context on that pod.
 
 ---
 
@@ -539,6 +615,7 @@ INFO Successfully recreated tab after dead session for context ctx-123 (cdp_cont
 2. All discovered workers have `available_slots = 0` (all busy)
 3. Health check indicates all workers are unhealthy
 4. The cluster has pods labelled with this scope, but **none of them is currently reachable** — they are booting, terminating, or otherwise not answering `GetStats`
+5. A worker was sent the request and answered `CAPACITY_EXHAUSTED` (5008) — its last free slot was taken in the few seconds between the coordinator's stats and the request arriving, and no other pod had room either. The `error_message` then carries the worker's own wording, e.g. `No available slots in scope my_scope: No available contexts - all 3 contexts are busy`
 
 ### 5001 vs 4003: "come back later" vs "fix the name"
 
@@ -562,29 +639,46 @@ Scope brightdata_dc_shared_hl_reusable_ego is temporarily unavailable
 
 ⚠️ **Client requirement**: 5001 is retryable and 4003 is not. A client that treats both as fatal loses every request during a routine pod restart; a client that retries 4003 forever hides a real typo. The distinction is only useful if the client acts on it.
 
-⚠️ **5001 now covers four distinct situations** (no pods, none healthy, no free slots, scope restarting). All four are retryable, so a client needs no further detail — but they call for different **backoff lengths**, and an operator separating them should use the `reason` label on `browser_hive_coordinator_requests_rejected_total` (`no_workers`, `no_slots`, `scope_unavailable`), not the error code. See METRICS.md.
+⚠️ **5001 covers five distinct situations** (no pods, none healthy, no free slots as seen by the coordinator, **a worker that ran out of slots between the check and the request** — see the 5008 mapping above — and a scope whose pods are restarting). All five are retryable, so a client needs no further detail — but they call for different **backoff lengths**, and an operator separating them should use the `reason` label on `browser_hive_coordinator_requests_rejected_total` (`no_workers`, `no_slots`, `scope_unavailable`), not the error code. See METRICS.md.
 
 ## Client Implementation Guidelines
 
 ### Retry Strategy
 
-**Retryable errors** (with exponential backoff):
-- `ERROR_CODE_NO_WORKERS_AVAILABLE` (5001) - all workers busy, no workers for scope, or the scope's pods are restarting (a pod restart takes ~10-20 s to become routable again — back off at least that long)
-- `ERROR_CODE_BROWSER_ERROR` (5003)
-- `ERROR_CODE_NETWORK_ERROR` (5004)
-- `ERROR_CODE_CONTEXT_CREATION_FAILED` (5005)
-- `ERROR_CODE_TERMINATING` (5006) - retry immediately, service is shutting down gracefully
-- `ERROR_CODE_PROXY_ERROR` (5007) - retry draws a different exit IP; no backoff needed for the first attempt, but back off if it repeats, since a whole zone can be blocked
-- `ERROR_CODE_TIMEOUT_BROWSER` (4041) - but consider increasing timeout first
+The whole decision in one rule: **every 5xxx code is retryable, no exceptions; in the 4xxx range
+only three are, and each in its own way.** The invariant is worth relying on — it is what the 5008
+split above exists to restore.
 
-**Non-retryable errors**:
-- `ERROR_CODE_INVALID_URL` (4001) - fix the URL first
-- `ERROR_CODE_SCOPE_NOT_FOUND` (4003) - check scope configuration; this now means no pod in the cluster carries the name, never a restart
-- `ERROR_CODE_SKIP_SELECTOR_FOUND` (4043) - expected behavior
+**5xxx — retry all of them** (with exponential backoff unless noted):
 
-**Special handling**:
-- `ERROR_CODE_SESSION_NOT_FOUND` (4002) - retry without `session_id` to start new session
-- `ERROR_CODE_SELECTOR_NOT_FOUND` (4042) - check selector validity, content may still be useful
+| Code | Backoff | Notes |
+|---|---|---|
+| `NO_WORKERS_AVAILABLE` (5001) | **≥ 10–20 s** | no pods / none healthy / no free slots / the scope's pods are restarting. A pod needs ~9 s of browser launch plus up to the 10 s discovery interval to become routable |
+| `WORKER_UNREACHABLE` (5002) | short | the next attempt routes to a different pod by itself |
+| `BROWSER_ERROR` (5003) | short (1–2 s) | the worker recreates its pool on its own |
+| `NETWORK_ERROR` (5004) | short | `content` holds the Chrome error page, which names the cause |
+| `CONTEXT_CREATION_FAILED` (5005) | short | a real CDP refusal; if it repeats on one scope, look at the worker logs |
+| `TERMINATING` (5006) | **none, retry at once** | the coordinator already tried up to 3 pods; reaching the client means < 10 s of the deadline was left |
+| `PROXY_ERROR` (5007) | none on the first retry, then back off | a retry draws a different exit IP; repeated failures mean a whole provider zone is down |
+
+**4xxx — retryable only here**:
+
+| Code | What to do |
+|---|---|
+| `SESSION_NOT_FOUND` (4002) | retry **without** `session_id`; store the new one from the response |
+| `SESSION_BUSY` (4004) | retry **with the same** `session_id` after 0.5–2 s; after 2–3 failures drop the session and start a new one |
+| `TIMEOUT_BROWSER` (4041) | retry is possible, but review `wait_timeout_ms` first — the same budget will time out again |
+
+**4xxx — never retry**: `INVALID_URL` (4001), `SCOPE_NOT_FOUND` (4003 — no pod in the cluster
+carries that name; a restart is 5001 instead), `SELECTOR_NOT_FOUND` (4042 — check the selector, and
+note `content` is still there), `SKIP_SELECTOR_FOUND` (4043 — this is the check working),
+`REDIRECT_TO_ANOTHER_DOMAIN` (4050).
+
+**HTTP 403 / 429** arrive as `success = true`, `error_code = 0` and the origin's `status_code`. The
+system sees no error, so the decision is the client's: a retry is reasonable (it gets a different
+context, and in `reusable` the one that was blocked is already quarantined for that origin), but back
+off. ⚠️ `success` does **not** mean "this is content" — key on `status_code`, or a block page gets
+stored as data.
 
 ### Session Management
 
@@ -606,14 +700,28 @@ Always check the `content` field even when `success: false`.
 
 Browser Hive only uses gRPC error statuses for true infrastructure failures:
 
-| gRPC Status | When Used | Example |
-|-------------|-----------|---------|
-| `OK (0)` | Always, when response can be returned | All operational errors |
-| `UNAVAILABLE (14)` | Coordinator/worker unreachable | Network partition |
-| `DEADLINE_EXCEEDED (4)` | gRPC timeout (not browser timeout) | Request timeout |
-| `INTERNAL (13)` | Should never happen | Report as bug |
+| gRPC Status | When Used | Retry? |
+|-------------|-----------|--------|
+| `OK (0)` | Always, when a response can be returned — every operational error, including an unreachable worker | see the code |
+| `UNAVAILABLE (14)` | The **coordinator** is unreachable (network partition, no coordinator pod) | ✅ with backoff |
+| `DEADLINE_EXCEEDED (4)` | gRPC deadline, not a browser timeout | ⚠️ carefully — the page may have been loading |
+| `INVALID_ARGUMENT (3)` | The request itself is rejected: unknown `wait_strategy`, `wait_timeout_ms` over the maximum (`worker/src/service.rs`) | ❌ fix the request |
+| `INTERNAL (13)` | Should never happen | Report as a bug |
 
-**Important**: If you see `INTERNAL` status in production, this is a bug. Browser Hive should always return `OK` with appropriate `ErrorCode`.
+**Important**: If you see `INTERNAL` in production, this is a bug. Browser Hive returns `OK` with an
+`ErrorCode` whenever it can answer at all.
+
+⚠️ **A worker the coordinator cannot reach is *not* a gRPC error.** Both paths — the connection
+could not be established, and the RPC broke mid-request because the pod died — return `OK` with
+`ERROR_CODE_WORKER_UNREACHABLE` (5002), a `worker_id` naming the pod, plus `ray_id` and
+`execution_time_ms` like every other response. They used to return `Status::internal`, which broke
+this document's own principle: the client had to parse free text and lost the tracing id with it.
+The mid-request case also recorded no rejection metric at all, so a pod dying under load looked like
+a batch of ordinary completed requests. Both now count
+`requests_rejected_total{reason="worker_unreachable"}`.
+
+`INVALID_ARGUMENT` is the one status deliberately passed through from the worker: it is a defect in
+the call, and dressing it up as an infrastructure problem would have clients retrying it forever.
 
 ## Debugging
 

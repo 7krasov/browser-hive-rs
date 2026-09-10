@@ -1,5 +1,5 @@
 use crate::local_worker_discovery::LocalWorkerDiscovery;
-use crate::metrics::{CoordinatorMetrics, RejectReason, RequestMetrics};
+use crate::metrics::{CoordinatorMetrics, RejectReason, RequestMetrics, RetryReason};
 use crate::worker_discovery::{ScopePresence, WorkerDiscovery};
 use anyhow::Result;
 use browser_hive_common::{CoordinatorConfig, SessionId, SessionManager, WorkerEndpoint};
@@ -74,6 +74,52 @@ const MAX_WORKER_RESPONSE_SIZE: usize = 70 * 1024 * 1024;
 ///   an enum every client would have to learn.
 /// - **absent** → `SCOPE_NOT_FOUND` (4003) keeps meaning only what it says: no such scope exists,
 ///   retrying will never help, fix the name.
+/// A rolling restart can put several pods of a scope into TERMINATING at once, so that case is
+/// worth walking down the list.
+const MAX_TERMINATING_ATTEMPTS: u32 = 3;
+
+/// Capacity gets **one** extra attempt, deliberately fewer than TERMINATING. A
+/// `CAPACITY_EXHAUSTED` answer means the scope is at its limit, and that is the worst moment to
+/// multiply RPCs across it: three attempts per client would turn a saturated scope into a
+/// self-amplifying load generator. One retry covers what this is actually for — the few seconds of
+/// staleness in the coordinator's slot cache, where a *different* pod really does have room.
+const MAX_CAPACITY_ATTEMPTS: u32 = 2;
+
+/// How a worker answer that another pod could still serve should be retried.
+pub(crate) struct RetryPlan {
+    reason: RetryReason,
+    max_attempts: u32,
+    code_name: &'static str,
+}
+
+/// Decide whether a worker's answer is worth re-sending to a different pod.
+///
+/// Only two answers are: the worker is shutting down, and the worker had no free slot. Everything
+/// else — success, a dead browser, a selector that is not there, a 403 — would be answered the
+/// same way anywhere in the scope, so retrying it only spends the client's deadline.
+///
+/// `no_session` is what keeps capacity retries honest: a session lives in one context on one pod,
+/// so "somewhere else" is a different session. In practice a session request cannot produce
+/// `CAPACITY_EXHAUSTED` at all (it is answered with `SESSION_NOT_FOUND` or `SESSION_BUSY`), and
+/// this guard keeps that true if the worker's lookup ever changes.
+fn classify_retry(error_code: i32, no_session: bool) -> Option<RetryPlan> {
+    if error_code == browser_hive_proto::coordinator::ErrorCode::Terminating as i32 {
+        return Some(RetryPlan {
+            reason: RetryReason::Terminating,
+            max_attempts: MAX_TERMINATING_ATTEMPTS,
+            code_name: "TERMINATING",
+        });
+    }
+    if error_code == browser_hive_proto::worker::ErrorCode::CapacityExhausted as i32 && no_session {
+        return Some(RetryPlan {
+            reason: RetryReason::NoSlots,
+            max_attempts: MAX_CAPACITY_ATTEMPTS,
+            code_name: "CAPACITY_EXHAUSTED",
+        });
+    }
+    None
+}
+
 fn classify_missing_scope(
     scope_name: &str,
     presence: Option<ScopePresence>,
@@ -724,15 +770,14 @@ impl ScraperCoordinator for CoordinatorService {
         // Calculate request deadline
         let request_deadline = start_time + Duration::from_secs(req.timeout_seconds as u64);
         let min_retry_time_remaining = Duration::from_secs(10);
-        const MAX_RETRY_ATTEMPTS: u32 = 3;
 
         let mut excluded_workers = HashSet::new();
         let mut attempt = 0;
         let mut last_worker_id = worker_id.clone();
         let mut last_worker_endpoint = worker_endpoint.clone();
 
-        // Retry loop for TERMINATING errors
-        let worker_response = loop {
+        // Retry loop for worker answers that another pod could still serve (see `retry_plan`)
+        let mut worker_response = loop {
             attempt += 1;
 
             // Connect to worker
@@ -740,11 +785,31 @@ impl ScraperCoordinator for CoordinatorService {
             {
                 Ok(client) => client.max_decoding_message_size(MAX_WORKER_RESPONSE_SIZE),
                 Err(e) => {
+                    // Unreachable worker is an operational error, not an infrastructure one from
+                    // the client's point of view: the coordinator answered, so the answer must be
+                    // a parseable response carrying `ray_id` and `execution_time_ms` like every
+                    // other error. Returning `Status::internal` here (as this did) forced clients
+                    // to read a free-text gRPC message and lost the tracing id with it.
+                    warn!("Failed to connect to worker {}: {}", last_worker_id, e);
                     request_metrics.reject(RejectReason::WorkerUnreachable);
-                    return Err(Status::internal(format!(
-                        "Failed to connect to worker: {}",
-                        e
-                    )));
+                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                    return Ok(Response::new(ScrapePageResponse {
+                        success: false,
+                        status_code: 0,
+                        content: String::new(),
+                        error_message: format!(
+                            "Failed to connect to worker {}: {}",
+                            last_worker_id, e
+                        ),
+                        error_code: browser_hive_proto::coordinator::ErrorCode::WorkerUnreachable
+                            as i32,
+                        response_headers: std::collections::HashMap::new(),
+                        session_id: String::new(),
+                        worker_id: last_worker_id.clone(),
+                        context_id: String::new(),
+                        execution_time_ms,
+                        ray_id: ray_id.clone(),
+                    }));
                 }
             };
 
@@ -790,24 +855,53 @@ impl ScraperCoordinator for CoordinatorService {
 
             let response = match client.scrape_page(request).await {
                 Ok(resp) => resp,
-                Err(e) => return Err(e),
+                // The RPC itself failed: the worker died mid-request, or the connection broke.
+                // `InvalidArgument` is the exception — it is the worker rejecting the *request*
+                // (an unknown `wait_strategy`, a `wait_timeout_ms` over the maximum), which is a
+                // defect in the call and must reach the client as such instead of being dressed
+                // up as an infrastructure problem it could retry forever.
+                Err(e) if e.code() == tonic::Code::InvalidArgument => return Err(e),
+                Err(e) => {
+                    warn!("Worker {} RPC failed: {}", last_worker_id, e);
+                    request_metrics.reject(RejectReason::WorkerUnreachable);
+                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                    return Ok(Response::new(ScrapePageResponse {
+                        success: false,
+                        status_code: 0,
+                        content: String::new(),
+                        error_message: format!(
+                            "Worker {} became unreachable during the request: {}",
+                            last_worker_id, e
+                        ),
+                        error_code: browser_hive_proto::coordinator::ErrorCode::WorkerUnreachable
+                            as i32,
+                        response_headers: std::collections::HashMap::new(),
+                        session_id: String::new(),
+                        worker_id: last_worker_id.clone(),
+                        context_id: String::new(),
+                        execution_time_ms,
+                        ray_id: ray_id.clone(),
+                    }));
+                }
             };
 
             let worker_resp = response.into_inner();
 
-            // Check if worker returned TERMINATING error
-            let is_terminating = worker_resp.error_code
-                == browser_hive_proto::coordinator::ErrorCode::Terminating as i32;
-
-            if !is_terminating {
-                // Success or non-retryable error - return response
+            // Is this an answer another pod could still serve?
+            let Some(plan) = classify_retry(worker_resp.error_code, req.session_id.is_empty())
+            else {
+                // Success, or an error no other worker would answer differently
                 break worker_resp;
-            }
+            };
+            let RetryPlan {
+                reason: retry_reason,
+                max_attempts,
+                code_name,
+            } = plan;
 
-            // Worker is terminating - check if we should retry
             warn!(
-                "Worker {} returned TERMINATING (attempt {})",
-                last_worker_id, attempt
+                "Worker {} returned {} (attempt {})",
+                last_worker_id, code_name, attempt
             );
 
             excluded_workers.insert(last_worker_id.clone());
@@ -817,14 +911,17 @@ impl ScraperCoordinator for CoordinatorService {
             let remaining_time = request_deadline.saturating_duration_since(now);
 
             if remaining_time < min_retry_time_remaining {
-                warn!("Not enough time remaining for retry ({:?} < {:?}), returning TERMINATING to client", remaining_time, min_retry_time_remaining);
+                warn!(
+                    "Not enough time remaining for retry ({:?} < {:?}), returning {} to client",
+                    remaining_time, min_retry_time_remaining, code_name
+                );
                 break worker_resp;
             }
 
-            if attempt >= MAX_RETRY_ATTEMPTS {
+            if attempt >= max_attempts {
                 warn!(
-                    "Max retry attempts ({}) reached, returning TERMINATING to client",
-                    MAX_RETRY_ATTEMPTS
+                    "Max retry attempts ({}) reached, returning {} to client",
+                    max_attempts, code_name
                 );
                 break worker_resp;
             }
@@ -874,8 +971,29 @@ impl ScraperCoordinator for CoordinatorService {
 
             drop(workers);
 
+            // A retry that succeeds leaves no other trace: the client sees a normal response and
+            // nothing was rejected. This counter is the only place a scope that survives on
+            // retries is visible.
+            request_metrics.record_retry(retry_reason);
+
             debug!("Retrying on worker: {}", last_worker_id);
         };
+
+        // A worker that ran out of slots is answering about **capacity**, and capacity is the
+        // coordinator's own vocabulary: the client learns no new code, it gets the 5001 it already
+        // treats as retryable, and the refusal is counted where an operator looks for "add
+        // replicas". The worker's own wording is kept — it names the session mode's limit, which
+        // is what actually has to change.
+        if worker_response.error_code
+            == browser_hive_proto::worker::ErrorCode::CapacityExhausted as i32
+        {
+            request_metrics.reject(RejectReason::NoSlots);
+            let detail = std::mem::take(&mut worker_response.error_message);
+            worker_response.error_message =
+                format!("No available slots in scope {}: {}", req.scope_name, detail);
+            worker_response.error_code =
+                browser_hive_proto::coordinator::ErrorCode::NoWorkersAvailable as i32;
+        }
 
         // Create or update session
         let session_id = if !worker_response.context_id.is_empty() {
@@ -973,6 +1091,59 @@ impl ScraperCoordinator for CoordinatorService {
 mod tests {
     use super::*;
     use browser_hive_common::WorkerStats;
+
+    /// Only two worker answers earn a second pod. Everything else would be answered identically
+    /// anywhere in the scope, so retrying spends the client's deadline for nothing.
+    #[test]
+    fn only_terminating_and_capacity_are_retried() {
+        use browser_hive_proto::coordinator::ErrorCode as CoordCode;
+        use browser_hive_proto::worker::ErrorCode as WorkerCode;
+
+        let terminating = classify_retry(CoordCode::Terminating as i32, true).expect("retryable");
+        assert_eq!(terminating.reason, RetryReason::Terminating);
+        assert_eq!(terminating.max_attempts, MAX_TERMINATING_ATTEMPTS);
+
+        let capacity =
+            classify_retry(WorkerCode::CapacityExhausted as i32, true).expect("retryable");
+        assert_eq!(capacity.reason, RetryReason::NoSlots);
+        assert_eq!(capacity.max_attempts, MAX_CAPACITY_ATTEMPTS);
+
+        for code in [
+            0,
+            CoordCode::BrowserError as i32,
+            CoordCode::NetworkError as i32,
+            CoordCode::ContextCreationFailed as i32,
+            CoordCode::ProxyError as i32,
+            CoordCode::SessionNotFound as i32,
+            WorkerCode::SessionBusy as i32,
+            CoordCode::SelectorNotFound as i32,
+            CoordCode::TimeoutBrowser as i32,
+        ] {
+            assert!(
+                classify_retry(code, true).is_none(),
+                "error code {code} must not be retried on another worker"
+            );
+        }
+    }
+
+    /// Capacity gets fewer attempts than TERMINATING on purpose: retrying hard against a scope
+    /// that is already at its limit is how a saturated scope becomes a load generator.
+    #[test]
+    fn capacity_is_retried_less_eagerly_than_terminating() {
+        assert!(MAX_CAPACITY_ATTEMPTS < MAX_TERMINATING_ATTEMPTS);
+    }
+
+    /// A session lives in one context on one pod, so re-sending it elsewhere would silently hand
+    /// the client a different session. TERMINATING is the exception — that pod is going away and
+    /// the session with it.
+    #[test]
+    fn a_session_request_is_never_retried_for_capacity() {
+        use browser_hive_proto::coordinator::ErrorCode as CoordCode;
+        use browser_hive_proto::worker::ErrorCode as WorkerCode;
+
+        assert!(classify_retry(WorkerCode::CapacityExhausted as i32, false).is_none());
+        assert!(classify_retry(CoordCode::Terminating as i32, false).is_some());
+    }
 
     /// Helper to create a WorkerEndpoint for testing
     fn make_worker(name: &str, available_slots: usize) -> WorkerEndpoint {

@@ -317,7 +317,8 @@ neither the pool nor the guard can be constructed in a test.
 1. *Integration test with a real browser* (`#[ignore]`d, run manually / in a browser-enabled
    CI job): start a worker with `WORKER_SESSION_MODE=always_new`, `WORKER_MAX_CONTEXTS=1`,
    issue a `scrape_page` call against a slow URL, drop the gRPC client mid-request, then
-   assert the next request succeeds instead of returning `CONTEXT_CREATION_FAILED`.
+   assert the next request succeeds instead of returning `CAPACITY_EXHAUSTED` (5008, which the
+   coordinator surfaces to a client as `NO_WORKERS_AVAILABLE`).
 2. *Refactor for testability*: extract context bookkeeping (the `Vec<Arc<BrowserContext>>`
    plus capacity/reclaim rules) from `BrowserPool` into a separate struct that owns no
    `Browser`. Then the guard can be tested against it with no Chrome at all, and
