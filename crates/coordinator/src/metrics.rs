@@ -101,11 +101,41 @@ const ALL_REJECT_REASONS: [RejectReason; 7] = [
     RejectReason::WorkerUnreachable,
 ];
 
+/// Why the coordinator sent a request to a second worker instead of answering the client.
+///
+/// A successful retry is invisible in every other metric: the client got a normal response, no
+/// rejection was recorded, and the first worker's refusal is not a failure either. Without this
+/// counter a scope that only stays healthy because half its requests are retried looks exactly
+/// like a comfortable one — and [`Self::NoSlots`] in particular is demand that nearly did not
+/// fit, i.e. the early warning that `requests_rejected_total{reason="no_slots"}` gives only once
+/// it is too late.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    /// The chosen worker was shutting down (`ERROR_CODE_TERMINATING`).
+    Terminating,
+    /// The chosen worker had no free slot by the time the request arrived
+    /// (`ERROR_CODE_CAPACITY_EXHAUSTED`) — the coordinator's stats were a few seconds stale.
+    NoSlots,
+}
+
+impl RetryReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminating => "terminating",
+            Self::NoSlots => "no_slots",
+        }
+    }
+}
+
+/// Same purpose as [`ALL_REJECT_REASONS`]: every series exists from process start.
+const ALL_RETRY_REASONS: [RetryReason; 2] = [RetryReason::Terminating, RetryReason::NoSlots];
+
 #[derive(Clone)]
 pub struct CoordinatorMetrics {
     pub registry: Arc<Registry>,
     requests_total: IntCounterVec,
     requests_rejected_total: IntCounterVec,
+    requests_retried_total: IntCounterVec,
     request_duration_seconds: HistogramVec,
     scope_workers_total: IntGaugeVec,
     scope_workers_healthy: IntGaugeVec,
@@ -134,6 +164,17 @@ impl CoordinatorMetrics {
             &["scope", "reason"],
         )?;
         registry.register(Box::new(requests_rejected_total.clone()))?;
+
+        // Retries that saved a request. Counts attempts, not requests: one request may be
+        // retried more than once.
+        let requests_retried_total = IntCounterVec::new(
+            Opts::new(
+                "browser_hive_coordinator_requests_retried_total",
+                "Scrape attempts re-sent to another worker, by reason",
+            ),
+            &["scope", "reason"],
+        )?;
+        registry.register(Box::new(requests_retried_total.clone()))?;
 
         // Coordinator-side end-to-end duration: worker time plus routing, retries and the
         // fresh-stats round trip. Rejections land in the sub-second buckets, so the histogram
@@ -181,6 +222,7 @@ impl CoordinatorMetrics {
             registry,
             requests_total,
             requests_rejected_total,
+            requests_retried_total,
             request_duration_seconds,
             scope_workers_total,
             scope_workers_healthy,
@@ -198,6 +240,10 @@ impl CoordinatorMetrics {
         self.request_duration_seconds.with_label_values(&labels);
         for reason in ALL_REJECT_REASONS {
             self.requests_rejected_total
+                .with_label_values(&[scope, reason.as_str()]);
+        }
+        for reason in ALL_RETRY_REASONS {
+            self.requests_retried_total
                 .with_label_values(&[scope, reason.as_str()]);
         }
     }
@@ -301,6 +347,21 @@ impl RequestMetrics {
 
     pub fn reject(&mut self, reason: RejectReason) {
         self.reject_reason = Some(reason);
+    }
+
+    /// Count one re-send to another worker.
+    ///
+    /// Incremented immediately rather than on `Drop`, unlike the rejection reason: a retry is an
+    /// event that can happen several times per request, not a terminal state. The scope is
+    /// already final by the time any retry happens (a session request re-points it before
+    /// routing).
+    pub fn record_retry(&self, reason: RetryReason) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .requests_retried_total
+                .with_label_values(&[self.scope.as_str(), reason.as_str()])
+                .inc();
+        }
     }
 }
 

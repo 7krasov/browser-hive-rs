@@ -183,10 +183,14 @@ Use `session_id` to reuse the same browser context in subsequent requests; `work
 - `0` - Success
 - `4001` - Invalid URL (fix URL and retry)
 - `4002` - Session not found (retry without context_id)
+- `4004` - Session busy (retry the same session shortly; `dedicated` scopes only)
 - `4042` - Wait selector not found (check selector)
 - `4043` - Skip selector found (expected - skip content)
+- `5001` - No capacity in the scope right now (retry with backoff; also what a worker's full pool becomes)
 - `5003` - Browser error (retry - auto-recovers)
 - `5004` - Network error (retry with backoff)
+
+Rule of thumb: **every `5xxx` is retryable**; in `4xxx` only `4002`, `4004` and `4041` are.
 
 See [ERROR_HANDLING.md](ERROR_HANDLING.md) for complete error handling guide.
 

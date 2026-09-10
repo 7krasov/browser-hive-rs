@@ -356,6 +356,25 @@ impl Drop for AlwaysNewContextGuard {
     }
 }
 
+/// Whether a response's error code means "this worker failed", for
+/// `browser_hive_worker_requests_failed` and the `success_rate` in `GetStats`.
+///
+/// 5xxx codes are operational failures of the worker; 4xxx are client-side conditions (invalid
+/// URL, selector not found) and are never counted. gRPC-level errors are counted separately at the
+/// handler boundary.
+///
+/// [`ErrorCode::CapacityExhausted`] is the one 5xxx code that is **not** a failure: it says every
+/// slot was taken, which is the pool doing exactly what it is configured to do under load.
+/// Counting it would make an overloaded scope indistinguishable from a breaking one on the failure
+/// metric and would drag `success_rate` down with it — while the refused demand is already counted
+/// where it is actionable, as the coordinator's `requests_rejected_total{reason="no_slots"}`.
+fn counts_as_failure(error_code: i32) -> bool {
+    if error_code == ErrorCode::CapacityExhausted as i32 {
+        return false;
+    }
+    (5000..6000).contains(&error_code)
+}
+
 pub struct WorkerService {
     browser_pool: Arc<RwLock<BrowserPool>>,
     config: WorkerConfig,
@@ -434,10 +453,8 @@ impl WorkerService {
     }
 
     /// Count a response with a 5xxx operational error code as a failed request.
-    /// 4xxx codes are client-side conditions (invalid URL, selector not found)
-    /// and are not counted. Infrastructure gRPC errors are counted separately.
     fn record_failed_if_5xxx(&self, response: &ScrapePageResponse) {
-        if (5000..6000).contains(&response.error_code) {
+        if counts_as_failure(response.error_code) {
             self.failed_requests.fetch_add(1, Ordering::SeqCst);
             self.metrics
                 .requests_failed
@@ -677,7 +694,7 @@ impl WorkerService {
                     status_code: 0,
                     content: String::new(),
                     error_message: self.capacity_exhausted_message(false),
-                    error_code: ErrorCode::ContextCreationFailed as i32,
+                    error_code: ErrorCode::CapacityExhausted as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
                     context_id: String::new(),
@@ -732,7 +749,7 @@ impl WorkerService {
                                 status_code: 0,
                                 content: String::new(),
                                 error_message: self.capacity_exhausted_message(true),
-                                error_code: ErrorCode::ContextCreationFailed as i32,
+                                error_code: ErrorCode::CapacityExhausted as i32,
                                 response_headers: std::collections::HashMap::new(),
                                 execution_time_ms,
                                 context_id: String::new(),
@@ -795,6 +812,13 @@ impl WorkerService {
             ContextBusyGuard::new(&context)
         };
 
+        // A context that is already busy is never a malfunction and never a capacity problem: it
+        // is *this client's own* session still serving its previous request (only `dedicated`
+        // addresses a context by id, so only there can a client collide with itself). Hence
+        // `SESSION_BUSY` (4xxx) rather than `BROWSER_ERROR`, which blamed the browser, counted
+        // the request as a failure and told an operator to look at logs that hold nothing.
+        // The coordinator must not retry it on another pod either — the session lives in this
+        // context on this pod, and anywhere else is a different session.
         let _busy_guard = match busy_guard_result {
             Ok(guard) => guard,
             Err(_) => {
@@ -810,7 +834,7 @@ impl WorkerService {
                         "Context {} is already busy (created: {:?}, last_used: {:?}, total_requests: {}, cache_size_mb: {}) (after {}ms)",
                         context.metadata.id, context.metadata.created_at, *last_used, total_reqs, cache_size, execution_time_ms
                     ),
-                    error_code: ErrorCode::BrowserError as i32,
+                    error_code: ErrorCode::SessionBusy as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
                     context_id: self.addressable_context_id(&context),
@@ -2140,8 +2164,9 @@ impl WorkerServiceTrait for WorkerService {
             // Session continuation: the context keeps its own assigned proxy, so a country_code
             // in this request is ignored — the session's exit identity is already fixed.
             // A context that is busy here means the client sent two concurrent requests on one
-            // session; that is answered further down with "already busy", which in this mode is
-            // an honest statement about the client's own traffic.
+            // session (or retried while the first one is still running); that is answered further
+            // down with `SESSION_BUSY`, which in this mode is an honest statement about the
+            // client's own traffic.
             info!("Looking for existing context: {}", req.context_id);
             match browser_pool_guard.find_context_by_id(&req.context_id).await {
                 Some(ctx) => ctx,
@@ -2391,6 +2416,44 @@ mod tests {
             cdp_context_id: None,
             proxy_host: None,
         })
+    }
+
+    /// A full pool is load, not breakage: it must not move the failure metric, because an
+    /// operator paging on `requests_failed` would be paged for a scope that is merely busy.
+    #[test]
+    fn capacity_exhausted_is_not_counted_as_a_failure() {
+        assert!(!counts_as_failure(ErrorCode::CapacityExhausted as i32));
+    }
+
+    /// The rest of the 5xxx range keeps its meaning, and 4xxx stays uncounted.
+    #[test]
+    fn failure_counting_covers_the_rest_of_5xxx_only() {
+        for code in [
+            ErrorCode::BrowserError as i32,
+            ErrorCode::NetworkError as i32,
+            ErrorCode::ContextCreationFailed as i32,
+            ErrorCode::Terminating as i32,
+            ErrorCode::ProxyError as i32,
+        ] {
+            assert!(
+                counts_as_failure(code),
+                "expected {code} to count as a failure"
+            );
+        }
+        for code in [
+            0,
+            ErrorCode::InvalidUrl as i32,
+            ErrorCode::SessionNotFound as i32,
+            ErrorCode::SessionBusy as i32,
+            ErrorCode::SelectorNotFound as i32,
+            ErrorCode::SkipSelectorFound as i32,
+            ErrorCode::Unknown as i32,
+        ] {
+            assert!(
+                !counts_as_failure(code),
+                "expected {code} not to count as a failure"
+            );
+        }
     }
 
     #[test]

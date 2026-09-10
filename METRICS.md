@@ -21,7 +21,7 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_claimed_contexts` | Gauge | Slots that cannot be handed to a new client. Identical to `active_contexts` in `always_new`/`reusable`; in `dedicated` it also counts contexts owned by sessions that are idle between requests |
 | `browser_hive_worker_available_slots` | Gauge | Free capacity: `total_slots - claimed_contexts` |
 | `browser_hive_worker_requests_total` | Counter | Total scraping requests received |
-| `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, selector not found, skip selector) are client-side conditions and are NOT counted - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
+| `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, session busy, selector not found, skip selector) are client-side conditions and are NOT counted. **`CAPACITY_EXHAUSTED` (5008) is the one 5xxx code that is also not counted** — a full pool is the pool working as configured under load, and counting it would make a busy scope indistinguishable from a breaking one (it would also drag `success_rate` down). That refused demand is counted on the coordinator as `requests_rejected_total{reason="no_slots"}` - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
 | `browser_hive_worker_request_duration_seconds` | Histogram | End-to-end `scrape_page` duration in seconds (observed on every return path, including early returns). Buckets: 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 60. Exposes `_bucket`, `_sum`, `_count` |
 
 **Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `claimed_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). Counters are incremented in the request path.
@@ -103,7 +103,7 @@ The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (imp
 | `scope_not_found` | no | No pod in the cluster carries this scope name — label or configuration mismatch |
 | `session_not_found` | no | Client sent an expired `session_id`, or its worker is gone |
 | `terminating` | no | The coordinator itself is shutting down |
-| `worker_unreachable` | no | Routing picked a worker but the gRPC connection failed |
+| `worker_unreachable` | no | Routing picked a worker but the gRPC connection failed, or the RPC broke mid-request because the pod died. A **sustained** rate means pods are dying under load, not a client problem |
 
 Notes:
 
@@ -112,6 +112,29 @@ Notes:
 - `scope_unavailable` keeps the real scope name: it is only reached after the name matched a scope discovery found in the cluster, so its cardinality is bounded by the deployments rather than by client input. The `scope` label of a `scope_not_found` rejection is reported as `unknown`. It is the one label value fed from client input, and an unknown scope is by definition not from the configured set — collapsing it keeps a buggy client from minting unbounded time series. The real name is in the logs (`span_scope`).
 - Every `reason` series is pre-created per discovered scope, so `rate()` over a rejection that has not happened yet returns 0 rather than no data.
 - Worker errors (selector not found, timeouts, browser errors) are **not** rejections: those requests did reach a worker and are already counted by `browser_hive_worker_requests_failed`.
+- `no_slots` is recorded in **two** places: when the coordinator's own check found every worker full, and when the chosen worker answered `CAPACITY_EXHAUSTED` (5008) and no other pod had room. The second case is the stale-cache race, and before 5008 existed it was recorded nowhere at all — it left the worker as a "failed request" and the coordinator as a normal one.
+
+### `browser_hive_coordinator_requests_retried_total{scope, reason}`
+
+Attempts re-sent to a **different** worker (not requests — one request can be retried more than
+once). `reason` is `terminating` or `no_slots`.
+
+This counter exists because a **successful** retry is otherwise invisible: the client got a normal
+response, nothing was rejected, and the first worker's refusal is not a failure either. A scope that
+only stays healthy because half its requests are retried looks identical to a comfortable one.
+
+- `reason="no_slots"` rising is the **early warning** for capacity. `requests_rejected_total{reason="no_slots"}` is the same problem after it became visible to clients — by then requests are already being lost.
+- `reason="terminating"` rising outside a deploy window means pods are being restarted by something else (OOM kills, evictions, spot reclaims).
+
+```promql
+# Retries as a share of traffic, per scope — watch this before rejections appear
+sum by (scope) (rate(browser_hive_coordinator_requests_retried_total{reason="no_slots"}[5m]))
+/ clamp_min(sum by (scope) (rate(browser_hive_coordinator_requests_total[5m])), 0.0001)
+```
+
+⚠️ Capacity gets **one** retry and TERMINATING gets up to three, on purpose: retrying hard against a
+scope that is already at its limit turns it into a self-amplifying load generator. See
+[ERROR_HANDLING.md](ERROR_HANDLING.md#retrying-on-another-worker).
 
 Useful queries:
 

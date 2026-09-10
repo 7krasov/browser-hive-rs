@@ -17,13 +17,19 @@ enum ErrorCode {
 
   ERROR_CODE_BROWSER_ERROR = 5003;           // Browser crashed or failed
   ERROR_CODE_NETWORK_ERROR = 5004;           // Network error during page load
-  ERROR_CODE_CONTEXT_CREATION_FAILED = 5005; // Failed to create browser context
+  ERROR_CODE_CONTEXT_CREATION_FAILED = 5005; // Failed to create browser context (CDP refused) - a real malfunction
   ERROR_CODE_TERMINATING = 5006;             // Worker/Coordinator is terminating (graceful shutdown), retry later
   ERROR_CODE_PROXY_ERROR = 5007;             // Proxy/tunnel failure (dead peer, refused CONNECT) - retryable
+  // Every slot of this worker is taken. Capacity, not a malfunction: no context was even
+  // attempted. Internal to the worker-coordinator hop - the coordinator either retries on
+  // another pod or maps it to ERROR_CODE_NO_WORKERS_AVAILABLE (5001), which is why this code
+  // has no counterpart in coordinator.proto and never reaches a client.
+  ERROR_CODE_CAPACITY_EXHAUSTED = 5008;
 
   ERROR_CODE_INVALID_URL = 4001;             // Invalid URL provided
   ERROR_CODE_SESSION_NOT_FOUND = 4002;       // Session ID not found
   ERROR_CODE_SCOPE_NOT_FOUND = 4003;         // Specified scope does not exist
+  ERROR_CODE_SESSION_BUSY = 4004;            // The session's own context is still serving a previous request
 
   ERROR_CODE_TIMEOUT_BROWSER = 4041;         // Browser timeout while loading page
   ERROR_CODE_SELECTOR_NOT_FOUND = 4042;      // Browser has not found the requested CSS selector
