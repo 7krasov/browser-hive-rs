@@ -15,12 +15,15 @@
 //! - **Gauges are refreshed on every scrape** (`refresh_cluster_gauges`), not in the request
 //!   path, so they cannot drift when discovery or the health monitor changes state through a
 //!   path nobody remembered to instrument. They expose the *coordinator's own view* of the
-//!   fleet, which is what routing decides on — when it disagrees with the workers' own
-//!   `available_slots`, the discovery cache is stale and that is exactly the bug to see.
+//!   fleet, which is what routing decides on — for free slots that is the discovery cache
+//!   corrected by in-flight requests (`in_flight.rs`). When it disagrees with the workers' own
+//!   `available_slots` for longer than one discovery round, the in-flight count has leaked
+//!   (routing then believes pods are busier than they are) and that is exactly the bug to see.
 //! - **Counters are recorded through an RAII guard** (`RequestMetrics`), because `scrape_page`
 //!   returns from a dozen places and a future that is dropped mid-request (client disconnect)
 //!   must still be counted.
 
+use crate::in_flight::InFlightTracker;
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
 use browser_hive_common::WorkerEndpoint;
 use prometheus::{
@@ -212,7 +215,8 @@ impl CoordinatorMetrics {
         let scope_available_slots = IntGaugeVec::new(
             Opts::new(
                 "browser_hive_coordinator_scope_available_slots",
-                "Free slots per scope as seen by the coordinator's discovery cache",
+                "Free slots per scope as routing sees them: the discovery cache corrected by the \
+                 requests this coordinator has dispatched since it was taken",
             ),
             &["scope"],
         )?;
@@ -253,13 +257,9 @@ impl CoordinatorMetrics {
     /// Scopes that vanish from discovery keep their last value rather than being deleted: a
     /// scope whose pods all disappeared is precisely the state worth seeing, and a removed
     /// series would render as a gap indistinguishable from Prometheus losing the target.
-    async fn refresh_cluster_gauges(
-        &self,
-        workers: &Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
-        healthy: &Arc<RwLock<HashSet<String>>>,
-    ) {
-        let workers = workers.read().await;
-        let healthy = healthy.read().await;
+    async fn refresh_cluster_gauges(&self, fleet: &FleetView) {
+        let workers = fleet.workers.read().await;
+        let healthy = fleet.healthy.read().await;
 
         for (scope, endpoints) in workers.iter() {
             self.register_scope(scope);
@@ -277,23 +277,17 @@ impl CoordinatorMetrics {
             self.scope_available_slots.with_label_values(&labels).set(
                 endpoints
                     .iter()
-                    .map(|w| w.stats.available_slots as i64)
+                    .map(|w| fleet.in_flight.free_slots(w) as i64)
                     .sum(),
             );
         }
     }
 
     /// Start the HTTP server exposing `/metrics`.
-    pub async fn start_server(
-        self,
-        port: u16,
-        workers: Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
-        healthy: Arc<RwLock<HashSet<String>>>,
-    ) -> anyhow::Result<()> {
+    pub async fn start_server(self, port: u16, fleet: FleetView) -> anyhow::Result<()> {
         let state = MetricsState {
             metrics: self,
-            workers,
-            healthy,
+            fleet,
         };
 
         let app = Router::new()
@@ -391,20 +385,27 @@ impl Drop for RequestMetrics {
     }
 }
 
+/// What the coordinator knows about the fleet, read by the gauges on every scrape.
+#[derive(Clone)]
+pub struct FleetView {
+    /// The routable map (discovery cache).
+    pub workers: Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
+    /// Pods that passed the last health check.
+    pub healthy: Arc<RwLock<HashSet<String>>>,
+    /// Requests dispatched and not yet answered, which routing subtracts from the cache.
+    pub in_flight: Arc<InFlightTracker>,
+}
+
 #[derive(Clone)]
 struct MetricsState {
     metrics: CoordinatorMetrics,
-    workers: Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
-    healthy: Arc<RwLock<HashSet<String>>>,
+    fleet: FleetView,
 }
 
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
 ) -> impl IntoResponse {
-    state
-        .metrics
-        .refresh_cluster_gauges(&state.workers, &state.healthy)
-        .await;
+    state.metrics.refresh_cluster_gauges(&state.fleet).await;
 
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();

@@ -1,5 +1,6 @@
+use crate::in_flight::InFlightTracker;
 use crate::local_worker_discovery::LocalWorkerDiscovery;
-use crate::metrics::{CoordinatorMetrics, RejectReason, RequestMetrics, RetryReason};
+use crate::metrics::{CoordinatorMetrics, FleetView, RejectReason, RequestMetrics, RetryReason};
 use crate::worker_discovery::{ScopePresence, WorkerDiscovery};
 use anyhow::Result;
 use browser_hive_common::{CoordinatorConfig, SessionId, SessionManager, WorkerEndpoint};
@@ -146,6 +147,9 @@ fn classify_missing_scope(
 #[derive(Debug, Clone)]
 pub struct SelectedWorker<'a> {
     pub worker: &'a WorkerEndpoint,
+    /// Free slots the worker was ranked by: the discovery cache corrected by in-flight requests,
+    /// not the raw `worker.stats.available_slots`.
+    pub free_slots: usize,
     pub used_fallback: bool, // true if no healthy workers were found and we fell back to all workers
 }
 
@@ -154,23 +158,23 @@ pub struct SelectedWorker<'a> {
 /// # Algorithm
 /// 1. Filter workers by healthy status (must be in `healthy_workers` set)
 /// 2. If no healthy workers, fall back to all workers (race condition window)
-/// 3. Select worker with the highest `available_slots`
+/// 3. Select the worker with the most free slots (see [`pick_most_free`])
 ///
 /// # Returns
 /// - `Some(SelectedWorker)` with the best worker and whether fallback was used
 /// - `None` if no workers available
 /// # Parameters
+/// * `free_slots` - free slots of a worker. In production that is
+///   [`InFlightTracker::free_slots`], which corrects the discovery cache by the requests
+///   dispatched since it was taken; a parameter so selection stays a pure function in tests.
 /// * `rotation` - a counter that advances once per routing decision; it selects among the workers
-///   that tie on `available_slots`. See the round-robin note in the body.
+///   that tie on free slots. See [`pick_most_free`].
 pub fn select_best_worker<'a>(
     scope_workers: &'a [WorkerEndpoint],
     healthy_workers: &HashSet<String>,
+    free_slots: impl Fn(&WorkerEndpoint) -> usize,
     rotation: u64,
 ) -> Option<SelectedWorker<'a>> {
-    if scope_workers.is_empty() {
-        return None;
-    }
-
     let healthy: Vec<_> = scope_workers
         .iter()
         .filter(|w| healthy_workers.contains(&w.pod_name))
@@ -183,11 +187,31 @@ pub fn select_best_worker<'a>(
         (healthy, false)
     };
 
-    let best_slots = candidates
-        .iter()
-        .map(|w| w.stats.available_slots)
-        .max()
-        .expect("candidates is non-empty: scope_workers was checked above");
+    pick_most_free(candidates, free_slots, rotation).map(|(worker, free_slots)| SelectedWorker {
+        worker,
+        free_slots,
+        used_fallback,
+    })
+}
+
+/// Of `candidates`, the worker with the most free slots, ties broken round-robin.
+///
+/// Both routing decisions go through here — the first one and the retry after
+/// `CAPACITY_EXHAUSTED`. The retry used to rank with a bare `max_by_key` on the cached
+/// `available_slots`, which returns the *last* maximum, so every capacity retry in one discovery
+/// window went to the same pod — full after the first two at 2 slots per pod. Observed in
+/// production as one pod taking ~85 second attempts in five minutes while its neighbours had room.
+///
+/// `free_slots` is evaluated once per candidate: the in-flight count moves under concurrent
+/// requests, and the tie has to be decided on one consistent reading.
+fn pick_most_free(
+    candidates: Vec<&WorkerEndpoint>,
+    free_slots: impl Fn(&WorkerEndpoint) -> usize,
+    rotation: u64,
+) -> Option<(&WorkerEndpoint, usize)> {
+    let ranked: Vec<(&WorkerEndpoint, usize)> =
+        candidates.into_iter().map(|w| (w, free_slots(w))).collect();
+    let best_slots = ranked.iter().map(|(_, slots)| *slots).max()?;
 
     // Rotate between the workers that tie on free capacity instead of always taking the same one.
     //
@@ -203,17 +227,14 @@ pub fn select_best_worker<'a>(
     // discovery rebuilds its vector every 10 s and its order is not stable — round-robin over an
     // unstable order is not round-robin. Selection stays a pure function of its inputs plus the
     // caller's counter, so it remains testable.
-    let mut tied: Vec<&WorkerEndpoint> = candidates
+    let mut tied: Vec<(&WorkerEndpoint, usize)> = ranked
         .into_iter()
-        .filter(|w| w.stats.available_slots == best_slots)
+        .filter(|(_, slots)| *slots == best_slots)
         .collect();
-    tied.sort_by(|a, b| a.pod_name.cmp(&b.pod_name));
+    tied.sort_by(|a, b| a.0.pod_name.cmp(&b.0.pod_name));
 
     let index = (rotation % tied.len() as u64) as usize;
-    tied.get(index).map(|worker| SelectedWorker {
-        worker,
-        used_fallback,
-    })
+    tied.get(index).copied()
 }
 
 /// Fetch fresh stats from a worker to verify slot availability
@@ -297,6 +318,9 @@ pub struct CoordinatorService {
     /// every scope on purpose: it is a rotation, not a per-scope cursor, and the alternative
     /// (a counter per scope) would need a map, a lock, and eviction to say the same thing.
     routing_rotation: Arc<AtomicU64>,
+    /// Requests sent to each worker and not yet answered; corrects the discovery cache for
+    /// routing. Exact only while there is a single coordinator — see `in_flight.rs`.
+    in_flight: Arc<InFlightTracker>,
 }
 
 impl CoordinatorService {
@@ -311,6 +335,8 @@ impl CoordinatorService {
             .map(|m| m == "local")
             .unwrap_or(false);
 
+        let in_flight = Arc::new(InFlightTracker::default());
+
         let worker_discovery = if is_local_mode {
             info!("Running in LOCAL mode - using hardcoded worker endpoint");
             let local_discovery = LocalWorkerDiscovery::new().await?;
@@ -318,7 +344,7 @@ impl CoordinatorService {
             WorkerDiscoveryImpl::Local(local_discovery)
         } else {
             info!("Running in KUBERNETES mode - using K8s API for worker discovery");
-            let k8s_discovery = WorkerDiscovery::new().await?;
+            let k8s_discovery = WorkerDiscovery::new(in_flight.clone()).await?;
             k8s_discovery.start_discovery().await;
             WorkerDiscoveryImpl::Kubernetes(k8s_discovery)
         };
@@ -342,6 +368,7 @@ impl CoordinatorService {
             healthy_workers: healthy_workers.clone(),
             metrics,
             routing_rotation: Arc::new(AtomicU64::new(0)),
+            in_flight,
         };
 
         // Start health monitoring background task
@@ -360,18 +387,14 @@ impl CoordinatorService {
         self.metrics.clone()
     }
 
-    /// Discovery cache and health set, for the metrics server's scrape-time gauge refresh.
-    #[allow(clippy::type_complexity)]
-    pub fn fleet_view(
-        &self,
-    ) -> (
-        Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
-        Arc<RwLock<HashSet<String>>>,
-    ) {
-        (
-            self.worker_discovery.get_workers(),
-            self.healthy_workers.clone(),
-        )
+    /// Discovery cache, health set and in-flight counts, for the metrics server's scrape-time
+    /// gauge refresh.
+    pub fn fleet_view(&self) -> FleetView {
+        FleetView {
+            workers: self.worker_discovery.get_workers(),
+            healthy: self.healthy_workers.clone(),
+            in_flight: self.in_flight.clone(),
+        }
     }
 
     /// Start background task that monitors worker health every 1 second
@@ -677,7 +700,12 @@ impl ScraperCoordinator for CoordinatorService {
             // Select best worker using routing logic
             let healthy_guard = self.healthy_workers.read().await;
             let rotation = self.routing_rotation.fetch_add(1, Ordering::Relaxed);
-            let selected = select_best_worker(scope_workers, &healthy_guard, rotation);
+            let selected = select_best_worker(
+                scope_workers,
+                &healthy_guard,
+                |w| self.in_flight.free_slots(w),
+                rotation,
+            );
             drop(healthy_guard);
 
             let selected = match selected {
@@ -713,11 +741,12 @@ impl ScraperCoordinator for CoordinatorService {
             let best_worker = selected.worker;
             let endpoint = format!("http://{}:{}", best_worker.pod_ip, best_worker.port);
 
-            // Cache says no slots available - but cache may be stale!
-            // Fetch fresh stats before rejecting the request
-            if best_worker.stats.available_slots == 0 {
+            // No free slot as far as the coordinator can tell. The cache under that estimate may
+            // still be stale (a `dedicated` session released its slot), so ask the worker itself
+            // before rejecting the request.
+            if selected.free_slots == 0 {
                 debug!(
-                    "Cache shows 0 slots for worker {}, fetching fresh stats",
+                    "No free slots on worker {} (cache corrected by in-flight requests), fetching fresh stats",
                     best_worker.pod_name
                 );
 
@@ -779,6 +808,16 @@ impl ScraperCoordinator for CoordinatorService {
         // Retry loop for worker answers that another pod could still serve (see `retry_plan`)
         let mut worker_response = loop {
             attempt += 1;
+
+            // This attempt occupies a slot on `last_worker_id` until the iteration ends — by
+            // `break`, `return`, or the future being dropped. Counted from before the connect, so
+            // concurrent routing decisions already see the slot as taken. A request continuing a
+            // session is not counted: its slot was claimed when the session was created and is
+            // already missing from the worker's `available_slots`.
+            let _in_flight = req
+                .session_id
+                .is_empty()
+                .then(|| self.in_flight.start(&last_worker_id));
 
             // Connect to worker
             let mut client = match WorkerServiceClient::connect(last_worker_endpoint.clone()).await
@@ -942,7 +981,7 @@ impl ScraperCoordinator for CoordinatorService {
 
             // Filter by healthy workers and exclude failed workers
             let healthy_guard = self.healthy_workers.read().await;
-            let available_workers: Vec<_> = scope_workers
+            let candidates: Vec<_> = scope_workers
                 .iter()
                 .filter(|w| {
                     healthy_guard.contains(&w.pod_name) && !excluded_workers.contains(&w.pod_name)
@@ -950,17 +989,16 @@ impl ScraperCoordinator for CoordinatorService {
                 .collect();
             drop(healthy_guard);
 
-            if available_workers.is_empty() {
+            // Ranked exactly like the first routing decision (see `pick_most_free`).
+            let rotation = self.routing_rotation.fetch_add(1, Ordering::Relaxed);
+            let Some((best_worker, free_slots)) =
+                pick_most_free(candidates, |w| self.in_flight.free_slots(w), rotation)
+            else {
                 warn!("No healthy workers available for retry");
                 break worker_resp;
-            }
+            };
 
-            let best_worker = available_workers
-                .iter()
-                .max_by_key(|w| w.stats.available_slots)
-                .unwrap();
-
-            if best_worker.stats.available_slots == 0 {
+            if free_slots == 0 {
                 warn!("No available slots for retry");
                 break worker_resp;
             }
@@ -1165,8 +1203,76 @@ mod tests {
                 total_contexts_recycled: 10,
                 success_rate: 0.95,
             },
+            in_flight_at_snapshot: 0,
             is_terminating: false,
         }
+    }
+
+    /// Free slots straight from the discovery cache, for tests about ranking rather than in-flight
+    /// accounting.
+    fn cached(worker: &WorkerEndpoint) -> usize {
+        worker.stats.available_slots
+    }
+
+    /// The production failure: two 2-slot pods, a cache taken while both were idle, and requests
+    /// arriving faster than discovery refreshes. Ranking on the cache alone kept offering pods it
+    /// had already filled; with in-flight accounting each pod gets exactly its two slots and the
+    /// fifth request sees a full scope instead of a pod that will answer CAPACITY_EXHAUSTED.
+    #[test]
+    fn dispatches_within_one_discovery_round_fill_every_pod_before_any_overflows() {
+        let tracker = Arc::new(InFlightTracker::default());
+        let workers = vec![make_worker("worker-1", 2), make_worker("worker-2", 2)];
+        let healthy: HashSet<String> = ["worker-1", "worker-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let mut held = Vec::new();
+        let mut per_pod: HashMap<String, usize> = HashMap::new();
+        for rotation in 0..4 {
+            let selected =
+                select_best_worker(&workers, &healthy, |w| tracker.free_slots(w), rotation)
+                    .unwrap();
+            assert!(
+                selected.free_slots > 0,
+                "request {rotation} found no free slot"
+            );
+            *per_pod.entry(selected.worker.pod_name.clone()).or_default() += 1;
+            held.push(tracker.start(&selected.worker.pod_name));
+        }
+
+        assert_eq!(per_pod.get("worker-1"), Some(&2));
+        assert_eq!(per_pod.get("worker-2"), Some(&2));
+        let fifth = select_best_worker(&workers, &healthy, |w| tracker.free_slots(w), 4).unwrap();
+        assert_eq!(fifth.free_slots, 0);
+
+        // A finished request gives its slot back without waiting for the next discovery round.
+        held.pop();
+        let sixth = select_best_worker(&workers, &healthy, |w| tracker.free_slots(w), 5).unwrap();
+        assert_eq!(sixth.free_slots, 1);
+    }
+
+    /// The retry path ranks through `pick_most_free` too. It used `max_by_key`, which returns the
+    /// last maximum and therefore sent every retry in a discovery window to the same pod.
+    #[test]
+    fn retry_candidates_rotate_between_ties() {
+        let workers = [
+            make_worker("worker-1", 2),
+            make_worker("worker-2", 2),
+            make_worker("worker-3", 2),
+        ];
+
+        let picked: Vec<&str> = (0..3)
+            .map(|rotation| {
+                pick_most_free(workers.iter().collect(), cached, rotation)
+                    .unwrap()
+                    .0
+                    .pod_name
+                    .as_str()
+            })
+            .collect();
+
+        assert_eq!(picked, vec!["worker-1", "worker-2", "worker-3"]);
     }
 
     // ==================== select_best_worker Tests ====================
@@ -1176,7 +1282,7 @@ mod tests {
         let workers: Vec<WorkerEndpoint> = vec![];
         let healthy = HashSet::new();
 
-        let result = select_best_worker(&workers, &healthy, 0);
+        let result = select_best_worker(&workers, &healthy, cached, 0);
         assert!(result.is_none());
     }
 
@@ -1185,7 +1291,7 @@ mod tests {
         let workers = vec![make_worker("worker-1", 5)];
         let healthy: HashSet<String> = ["worker-1".to_string()].into_iter().collect();
 
-        let result = select_best_worker(&workers, &healthy, 0).unwrap();
+        let result = select_best_worker(&workers, &healthy, cached, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-1");
         assert!(!result.used_fallback);
     }
@@ -1202,7 +1308,7 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let result = select_best_worker(&workers, &healthy, 0).unwrap();
+        let result = select_best_worker(&workers, &healthy, cached, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-2");
         assert_eq!(result.worker.stats.available_slots, 5);
         assert!(!result.used_fallback);
@@ -1221,7 +1327,7 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let result = select_best_worker(&workers, &healthy, 0).unwrap();
+        let result = select_best_worker(&workers, &healthy, cached, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-3");
         assert_eq!(result.worker.stats.available_slots, 5);
         assert!(!result.used_fallback);
@@ -1233,7 +1339,7 @@ mod tests {
         // Empty healthy set - should fall back to all workers
         let healthy: HashSet<String> = HashSet::new();
 
-        let result = select_best_worker(&workers, &healthy, 0).unwrap();
+        let result = select_best_worker(&workers, &healthy, cached, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-2");
         assert!(result.used_fallback);
     }
@@ -1247,7 +1353,7 @@ mod tests {
             .collect();
 
         // Should still select a worker (any of them)
-        let result = select_best_worker(&workers, &healthy, 0).unwrap();
+        let result = select_best_worker(&workers, &healthy, cached, 0).unwrap();
         assert_eq!(result.worker.stats.available_slots, 0);
         assert!(!result.used_fallback);
     }
@@ -1262,7 +1368,7 @@ mod tests {
         // Only worker-1 is healthy
         let healthy: HashSet<String> = ["worker-1"].into_iter().map(String::from).collect();
 
-        let result = select_best_worker(&workers, &healthy, 0).unwrap();
+        let result = select_best_worker(&workers, &healthy, cached, 0).unwrap();
         assert_eq!(result.worker.pod_name, "worker-1");
         assert_eq!(result.worker.stats.available_slots, 1);
         assert!(!result.used_fallback);
@@ -1285,7 +1391,7 @@ mod tests {
 
         let picked: Vec<String> = (0..6)
             .map(|rotation| {
-                select_best_worker(&workers, &healthy, rotation)
+                select_best_worker(&workers, &healthy, cached, rotation)
                     .unwrap()
                     .worker
                     .pod_name
@@ -1314,7 +1420,7 @@ mod tests {
             .collect();
 
         for rotation in 0..6 {
-            let selected = select_best_worker(&workers, &healthy, rotation).unwrap();
+            let selected = select_best_worker(&workers, &healthy, cached, rotation).unwrap();
             assert_eq!(selected.worker.stats.available_slots, 5);
             assert_ne!(selected.worker.pod_name, "worker-2");
         }
@@ -1334,11 +1440,11 @@ mod tests {
 
         for rotation in 0..4 {
             assert_eq!(
-                select_best_worker(&one_order, &healthy, rotation)
+                select_best_worker(&one_order, &healthy, cached, rotation)
                     .unwrap()
                     .worker
                     .pod_name,
-                select_best_worker(&other_order, &healthy, rotation)
+                select_best_worker(&other_order, &healthy, cached, rotation)
                     .unwrap()
                     .worker
                     .pod_name

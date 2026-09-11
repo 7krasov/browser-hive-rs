@@ -57,6 +57,8 @@ impl LocalWorkerDiscovery {
                         total_contexts_recycled: 0,
                         success_rate: 1.0,
                     },
+                    // Static stats, taken before any request existed.
+                    in_flight_at_snapshot: 0,
                     // Local mode has no pod lifecycle / termination.
                     is_terminating: false,
                 };
@@ -113,6 +115,8 @@ impl LocalWorkerDiscovery {
                     total_contexts_recycled: 0,
                     success_rate: 1.0,
                 },
+                // Static stats, taken before any request existed.
+                in_flight_at_snapshot: 0,
                 // Local mode has no pod lifecycle / termination.
                 is_terminating: false,
             };

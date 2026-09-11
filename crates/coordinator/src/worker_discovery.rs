@@ -1,3 +1,4 @@
+use crate::in_flight::InFlightTracker;
 use anyhow::Result;
 use browser_hive_common::WorkerEndpoint;
 use k8s_openapi::api::core::v1::{Pod, PodStatus};
@@ -70,15 +71,18 @@ pub struct WorkerDiscovery {
     workers: Arc<RwLock<HashMap<String, Vec<WorkerEndpoint>>>>,
     /// Every scope the cluster has pods for, routable or not. See [`ScopePresence`].
     known_scopes: Arc<RwLock<HashMap<String, ScopePresence>>>,
+    /// Read once per pod as its stats arrive, to stamp the baseline routing corrects them by.
+    in_flight: Arc<InFlightTracker>,
 }
 
 impl WorkerDiscovery {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(in_flight: Arc<InFlightTracker>) -> Result<Self> {
         let client = Client::try_default().await?;
         Ok(Self {
             kube_client: client,
             workers: Arc::new(RwLock::new(HashMap::new())),
             known_scopes: Arc::new(RwLock::new(HashMap::new())),
+            in_flight,
         })
     }
 
@@ -95,6 +99,7 @@ impl WorkerDiscovery {
         let pods: Api<Pod> = Api::default_namespaced(self.kube_client.clone());
         let workers = self.workers.clone();
         let known_scopes = self.known_scopes.clone();
+        let in_flight = self.in_flight.clone();
 
         // Whether to log "failed to get stats" warnings for terminating pods.
         // Terminating pods (deletionTimestamp set) routinely fail GetStats during
@@ -112,7 +117,8 @@ impl WorkerDiscovery {
 
         let discovery = async move {
             loop {
-                match Self::discover_workers(&pods, log_terminating_pod_warnings).await {
+                match Self::discover_workers(&pods, log_terminating_pod_warnings, &in_flight).await
+                {
                     Ok((discovered_workers, presence)) => {
                         let total_workers: usize =
                             discovered_workers.values().map(|v| v.len()).sum();
@@ -159,6 +165,7 @@ impl WorkerDiscovery {
     async fn discover_workers(
         pods: &Api<Pod>,
         log_terminating_pod_warnings: bool,
+        in_flight: &InFlightTracker,
     ) -> Result<(
         HashMap<String, Vec<WorkerEndpoint>>,
         HashMap<String, ScopePresence>,
@@ -244,6 +251,9 @@ impl WorkerDiscovery {
                         port,
                         scope_name: scope_name.clone(),
                         stats,
+                        // Read the moment the stats arrived and stored beside them, so the
+                        // routable map swaps both in together (see `in_flight.rs`).
+                        in_flight_at_snapshot: in_flight.current(&pod_name),
                         is_terminating,
                     };
 

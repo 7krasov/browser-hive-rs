@@ -91,7 +91,7 @@ The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (imp
 | `browser_hive_coordinator_request_duration_seconds` | Histogram | `scope` | End-to-end coordinator duration: worker time plus routing, retries and the fresh-stats round trip. Buckets: 0.005 … 60 |
 | `browser_hive_coordinator_scope_workers_total` | Gauge | `scope` | Worker pods discovered per scope, as the coordinator sees them |
 | `browser_hive_coordinator_scope_workers_healthy` | Gauge | `scope` | Of those, the pods that passed the last health check |
-| `browser_hive_coordinator_scope_available_slots` | Gauge | `scope` | Free slots per scope from the coordinator's discovery cache |
+| `browser_hive_coordinator_scope_available_slots` | Gauge | `scope` | Free slots per scope **as routing sees them**: the discovery cache corrected by the requests this coordinator has dispatched since (`coordinator/src/in_flight.rs`) |
 
 **`reason` values**, split by what they mean for action:
 
@@ -107,7 +107,7 @@ The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (imp
 
 Notes:
 
-- **Gauges are refreshed on every scrape** (same rule as the worker's pool gauges), so they cannot drift when discovery or the health monitor changes state. They deliberately show the **coordinator's own view** — that is what routing decides on, and a disagreement with the workers' own `available_slots` *is* the bug (a stale discovery cache).
+- **Gauges are refreshed on every scrape** (same rule as the worker's pool gauges), so they cannot drift when discovery or the health monitor changes state. They deliberately show the **coordinator's own view** — that is what routing decides on. For `scope_available_slots` that view is the discovery cache corrected by in-flight requests, so it tracks the workers' own `available_slots` closely; a gap that **outlasts one discovery round (10 s)** means the in-flight count has leaked and routing believes pods are busier than they are — the same symptom (`no_slots` at low utilisation) the correction exists to remove. Because both are snapshot gauges, compare them over a window, not sample by sample.
 - **Counters are recorded by an RAII guard**, so a request whose future is dropped (client disconnect, gRPC deadline) is still counted.
 - `scope_unavailable` keeps the real scope name: it is only reached after the name matched a scope discovery found in the cluster, so its cardinality is bounded by the deployments rather than by client input. The `scope` label of a `scope_not_found` rejection is reported as `unknown`. It is the one label value fed from client input, and an unknown scope is by definition not from the configured set — collapsing it keeps a buggy client from minting unbounded time series. The real name is in the logs (`span_scope`).
 - Every `reason` series is pre-created per discovered scope, so `rate()` over a rejection that has not happened yet returns 0 rather than no data.

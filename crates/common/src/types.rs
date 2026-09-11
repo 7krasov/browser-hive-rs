@@ -16,6 +16,14 @@ pub struct WorkerEndpoint {
     pub port: u16,
     pub scope_name: String,
     pub stats: WorkerStats,
+    /// Requests the coordinator had in flight to this pod at the moment `stats` arrived.
+    ///
+    /// Coordinator-side bookkeeping, not something the worker reports: routing subtracts the
+    /// requests dispatched since then from `stats.available_slots`. It is captured together with
+    /// the stats and swapped into the routable map with them, because a baseline newer than its
+    /// stats would cancel the correction. See `coordinator/src/in_flight.rs`.
+    #[serde(default)]
+    pub in_flight_at_snapshot: usize,
     /// True when the pod is terminating (K8s `deletionTimestamp` is set) as of the
     /// last discovery round. Used only to downgrade routine connect/stats-error logs
     /// during graceful shutdown; never affects routing or health decisions. May be

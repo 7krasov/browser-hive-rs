@@ -1,3 +1,4 @@
+mod in_flight;
 mod local_worker_discovery;
 mod metrics;
 mod service;
@@ -124,12 +125,12 @@ async fn run_coordinator() -> Result<()> {
     // Prometheus metrics server. Long-lived background task, so it opens its own span with a
     // sentinel ray_id (a spawned task does not inherit the lifetime span).
     if let Some(metrics) = coordinator_service.metrics() {
-        let (workers, healthy) = coordinator_service.fleet_view();
+        let fleet = coordinator_service.fleet_view();
         let metrics_port = config.metrics_port;
         let span = tracing::info_span!("metrics_server", ray_id = "metrics-server");
         tokio::spawn(
             async move {
-                if let Err(e) = metrics.start_server(metrics_port, workers, healthy).await {
+                if let Err(e) = metrics.start_server(metrics_port, fleet).await {
                     warn!("Metrics server error: {}", e);
                 }
             }
