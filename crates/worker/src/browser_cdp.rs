@@ -14,6 +14,11 @@
 //! navigation, Fetch auth) runs through the crate's transport as usual. Verified against
 //! Brave 150 before this was written.
 //!
+//! The metrics endpoint opens a client of its own for read-only introspection
+//! (`Target.getTargets`, `Target.getBrowserContexts`, see `browser_resources.rs`). Those calls
+//! create nothing and enable nothing, so the rules below hold for it unchanged; it is a separate
+//! socket so that a scrape waiting on a wedged browser never holds the lock context creation needs.
+//!
 //! # Invariants
 //!
 //! Running two CDP clients against one browser is safe *because of these rules*, not inherently.
@@ -42,7 +47,7 @@
 //!    the exception for browser-level calls that are unreachable, not a parallel CDP layer.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -63,6 +68,8 @@ type BrowserSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 pub struct BrowserCdpClient {
     ws_url: String,
+    /// Bound on one call, and on each step (TCP connect, handshake) of opening the socket.
+    call_timeout: Duration,
     /// `None` while disconnected; the next call reconnects.
     ///
     /// A `std::sync::Mutex` is deliberate: every call is a short blocking round-trip and is
@@ -77,11 +84,18 @@ impl BrowserCdpClient {
     /// Connecting eagerly turns a misconfigured endpoint into a startup failure rather than
     /// into a failure of the first scrape request.
     pub fn connect(ws_url: impl Into<String>) -> Result<Self> {
+        Self::connect_with_timeout(ws_url, CALL_TIMEOUT)
+    }
+
+    /// [`connect`](Self::connect) with a bound other than [`CALL_TIMEOUT`], for callers that must
+    /// give up sooner than the request path does.
+    pub fn connect_with_timeout(ws_url: impl Into<String>, call_timeout: Duration) -> Result<Self> {
         let ws_url = ws_url.into();
-        let socket = Self::open(&ws_url)?;
+        let socket = Self::open(&ws_url, call_timeout)?;
 
         Ok(Self {
             ws_url,
+            call_timeout,
             socket: Mutex::new(Some(socket)),
             next_id: AtomicU64::new(1),
         })
@@ -107,6 +121,40 @@ impl BrowserCdpClient {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow!("createBrowserContext returned no browserContextId"))
+    }
+
+    /// The `type` of every target the browser reports, one entry per target.
+    ///
+    /// Read-only: `Target.getTargets` attaches to nothing and needs no `Target.setDiscoverTargets`
+    /// on this socket. With no filter the browser applies its default one, which leaves out the
+    /// `browser` and `tab` targets.
+    pub fn target_types(&self) -> Result<Vec<String>> {
+        let response = self.call("Target.getTargets", serde_json::json!({}))?;
+
+        let infos = response
+            .pointer("/result/targetInfos")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("getTargets returned no targetInfos"))?;
+        Ok(infos
+            .iter()
+            .map(|info| {
+                info.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect())
+    }
+
+    /// Number of browser contexts other than the default one.
+    pub fn browser_context_count(&self) -> Result<usize> {
+        let response = self.call("Target.getBrowserContexts", serde_json::json!({}))?;
+
+        response
+            .pointer("/result/browserContextIds")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .ok_or_else(|| anyhow!("getBrowserContexts returned no browserContextIds"))
     }
 
     /// Issue one method call, reconnecting once if the socket turned out to be dead.
@@ -137,14 +185,14 @@ impl BrowserCdpClient {
 
         let socket = match guard.as_mut() {
             Some(socket) => socket,
-            None => guard.insert(Self::open(&self.ws_url)?),
+            None => guard.insert(Self::open(&self.ws_url, self.call_timeout)?),
         };
 
         socket
             .send(Message::Text(request.to_string().into()))
             .context("send")?;
 
-        let deadline = Instant::now() + CALL_TIMEOUT;
+        let deadline = Instant::now() + self.call_timeout;
         for _ in 0..MAX_FRAMES_PER_CALL {
             if Instant::now() >= deadline {
                 bail!("timed out waiting for a response to '{method}'");
@@ -176,20 +224,31 @@ impl BrowserCdpClient {
         }
     }
 
-    fn open(ws_url: &str) -> Result<BrowserSocket> {
-        let (mut socket, _response) = tungstenite::connect(ws_url)
-            .with_context(|| format!("connect to the browser CDP endpoint at {ws_url}"))?;
+    fn open(ws_url: &str, timeout: Duration) -> Result<BrowserSocket> {
+        let context = || format!("connect to the browser CDP endpoint at {ws_url}");
 
-        // Without these, a browser that stops answering blocks the calling task forever:
-        // tungstenite's read is a blocking socket read with no deadline of its own.
-        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
-            stream
-                .set_read_timeout(Some(CALL_TIMEOUT))
-                .context("set read timeout")?;
-            stream
-                .set_write_timeout(Some(CALL_TIMEOUT))
-                .context("set write timeout")?;
-        }
+        // The timeouts are set on the TCP stream *before* the WebSocket handshake. Without them a
+        // browser that stops answering blocks the calling thread forever — tungstenite's read is a
+        // blocking socket read with no deadline of its own, and `tungstenite::connect` would run the
+        // handshake read before a timeout could be set. The DevTools endpoint is always a plain
+        // `ws://host:port`, so no TLS is involved.
+        let url = url::Url::parse(ws_url).with_context(context)?;
+        let address = (url.host_str().unwrap_or_default(), url.port().unwrap_or(80))
+            .to_socket_addrs()
+            .with_context(context)?
+            .next()
+            .ok_or_else(|| anyhow!("{} resolved to no address", context()))?;
+        let stream = TcpStream::connect_timeout(&address, timeout).with_context(context)?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .context("set read timeout")?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .context("set write timeout")?;
+
+        let (socket, _response) =
+            tungstenite::client::client(ws_url, MaybeTlsStream::Plain(stream))
+                .map_err(|error| anyhow!("{}: WebSocket handshake failed: {error}", context()))?;
 
         Ok(socket)
     }

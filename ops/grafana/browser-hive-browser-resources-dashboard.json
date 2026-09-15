@@ -1,0 +1,710 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Browser Hive - Browser Resources",
+  "uid": "browser-hive-browser-resources",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "scope",
+        "label": "Scope",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(browser_hive_worker_total_slots, scope)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "hide": 0
+      },
+      {
+        "name": "pod",
+        "label": "Pod",
+        "description": "The pod label added by Kubernetes scraping. Memory is a per-pod question (the OOM limit is per container): select one pod when reading the by-type panels, which otherwise sum every selected pod. Outside Kubernetes the list is empty and All still matches every series.",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(browser_hive_worker_total_slots{scope=~\"$scope\"}, pod)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Memory (browser processes, PSS)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Browser memory by process type",
+      "description": "PSS of the worker's descendant processes, summed per Chromium process type and stacked. PSS splits shared pages between processes, so the stack adds up to what the browser really costs (summed RSS would overstate it several times). Sums every selected pod - pick one pod to compare against its memory limit. Gaps mean the source could not be read (non-Linux, or before the version that exports it).",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (type) (browser_hive_worker_browser_process_pss_bytes{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Container restarts and OOMKills per pod",
+      "description": "From kube-state-metrics, 5 m windows. restarts: any container restart of the pod. OOMKilled: a restart whose last termination reason is OOMKilled (the reason metric only keeps the latest termination, so two different kills inside one window count once). Empty panel = kube-state-metrics is not scraped by this Prometheus.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* - OOMKilled$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (increase(kube_pod_container_status_restarts_total[5m])) > 0 and on (pod) group by (pod) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - restarts"
+        },
+        {
+          "refId": "B",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) ((increase(kube_pod_container_status_restarts_total[5m]) >= 1) and ignoring (reason) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"}[5m]) == 1)) and on (pod) group by (pod) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - OOMKilled"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory per pod vs. container limit",
+      "description": "Per pod: browser PSS + worker RSS (our gauges), the container working set (cAdvisor - usage minus inactive page cache, the figure Kubernetes reports as container memory), and the memory limit (dashed, kube-state-metrics). A line climbing to the dashed one is the next OOMKill. The last two need cAdvisor and kube-state-metrics scraped by the same Prometheus (kube-prometheus-stack does both); if they are missing only the first line is drawn.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* - limit$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_browser_process_pss_bytes{scope=~\"$scope\", pod=~\"$pod\"}) + sum by (pod) (browser_hive_worker_process_resident_memory_bytes{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - browser PSS + worker RSS"
+        },
+        {
+          "refId": "B",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (container_memory_working_set_bytes{container!=\"\", container!=\"POD\", image!=\"\"}) and on (pod) group by (pod) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - container working set"
+        },
+        {
+          "refId": "C",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (kube_pod_container_resource_limits{resource=\"memory\"}) and on (pod) group by (pod) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - limit"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Largest single process by type",
+      "description": "PSS of the biggest process of each type across the selected pods. Together with the process count it separates one bloated renderer (high max, few processes) from many small ones (low max, many processes - out-of-process iframes).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "max by (type) (browser_hive_worker_browser_process_max_pss_bytes{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Browser processes by type",
+      "description": "Process count per Chromium process type, summed over the selected pods. Renderers far above the number of tabs point at site isolation (a renderer per framed third-party site).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (type) (browser_hive_worker_browser_processes{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Browser main processes per pod",
+      "description": "Processes without a Chromium --type flag. A healthy pod has exactly 1; above 1 is a browser process that was never reaped (for example one a pool recreation replaced) and still holds its memory.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "lineWidth": 2,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_browser_processes{scope=~\"$scope\", pod=~\"$pod\", type=\"browser\"})",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "CDP targets and contexts",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Targets by type",
+      "description": "CDP targets the browser reports (Target.getTargets), stacked. A cross-site iframe is an iframe target; page includes the browser's initial blank tab; browser_ui is the browser's own internal pages. Gaps mean the target probe failed or ran past its 3 s budget.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (type) (browser_hive_worker_browser_targets{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Out-of-process iframes per page",
+      "description": "iframe targets / page targets per pod. High values mean pages frame many third-party sites, each in its own renderer under site isolation - the memory then comes from what pages embed, not from tab age.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_browser_targets{scope=~\"$scope\", pod=~\"$pod\", type=\"iframe\"}) / clamp_min(sum by (pod) (browser_hive_worker_browser_targets{scope=~\"$scope\", pod=~\"$pod\", type=\"page\"}), 1)",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Browser contexts: in the browser vs. not in the pool",
+      "description": "CDP browser contexts that exist in the browser (default context excluded), and how many of them the pool no longer holds (browser_contexts - total_contexts). A growing 'not in pool' line is contexts left behind after removal or recycling. Meaningful for isolated scopes only - a shared scope creates no CDP contexts of its own.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_browser_contexts{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - in browser"
+        },
+        {
+          "refId": "B",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_browser_contexts{scope=~\"$scope\", pod=~\"$pod\"}) - sum by (pod) (browser_hive_worker_total_contexts{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - not in pool"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Worker process",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker RSS per pod",
+      "description": "Resident memory of the worker process itself, the browser excluded. Steady growth with uptime is a leak in the worker (the headless_chrome per-tab leak looked like this).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_process_resident_memory_bytes{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker threads per pod",
+      "description": "Threads of the worker process. A count that keeps rising with uptime means threads that never exit (headless_chrome kept one event thread per closed tab before the fork pin).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (browser_hive_worker_process_threads{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    }
+  ]
+}

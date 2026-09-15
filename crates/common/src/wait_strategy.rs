@@ -203,8 +203,8 @@ pub trait WaitStrategy: Send + Sync {
 /// This is the default strategy. Phase 1 waits on `Tab::wait_until_navigated`, which in
 /// headless_chrome does **not** wait for page load: it blocks on a `navigating` flag that the
 /// `init` page-lifecycle event sets and the **`networkAlmostIdle`** one clears (verified in
-/// headless_chrome 1.0.18, the pinned version, and 1.0.22, the newest published one — that code
-/// is identical in both). Chromium fires `networkAlmostIdle` when **at most 2** network requests
+/// headless_chrome 1.0.18 and 1.0.22 — that code is identical in both; the workspace pins a fork
+/// of 1.0.22 whose changes do not touch it). Chromium fires `networkAlmostIdle` when **at most 2** network requests
 /// have been in flight for ~500ms: the same condition Puppeteer exposes as `networkidle2`, not
 /// `networkidle0`.
 ///

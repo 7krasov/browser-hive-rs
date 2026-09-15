@@ -182,6 +182,104 @@ The **documentation half is done** (2026-09-09): CLAUDE.md, SESSION_MODES.md, th
 (`common/src/config.rs`) all now say the threshold is inert and that `Hybrid` effectively ORs
 three predicates. What is left here is the code decision — one of the three options above.
 
+## `headless_chrome` is pinned to a fork commit
+
+**Status**: open until upstream PR rust-headless-chrome#568 is released (raised 2026-09-15)
+
+The workspace `Cargo.toml` takes `headless_chrome` from `tungs0ul/rust-headless-chrome` at rev
+`a321dae1`, which is upstream **1.0.22 plus exactly the three commits of #568** (verified with the
+GitHub compare API: ahead 3, behind 0). A rev rather than a branch, so the code cannot change under us.
+
+**Why.** In every published version up to 1.0.22:
+- a tab's session listener is never removed from the transport, so after the tab is closed its event
+  thread blocks on `recv()` for the browser's lifetime and keeps all of the tab's state reachable —
+  one thread and one tab's state per tab ever opened, which in `always_new` is one per request;
+- the tab's `received_event_params` map keeps the params of every `Network.responseReceived` —
+  every sub-resource, headers included — and is never pruned. The response observer enables
+  `Network` on every request, so a `reusable` tab accumulates this for its whole life;
+- a late response to a call that already timed out, or a send to a listener whose thread has ended,
+  breaks the transport's message loop — which the pool can only see as a dead browser.
+
+#568 fixes all three (`Drop for Tab` unregisters the listener, the map is pruned on
+`loadingFinished`/`loadingFailed`, timed-out calls are unregistered).
+
+**Measured before the switch** (downstream production, 1.0.18): the `worker` process grew ~20 MiB/h
+on one `reusable` pod and 84 → 175 MiB between minute 14 and minute 31 on a busy one. Not what
+triggers the OOMKills — renderer processes are — but unbounded. Re-measure after deploying.
+
+**What else came with 1.0.18 → 1.0.22**, for tracing a regression: a regenerated CDP protocol (new
+optional fields in `Network.enable` and `Target.createTarget`, set to `None` here, so the requests on
+the wire are unchanged); `wait_for_initial_tab` waits 20 s instead of 10 s (not called here);
+`tungstenite` 0.29, which our own pin followed.
+
+**Costs of the pin**: the fork can disappear — clean builds would then fail loudly; mirror the same
+rev under our own account if that happens. A crate with a git dependency cannot be published to
+crates.io.
+
+**To close**: once a release contains #568, switch back to the version from crates.io, keep
+`tungstenite` on the version it resolves (see the comment in `Cargo.toml`), and remove this item.
+
+## Worker OOMKills are driven by renderer processes
+
+**Status**: investigating (raised 2026-09-15)
+
+A busy downstream `reusable` scope (2 GiB limit, `max_contexts = 2`, Brave headless, isolated
+contexts) is OOMKilled repeatedly — one container lived 6 m 44 s. PSS snapshots of one pod:
+
+| container age | renderers | renderer PSS | `worker` RSS | `worker` threads |
+|---|---:|---:|---:|---:|
+| ~3.5 min | 21 | ~1.47 GiB (the two tab renderers: 511 + 418 MiB) | — | 11 |
+| 14 min | 15 | 898 MiB | 83 MiB | 12 |
+| 31 min | 28 | 1.18 GiB | 171 MiB | 14 |
+
+A tab's renderer reaches 400–500 MiB within 2–3 minutes, so the memory is not a slow growth with
+tab age, and neither `max_lifetime` nor a per-tab rotation can be the main fix. A lower
+`WORKER_MAX_LIFETIME` did not prevent the kills.
+
+**Leading hypothesis, unconfirmed**: out-of-process iframes. Headless keeps site isolation on
+(`--disable-features=IsolateOrigins,site-per-process` is added only in headful), so every
+third-party site framed by a page gets its own renderer; `renderer-client-id` reached ~143 within
+3.5 minutes of browser start. Manual confirmation failed: the image has no `curl`, and a raw
+`/json/list` request over `/dev/tcp` returned 0 bytes.
+
+Plan, in order:
+1. **Deploy the browser resource gauges and read them** (implemented, not yet deployed; see
+   METRICS.md, "Browser resources"): processes and PSS per Chromium process type, CDP targets per
+   type, browser contexts, the worker's own RSS and threads. Also confirm there that the first
+   production deploy exposes them: `/proc` readable by the worker, and the target probe connecting.
+   The `iframe` target type has only been verified against a local Chrome, not Brave.
+2. Confirm or reject the iframe hypothesis from those numbers. If confirmed, the options are:
+   blocking third-party hosts (`BlockedUrlsMiddleware`), turning site isolation off (a
+   memory-vs-stealth trade-off — measure the block rate), fewer contexts per pod, or a larger limit.
+3. Dispose of empty CDP contexts (the item below). It is suspected of growing NetworkService, not
+   confirmed; the browser-context gauge from step 1 decides it.
+4. Per-tab rotation (close and reopen the tab inside the same CDP context every N requests) is
+   deprioritised by the data above; revisit only if renderer PSS still grows with tab age once the
+   fast part is explained.
+
+Also seen, unexplained: an almost idle `always_new` pod held 0.3 → 1.4 CPU cores for hours, which
+dropped on restart. On the busy pod, gpu-process (swiftshader software rendering) showed 21 % CPU.
+The target gauges from step 1 are the first thing to check there.
+
+## Shutdown does not drain in-flight requests
+
+**Status**: open, agreed, not started (raised 2026-09-15)
+
+- `shutdown_signal` (`worker/src/lib.rs`) cancels the token **before** waiting, so SIGTERM aborts
+  in-flight requests with `TERMINATING`. The coordinator retries those only with ≥ 10 s of
+  deadline left, from scratch.
+- During a `preStop` sleep the worker still reports itself healthy (`health_check` is
+  `is_ready && !cancelled`, and SIGTERM arrives only after preStop), so the coordinator keeps
+  routing new requests to a pod that is about to cancel them.
+- Between the gRPC server closing and the next health round, connects fail as
+  `WORKER_UNREACHABLE`, which is not retried.
+
+Proposed order on SIGTERM: report unhealthy → wait at least one coordinator health round → wait
+for in-flight requests with a bound → cancel what remains → exit. The bound must be configurable
+and fit inside `terminationGracePeriodSeconds`; `GRPC_REQUEST_TIMEOUT` is 320 s, so it cannot
+simply wait for the longest possible request. Today this costs requests on every rollout, KEDA
+scale-down and spot preemption. A separate change from the memory work.
+
 ## Empty CDP BrowserContexts are never disposed
 
 **Status**: residue of the tab-leak fix; needs an upstream change (raised 2026-07-27)

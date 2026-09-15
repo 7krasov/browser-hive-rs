@@ -44,10 +44,10 @@
         "label": "WORKER_MAX_CONTEXTS",
         "description": "Per-worker capacity (contexts = concurrent requests per pod) of the selected scope. Only meaningful with a SINGLE scope selected \u2014 it feeds the 'Recommended maxReplicas' panel (peak load / this value). Set it to the scope's WORKER_MAX_CONTEXTS config value.",
         "type": "textbox",
-        "query": "3",
+        "query": "2",
         "current": {
-          "text": "3",
-          "value": "3"
+          "text": "2",
+          "value": "2"
         },
         "hide": 0
       }

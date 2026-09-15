@@ -12,7 +12,7 @@ observed daily peak.
 ### Variables
 
 - **Scope** - multi-select, populated from `label_values(browser_hive_worker_total_slots, scope)`. Defaults to `All`.
-- **WORKER_MAX_CONTEXTS** - the per-worker context count for the selected scope (default `3`).
+- **WORKER_MAX_CONTEXTS** - the per-worker context count for the selected scope (default `2`).
   Used only by the "Recommended maxReplicas" stat. If scopes run different values, filter
   to one scope at a time and set this to match.
 
@@ -90,5 +90,61 @@ pattern fall into an unnamed series. Headful workers consume significantly more 
 so the per-mode worker counts (and the capacity/slots panel) drive node pool sizing. Note
 that hl and hf run different `WORKER_MAX_CONTEXTS`, so worker counts and slot capacity
 differ per mode - the dashboard shows both.
+
+## `browser-hive-browser-resources-dashboard.json` - Browser Resources
+
+Per-pod view of what the browser is made of: memory and process count per Chromium process
+type, CDP targets and browser contexts, and the worker process's own RSS and threads. Its
+purpose is diagnosing OOMKills without `kubectl exec`. Metric semantics are in the "Browser
+resources" section of METRICS.md.
+
+### Variables
+
+- **Scope** - as in the other dashboards.
+- **Pod** - read from the `pod` label that Kubernetes scraping adds. The OOM limit is per
+  container, so **select a single pod** when reading the by-type panels, which otherwise sum
+  every selected pod. Outside Kubernetes the list is empty and `All` still matches everything.
+
+### Reading it
+
+- **Browser memory by process type** - where a pod's memory goes. PSS, so the stack adds up.
+- **Container restarts and OOMKills per pod** - when a pod died and whether memory killed it.
+- **Memory per pod vs. container limit** - browser PSS plus worker RSS, the container working
+  set, and the memory limit as a dashed line. A line climbing to the dashed one is the next
+  OOMKill.
+- **Largest single process** together with **Browser processes by type** - one bloated
+  renderer (high max, few processes) vs. many small ones (low max, many processes).
+- **Out-of-process iframes per page** - high values mean the memory comes from what pages
+  embed (a renderer per framed third-party site), not from tab age.
+- **Browser main processes per pod** - above 1 is a browser process that was never reaped.
+- **Browser contexts: not in the pool** - contexts the browser still holds after the pool
+  let them go; meaningful for isolated scopes only.
+- **Worker RSS / threads** - growth with uptime is a leak in the worker process itself.
+
+Gaps mean a source could not be read: a worker version without these gauges, a non-Linux
+host (process gauges), or a target probe that failed or ran past its 3 s budget.
+
+### Kubernetes metrics (limit, working set, OOMKills)
+
+Two panels also read standard Kubernetes metrics that Browser Hive does not export. They must
+be scraped by the **same Prometheus** as the workers; kube-prometheus-stack does both by
+default.
+
+| Series | Source |
+|---|---|
+| `container_memory_working_set_bytes` | cAdvisor (kubelet) |
+| `kube_pod_container_resource_limits{resource="memory"}` | kube-state-metrics v2 |
+| `kube_pod_container_status_restarts_total` | kube-state-metrics |
+| `kube_pod_container_status_last_terminated_reason` | kube-state-metrics |
+
+The limit comes from kube-state-metrics rather than cAdvisor's `container_spec_memory_limit_bytes`,
+because kube-prometheus-stack drops `container_spec_*` by default. Every such query is
+restricted to worker pods with `and on (pod)` against `browser_hive_worker_total_slots`, so the
+selection follows the Scope and Pod variables and never pulls in the rest of the cluster.
+
+If those series are missing, the panels show only the Browser Hive lines, or nothing. To
+check, run each metric name above in Grafana Explore. Cloud-provider system metrics (for
+example GKE's `kubernetes.io/container/memory/limit_bytes` in Cloud Monitoring) live in a
+different backend and cannot be combined with these PromQL queries.
 
 See [../../METRICS.md](../../METRICS.md) for metric semantics, sizing math, and KEDA guidance.
