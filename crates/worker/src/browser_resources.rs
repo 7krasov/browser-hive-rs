@@ -166,14 +166,20 @@ fn descendants(root: u32, parents: &[(u32, u32)]) -> Vec<u32> {
     found
 }
 
-/// Map a NUL-separated command line to a value of [`PROCESS_TYPES`].
+/// Map a `/proc/<pid>/cmdline` to a value of [`PROCESS_TYPES`].
 ///
 /// Chromium marks every child with `--type=`; the main process is the one without it (a wrapper
 /// script that does not `exec` would be counted as `browser` as well). Utility processes are told
 /// apart by `--utility-sub-type=`, of which only the two that hold real memory get their own label.
+///
+/// Arguments are split on NUL **and** whitespace: on Linux Chromium rewrites its process title,
+/// after which `cmdline` is one space-joined string instead of NUL-separated arguments. Splitting on
+/// NUL alone classified every process of a production pod as `browser`. A flag value containing
+/// spaces (a user agent) is split too, which is harmless: only whole `--type=`-style tokens match.
 fn classify_process(cmdline: &[u8]) -> &'static str {
     let args: Vec<&str> = cmdline
-        .split(|&byte| byte == 0)
+        .split(|&byte| byte == 0 || byte.is_ascii_whitespace())
+        .filter(|arg| !arg.is_empty())
         .filter_map(|arg| std::str::from_utf8(arg).ok())
         .collect();
     let value_of = |flag: &str| args.iter().find_map(|arg| arg.strip_prefix(flag));
@@ -219,7 +225,7 @@ fn classify_target(target_type: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-fn count_target_types(types: &[String]) -> HashMap<&'static str, u64> {
+fn count_target_types<'a>(types: impl IntoIterator<Item = &'a str>) -> HashMap<&'static str, u64> {
     let mut counts = HashMap::new();
     for target_type in types {
         *counts.entry(classify_target(target_type)).or_default() += 1;
@@ -256,7 +262,12 @@ impl BrowserTargetProbe {
         };
 
         Ok(TargetSnapshot {
-            targets: count_target_types(&client.target_types()?),
+            targets: count_target_types(
+                client
+                    .targets()?
+                    .iter()
+                    .map(|target| target.target_type.as_str()),
+            ),
             contexts: client.browser_context_count()? as u64,
         })
     }
@@ -334,6 +345,28 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_process_titles_are_classified_too() {
+        // After Chromium rewrites its title, cmdline is one space-joined, NUL-terminated string.
+        let title = |args: &str| format!("{args}\0").into_bytes();
+        assert_eq!(
+            classify_process(&title(
+                "/opt/brave/brave --type=renderer --user-agent=Mozilla/5.0 (X11; Linux x86_64) --lang=en"
+            )),
+            "renderer"
+        );
+        assert_eq!(
+            classify_process(&title(
+                "/opt/brave/brave --type=utility --utility-sub-type=network.mojom.NetworkService"
+            )),
+            "network"
+        );
+        assert_eq!(
+            classify_process(&title("/opt/brave/brave --headless --no-sandbox")),
+            "browser"
+        );
+    }
+
+    #[test]
     fn status_numbers_are_parsed_by_field() {
         let status = "Name:\tworker\nVmRSS:\t   84704 kB\nThreads:\t12\n";
         assert_eq!(
@@ -350,10 +383,7 @@ mod tests {
 
     #[test]
     fn unknown_target_types_collapse_to_other() {
-        let types: Vec<String> = ["page", "iframe", "iframe", "webview", "auction_worklet"]
-            .map(String::from)
-            .into();
-        let counts = count_target_types(&types);
+        let counts = count_target_types(["page", "iframe", "iframe", "webview", "auction_worklet"]);
         assert_eq!(counts.get("page"), Some(&1));
         assert_eq!(counts.get("iframe"), Some(&2));
         assert_eq!(counts.get("other"), Some(&2));

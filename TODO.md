@@ -207,6 +207,10 @@ GitHub compare API: ahead 3, behind 0). A rev rather than a branch, so the code 
 on one `reusable` pod and 84 → 175 MiB between minute 14 and minute 31 on a busy one. Not what
 triggers the OOMKills — renderer processes are — but unbounded. Re-measure after deploying.
 
+**Measured after the switch** (2026-09-15, same busy scope): 12 → 22–33 MiB after ~1 h, against
+83 → 171 MiB at minutes 14–31 before. Still rising in small steps; the busy scope's pods do not live
+long enough (OOMKills) to show whether it levels off, so read a quieter scope over 12 h+.
+
 **What else came with 1.0.18 → 1.0.22**, for tracing a regression: a regenerated CDP protocol (new
 optional fields in `Network.enable` and `Target.createTarget`, set to `None` here, so the requests on
 the wire are unchanged); `wait_for_initial_tab` waits 20 s instead of 10 s (not called here);
@@ -248,6 +252,14 @@ Plan, in order:
    type, browser contexts, the worker's own RSS and threads. Also confirm there that the first
    production deploy exposes them: `/proc` readable by the worker, and the target probe connecting.
    The `iframe` target type has only been verified against a local Chrome, not Brave.
+   **Deployed 2026-09-15**: `/proc` and the target probe work in production, but every process was
+   classified as `browser` (Chromium rewrites its process title, so `cmdline` is space-joined, not
+   NUL-separated). Fixed in `classify_process`; the per-type process gauges need a redeploy.
+   First target readings (busy `reusable` scope, 8 pods): ~37 processes, ~3.4 `page`, ~4 `iframe`,
+   ~3 `worker` targets per pod on average; browser contexts go 2 → 4 when lifecycle recycling runs.
+   An `always_new` scope showed 0 `iframe` targets, which is **not** evidence of no iframes: the
+   gauge is read once per scrape, and a frame lives only while its request runs (locally ~1.5 s).
+   `browser_hive_worker_iframes_total` (the item below) counts them.
 2. Confirm or reject the iframe hypothesis from those numbers. If confirmed, the options are:
    blocking third-party hosts (`BlockedUrlsMiddleware`), turning site isolation off (a
    memory-vs-stealth trade-off — measure the block rate), fewer contexts per pod, or a larger limit.
@@ -260,6 +272,68 @@ Plan, in order:
 Also seen, unexplained: an almost idle `always_new` pod held 0.3 → 1.4 CPU cores for hours, which
 dropped on restart. On the busy pod, gpu-process (swiftshader software rendering) showed 21 % CPU.
 The target gauges from step 1 are the first thing to check there.
+
+## Third-party request and iframe metrics
+
+**Status**: implemented 2026-09-15, not deployed. What the metrics count, the label rules and the
+decisions (full hosts, requested-host attribution, keeping `page_site` under a cap) are in the
+"Third-party hosts and iframes" section of METRICS.md.
+
+Goal: find the hosts worth adding to `BlockedUrlsMiddleware` and rank them.
+
+**Verified locally** (Chrome, macOS, headless, HTTP, no proxy, base worker):
+- A cross-site sub-resource of the main page was counted. A same-site one and one inside a
+  cross-site iframe were not.
+- Iframes, nested ones included, were attributed to the requested site. After an off-domain
+  redirect, both loads and frames stayed on the requested host.
+- Redirect side effect: the redirect target's own resources, and its `favicon.ico`, count as third
+  party. Accepted by the user (2026-09-15): the host still appears under the requested site, so the
+  noise is readable.
+- **The agreed 5 s sampling interval counted 0 of 8 frames**, in `always_new` and in `reusable`: a
+  frame lives only while its page is loaded, about 1.5 s here. At 1 s it counted 8 of 8. The
+  interval is now 1 s (confirmed by the user, 2026-09-15).
+
+**Open.**
+- **After the deploy**, compare `prometheus_tsdb_head_series` with the reading before it. On
+  2026-09-15 it was 1.26 M, with a 2.6–4.7 M sawtooth earlier that day before Prometheus moved
+  pods. Lower `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` (default 2000) if the growth is too much.
+- **Not verified end to end**: the blocked counter (the base worker has no list; unit-tested only),
+  Linux, Brave, HTTPS, a proxy.
+- **Frames shorter than 1 s are still missed.** The exact alternative is event-driven:
+  `Target.setDiscoverTargets` on a dedicated socket, reading `targetCreated` /
+  `targetInfoChanged`. It needs an event-reading client, which `browser_cdp.rs` is not (invariant
+  5). Not done.
+- **Deferred**: memory per requested site. No way was found to map a tab to its renderer process.
+  When revisited, the user wants metrics, with the same cardinality problem at 800 sites.
+
+## `BlockedUrlsMiddleware` cannot block iframes
+
+**Status**: open, decision pending (raised 2026-09-15)
+
+Measured locally against Chrome and Brave on macOS, headless, over plain HTTP with no proxy. The
+page loaded one cross-site iframe that nested two more, and the list blocked one host. Server hits
+were checked, not only the CDP events.
+
+| | site isolation on (headless default) | site isolation off |
+|---|---|---|
+| sub-resource of the main page on a blocked host | blocked | blocked |
+| iframe **document** on a blocked host, at any depth | **loaded** | **loaded** |
+| sub-resource inside a cross-site iframe | **loaded**, invisible to the page session | blocked, visible |
+| `Network.requestWillBeSent` on the page session | only the main page's direct child frames | every frame, nested included |
+| `iframe` targets from `Target.getTargets` | every cross-site frame, nested included | none (frames run in-process) |
+
+Consequences:
+- The list cannot reduce renderer processes, which is what the OOMKills are made of.
+- An iframe-host metric fed from page-session events misses every frame nested inside a
+  cross-site frame.
+
+Candidates, all unverified:
+- Turn site isolation off in headless (headful already does).
+- `Fetch` interception of `Document` requests, which must coexist with the `Fetch` handler
+  `tab.authenticate` installs.
+- `Target.setAutoAttach` to reach the child frames' sessions.
+
+Not yet checked on Linux, over HTTPS, or through a proxy.
 
 ## Shutdown does not drain in-flight requests
 

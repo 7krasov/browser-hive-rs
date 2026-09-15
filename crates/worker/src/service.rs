@@ -1292,6 +1292,17 @@ impl WorkerService {
         let proxy_failure_holder: Arc<std::sync::Mutex<ProxyFailures>> =
             Arc::new(std::sync::Mutex::new(ProxyFailures::default()));
         let blocked_url_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Third-party host metrics attribute everything to the host the client requested, even
+        // after a redirect, so a site stays joinable with the client's own source list. The
+        // context remembers it for the iframe sampler (see `third_party.rs`).
+        let requested_site = crate::third_party::host_of(&req.url)
+            .unwrap_or_else(|| crate::third_party::UNKNOWN_SITE.to_string());
+        if let Ok(mut site) = context.site.lock() {
+            *site = Some(requested_site.clone());
+        }
+        let third_party_loads = Arc::new(std::sync::Mutex::new(
+            self.metrics.third_party.request_loads(requested_site),
+        ));
         let _header_capture_guard: Option<EventListenerGuard> = {
             use headless_chrome::protocol::cdp::types::Event;
             use headless_chrome::protocol::cdp::Network;
@@ -1315,9 +1326,24 @@ impl WorkerService {
                     let holder = main_response_holder.clone();
                     let proxy_holder = proxy_failure_holder.clone();
                     let blocked_counter = blocked_url_counter.clone();
+                    let loads = third_party_loads.clone();
                     let listener: Arc<
                         dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync,
                     > = Arc::new(move |event: &Event| {
+                        if let Event::NetworkRequestWillBeSent(ev) = event {
+                            if let Ok(mut loads) = loads.lock() {
+                                loads.will_be_sent(
+                                    &ev.params.request_id,
+                                    &ev.params.request.url,
+                                    matches!(ev.params.Type, Some(Network::ResourceType::Document)),
+                                );
+                            }
+                        }
+                        if let Event::NetworkLoadingFinished(ev) = event {
+                            if let Ok(mut loads) = loads.lock() {
+                                loads.finished(&ev.params.request_id);
+                            }
+                        }
                         if let Event::NetworkLoadingFailed(ev) = event {
                             if is_proxy_error(&ev.params.error_text) {
                                 proxy_holder.lock().unwrap().record(format!(
@@ -1327,11 +1353,15 @@ impl WorkerService {
                             }
                             // `inspector` is the reason CDP reports for a load dropped by
                             // `Network.setBlockedURLs` — i.e. by our own list, never by the site.
-                            if matches!(
+                            let blocked_by_list = matches!(
                                 ev.params.blocked_reason,
                                 Some(Network::BlockedReason::Inspector)
-                            ) {
+                            );
+                            if blocked_by_list {
                                 blocked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Ok(mut loads) = loads.lock() {
+                                loads.failed(&ev.params.request_id, blocked_by_list);
                             }
                         }
                         if let Event::NetworkResponseReceived(ev) = event {
@@ -2417,6 +2447,7 @@ mod tests {
             tab: Arc::new(tokio::sync::Mutex::new(None)),
             cdp_context_id: None,
             proxy_host: None,
+            site: Default::default(),
         })
     }
 

@@ -4,6 +4,7 @@ mod browser_resources;
 mod diagnostics;
 mod metrics;
 mod service;
+mod third_party;
 
 pub mod providers;
 
@@ -128,6 +129,18 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     let active_requests = worker_service.active_requests();
     let is_ready = worker_service.is_ready_flag();
     let browser_pool = worker_service.browser_pool_handle();
+
+    // Iframe hosts are sampled from the browser's target list, not collected on scrape: a frame
+    // counted once must be remembered between samples, and frames shorter than a scrape interval
+    // would be missed. See `third_party.rs`.
+    tokio::spawn(
+        third_party::run_iframe_sampler(metrics.third_party.clone(), browser_pool.clone())
+            .instrument(tracing::info_span!(
+                "iframe_sampler",
+                scope = %config.scope.name,
+                ray_id = "iframe-sampler",
+            )),
+    );
 
     // Start metrics HTTP server in background
     let metrics_port = 9090;

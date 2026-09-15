@@ -1,5 +1,6 @@
 use crate::browser_pool::BrowserPool;
 use crate::browser_resources::{self, BrowserTargetProbe, PROCESS_TYPES, TARGET_TYPES};
+use crate::third_party::{self, ThirdPartyMetrics};
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -44,6 +45,8 @@ pub struct Metrics {
     browser_contexts: IntGaugeVec,
     process_resident_memory_bytes: IntGaugeVec,
     process_threads: IntGaugeVec,
+    /// Third-party hosts and iframes of scraped pages; see `third_party.rs`.
+    pub third_party: Arc<ThirdPartyMetrics>,
     target_probe: Arc<BrowserTargetProbe>,
     scope_name: String,
 }
@@ -194,6 +197,16 @@ impl Metrics {
             &["scope"],
         )?;
 
+        let max_series = third_party::max_series_from_env();
+        tracing::info!(
+            "Third-party host metrics: at most {max_series} label combinations per metric \
+             ({})",
+            third_party::MAX_SERIES_ENV
+        );
+        let third_party = Arc::new(ThirdPartyMetrics::register(
+            &registry, scope_name, max_series,
+        )?);
+
         // Initialize all metrics with scope label so they are exposed immediately
         total_contexts.with_label_values(&[scope_name]).set(0);
         active_contexts.with_label_values(&[scope_name]).set(0);
@@ -221,6 +234,7 @@ impl Metrics {
             browser_contexts,
             process_resident_memory_bytes,
             process_threads,
+            third_party,
             target_probe: Arc::new(BrowserTargetProbe::default()),
             scope_name: scope_name.to_string(),
         })

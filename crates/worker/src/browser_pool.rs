@@ -198,6 +198,12 @@ pub struct BrowserContext {
     /// context. This field records the host that ends up carrying the traffic either way, so a
     /// log line can name it without the reader having to know which of the two applies.
     pub proxy_host: Option<String>,
+    /// Host of the URL the last request served here asked for, or `None` before the first one.
+    ///
+    /// The tab keeps that page loaded after the request, so its iframes still belong to this site
+    /// until the next request. Read by the iframe sampler to attribute a frame target, which
+    /// carries only its browser context id, to a site (see `third_party.rs`).
+    pub site: std::sync::Mutex<Option<String>>,
 }
 
 impl BrowserPool {
@@ -687,6 +693,7 @@ impl BrowserPool {
             tab: Arc::new(Mutex::new(Some(new_tab))),
             cdp_context_id,
             proxy_host,
+            site: Default::default(),
         })
     }
 
@@ -995,6 +1002,7 @@ impl BrowserPool {
                             tab: Arc::new(Mutex::new(tab)),
                             cdp_context_id,
                             proxy_host,
+                            site: Default::default(),
                         };
 
                         contexts_guard[*idx] = Arc::new(new_context);
@@ -1365,6 +1373,22 @@ impl BrowserPool {
         self.browser.clone()
     }
 
+    /// [`BrowserContext::site`] of every context that owns a CDP BrowserContext, keyed by its id.
+    ///
+    /// Contexts of a `shared` scope all live in the browser's default context, where a frame
+    /// cannot be told apart by context, so they are left out and their frames count as unknown.
+    pub async fn sites_by_cdp_context(&self) -> std::collections::HashMap<String, String> {
+        self.contexts
+            .read()
+            .await
+            .iter()
+            .filter_map(|context| {
+                let site = context.site.lock().ok()?.clone()?;
+                Some((context.cdp_context_id.clone()?, site))
+            })
+            .collect()
+    }
+
     pub fn get_proxy_config(&self) -> &ProxyConfig {
         &self.proxy_config
     }
@@ -1512,6 +1536,7 @@ mod tests {
             tab: Arc::new(Mutex::new(None)),
             cdp_context_id: None,
             proxy_host: None,
+            site: Default::default(),
         })
     }
 

@@ -15,9 +15,10 @@
 //! Brave 150 before this was written.
 //!
 //! The metrics endpoint opens a client of its own for read-only introspection
-//! (`Target.getTargets`, `Target.getBrowserContexts`, see `browser_resources.rs`). Those calls
-//! create nothing and enable nothing, so the rules below hold for it unchanged; it is a separate
-//! socket so that a scrape waiting on a wedged browser never holds the lock context creation needs.
+//! (`Target.getTargets`, `Target.getBrowserContexts`, see `browser_resources.rs`), and the iframe
+//! sampler another (`Target.getTargets`, see `third_party.rs`). Those calls create nothing and
+//! enable nothing, so the rules below hold for them unchanged; they are separate sockets so that a
+//! scrape waiting on a wedged browser never holds the lock context creation needs.
 //!
 //! # Invariants
 //!
@@ -65,6 +66,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAMES_PER_CALL: usize = 512;
 
 type BrowserSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// The fields of a CDP `Target.TargetInfo` the metrics read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetInfo {
+    pub target_id: String,
+    pub target_type: String,
+    pub url: String,
+    pub browser_context_id: Option<String>,
+}
 
 pub struct BrowserCdpClient {
     ws_url: String,
@@ -123,25 +133,30 @@ impl BrowserCdpClient {
             .ok_or_else(|| anyhow!("createBrowserContext returned no browserContextId"))
     }
 
-    /// The `type` of every target the browser reports, one entry per target.
+    /// Every target the browser reports.
     ///
     /// Read-only: `Target.getTargets` attaches to nothing and needs no `Target.setDiscoverTargets`
     /// on this socket. With no filter the browser applies its default one, which leaves out the
     /// `browser` and `tab` targets.
-    pub fn target_types(&self) -> Result<Vec<String>> {
+    pub fn targets(&self) -> Result<Vec<TargetInfo>> {
         let response = self.call("Target.getTargets", serde_json::json!({}))?;
 
         let infos = response
             .pointer("/result/targetInfos")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| anyhow!("getTargets returned no targetInfos"))?;
+        let field = |info: &serde_json::Value, name: &str| {
+            info.get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
         Ok(infos
             .iter()
-            .map(|info| {
-                info.get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
+            .map(|info| TargetInfo {
+                target_id: field(info, "targetId").unwrap_or_default(),
+                target_type: field(info, "type").unwrap_or_default(),
+                url: field(info, "url").unwrap_or_default(),
+                browser_context_id: field(info, "browserContextId"),
             })
             .collect())
     }

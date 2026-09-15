@@ -120,20 +120,30 @@ resources" section of METRICS.md.
 - **Browser contexts: not in the pool** - contexts the browser still holds after the pool
   let them go; meaningful for isolated scopes only.
 - **Worker RSS / threads** - growth with uptime is a leak in the worker process itself.
+- **CPU per pod vs. container request and limit** - usage climbing on an almost idle pod is the
+  browser burning CPU on its own; usage pinned at the limit is throttling.
+- **Third-party hosts row** - top 100 tables over the dashboard range, for choosing block list
+  patterns: iframes, loads that went out, and loads the list blocked. Each comes by host (summed
+  over sites) and by site and host. A host still high in the loads table is not matched by any
+  pattern; a row with `page_site="other"` means a worker reached its cap on label combinations.
+  Loads inside a cross-site iframe are not counted, and the list does not block iframes. See the
+  "Third-party hosts and iframes" section of METRICS.md.
 
 Gaps mean a source could not be read: a worker version without these gauges, a non-Linux
 host (process gauges), or a target probe that failed or ran past its 3 s budget.
 
 ### Kubernetes metrics (limit, working set, OOMKills)
 
-Two panels also read standard Kubernetes metrics that Browser Hive does not export. They must
+Three panels also read standard Kubernetes metrics that Browser Hive does not export. They must
 be scraped by the **same Prometheus** as the workers; kube-prometheus-stack does both by
 default.
 
 | Series | Source |
 |---|---|
 | `container_memory_working_set_bytes` | cAdvisor (kubelet) |
-| `kube_pod_container_resource_limits{resource="memory"}` | kube-state-metrics v2 |
+| `container_cpu_usage_seconds_total` | cAdvisor (kubelet) |
+| `kube_pod_container_resource_limits{resource="memory"}`, `{resource="cpu"}` | kube-state-metrics v2 |
+| `kube_pod_container_resource_requests{resource="cpu"}` | kube-state-metrics v2 |
 | `kube_pod_container_status_restarts_total` | kube-state-metrics |
 | `kube_pod_container_status_last_terminated_reason` | kube-state-metrics |
 
@@ -141,6 +151,10 @@ The limit comes from kube-state-metrics rather than cAdvisor's `container_spec_m
 because kube-prometheus-stack drops `container_spec_*` by default. Every such query is
 restricted to worker pods with `and on (pod)` against `browser_hive_worker_total_slots`, so the
 selection follows the Scope and Pod variables and never pulls in the rest of the cluster.
+
+After a container restart cAdvisor exports the dead container next to the new one for a few
+minutes, under the same `pod` and `container`. The working-set query therefore takes the
+`max` per container before summing per pod — a plain sum drew spikes far above the limit.
 
 If those series are missing, the panels show only the Browser Hive lines, or nothing. To
 check, run each metric name above in Grafana Explore. Cloud-provider system metrics (for

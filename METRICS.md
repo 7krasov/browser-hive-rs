@@ -30,6 +30,9 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_browser_contexts` | Gauge | CDP browser contexts that exist in the browser, the default context excluded |
 | `browser_hive_worker_process_resident_memory_bytes` | Gauge | RSS of the worker process itself, the browser excluded |
 | `browser_hive_worker_process_threads` | Gauge | Threads of the worker process |
+| `browser_hive_worker_iframes_total{scope, page_site, iframe_host}` | Counter | Cross-site iframes loaded by scraped pages, each frame counted once (see [Third-party hosts](#third-party-hosts-and-iframes)) |
+| `browser_hive_worker_third_party_requests_total{scope, page_site, request_host}` | Counter | Cross-site sub-resource loads that were not blocked |
+| `browser_hive_worker_third_party_requests_blocked_total{scope, page_site, request_host}` | Counter | Loads dropped by the scope's blocked-URL list, any host |
 
 **Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `claimed_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). The browser resource gauges are collected on every scrape too. Counters are incremented in the request path.
 
@@ -69,6 +72,43 @@ browser_hive_worker_browser_targets{type="iframe"} / browser_hive_worker_browser
 # Contexts the browser still holds after the pool let them go (isolated scopes only;
 # a `shared` scope creates no CDP contexts of its own)
 browser_hive_worker_browser_contexts - browser_hive_worker_total_contexts
+```
+
+### Third-party hosts and iframes
+
+Which foreign hosts the scraped pages load, ranked, to choose what `BlockedUrlsMiddleware` should cut. Implementation: `crates/worker/src/third_party.rs`.
+
+**Two sources, because neither sees everything.** With site isolation on (the headless default) a cross-site iframe runs in its own renderer. The page's CDP session neither reports nor blocks anything inside it, and never blocks the frame's own document.
+
+| Metric | Source | Sees | Misses |
+|---|---|---|---|
+| `iframes_total` | a background sampler calls `Target.getTargets` every second over its own browser-level CDP connection | every cross-site frame, nested ones included | frames that live under a second (a frame lives only while its page is loaded); same-site frames |
+| `third_party_requests_total` | the page session's `Network` events (the response observer's listener): `requestWillBeSent`, then `loadingFinished` or a `loadingFailed` not caused by the list | the main page and frames running in its process | everything inside a cross-site iframe; `Document` loads (the page itself, and frame documents, which `iframes_total` counts); loads still pending when the request ends |
+| `third_party_requests_blocked_total` | same listener, `loadingFailed` with `blockedReason: inspector` | loads dropped by the list, any host, same-site included | same as above |
+
+**Labels.**
+- **Hosts are full hosts**, not registrable domains: a block pattern is often written for one subdomain.
+- **Cross-site means the registrable domains differ** (public suffix list; an IP or `localhost` is its own site).
+- **`page_site` is the host the client requested**, even after a redirect to another site, so a site stays joinable with the client's own source list.
+- **An iframe's `page_site`** comes from its target's `browserContextId`: each pool context remembers the host of the last request it served. The tab keeps that page loaded afterwards, so a frame appearing between requests still belongs to it. It is `unknown` when no pool context matches, which includes every frame of a `shared` scope, since all its tabs live in the default context.
+- **A frame is keyed by target id and host**, so a frame that navigates to another host is counted again.
+
+**Cardinality.** Client input feeds both `page_site` and the hosts, so the `(page_site, host)` combinations are capped **per metric, per worker process** by `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` (default 2000). Past the cap a combination is counted as `page_site="other"`, host `"other"`: the total stays correct and only the breakdown is lost. Nothing is evicted, since a counter that disappears and comes back breaks `increase()`.
+- ⚠️ **Worst case is `3 × cap × pods` series**, and every rollout creates the set again under new pod names. A container restart (an OOMKill included) keeps the pod name and adds no series. Series that only exist in the worst case are never created: the real number is the combinations actually seen.
+- **An `other` row in the dashboard tables** means a worker reached the cap. Nothing is logged.
+- Keeping `page_site` over dropping it was a deliberate choice for 300–800 scraped sites, accepting this cost (2026-09-15). Watch `prometheus_tsdb_head_series` after a deploy.
+
+`increase()` misses the first increments of a series that appeared inside the range, so rare hosts are undercounted. The ranking of frequent hosts is unaffected.
+
+```promql
+# Hosts to consider blocking: sub-resource loads over the last day, across all sites
+topk(50, sum by (request_host) (increase(browser_hive_worker_third_party_requests_total{scope="<scope>"}[1d])))
+
+# Iframe hosts, same idea (the block list cannot reach these yet)
+topk(50, sum by (iframe_host) (increase(browser_hive_worker_iframes_total{scope="<scope>"}[1d])))
+
+# How many sites load a host: a host used by one site is cheaper to reason about
+count by (request_host) (sum by (page_site, request_host) (increase(browser_hive_worker_third_party_requests_total{scope="<scope>"}[1d])) > 0)
 ```
 
 **Capacity model**: each worker runs `WORKER_MAX_CONTEXTS` CDP browser contexts (default: 3), one tab per context, and each context processes exactly one request at a time. So the concurrency unit is a **context**, not a worker pod:
