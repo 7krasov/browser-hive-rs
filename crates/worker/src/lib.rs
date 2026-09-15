@@ -1,5 +1,6 @@
 mod browser_cdp;
 mod browser_pool;
+mod browser_resources;
 mod diagnostics;
 mod metrics;
 mod service;

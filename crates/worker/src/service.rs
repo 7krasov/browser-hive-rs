@@ -1300,6 +1300,8 @@ impl WorkerService {
                 max_total_buffer_size: None,
                 max_resource_buffer_size: None,
                 max_post_data_size: None,
+                report_direct_socket_traffic: None,
+                enable_durable_messages: None,
             }) {
                 Err(e) => {
                     debug!(

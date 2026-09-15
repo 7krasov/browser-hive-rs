@@ -25,7 +25,8 @@ pub struct BrowserPool {
 
     /// Browser-level CDP client, present only when the provider assigns proxy hosts per
     /// context. Every other provider keeps using `Browser::new_context()`, so no second
-    /// socket is opened for them.
+    /// socket is opened for them here (the metrics endpoint keeps a connection of its own,
+    /// in every scope, see `browser_resources.rs`).
     ///
     /// Shared with the lifecycle monitor, which recycles contexts and must route them the
     /// same way the request path does.
@@ -73,9 +74,10 @@ fn reclaim_leaked_always_new_contexts(
 
 /// Close a tab inside Chrome after its context has been removed from the pool.
 ///
-/// Removing a context from the pool `Vec` frees nothing browser-side: headless_chrome's `Tab`
-/// and `Context` have no `Drop` impl and the crate never disposes either, so a dropped handle
-/// leaves a live tab — with its renderer, sockets and proxy tunnels — inside Chrome. In
+/// Removing a context from the pool `Vec` frees nothing browser-side: headless_chrome never
+/// closes a target or disposes a context on drop (the pinned fork's `Drop for Tab` releases only
+/// the crate's own event thread), so a dropped handle leaves a live tab — with its renderer,
+/// sockets and proxy tunnels — inside Chrome. In
 /// `SessionMode::AlwaysNew` that would be one leaked tab per request, for the pod's lifetime.
 ///
 /// The call runs **detached on the blocking pool**, for two reasons. `Tab::close` is a
@@ -851,7 +853,7 @@ impl BrowserPool {
                         );
 
                         // Close the old tab in Chrome. Dropping the handle does not close it —
-                        // headless_chrome's Tab has no Drop — so the recycled-away tab would
+                        // headless_chrome never closes a target on drop — so the recycled-away tab would
                         // otherwise keep its renderer, sockets and proxy tunnel alive forever.
                         let old_tab = context.tab.lock().await.take();
                         if let Some(old_tab) = old_tab {
@@ -1404,13 +1406,17 @@ impl BrowserPool {
 
         let create_target = CreateTarget {
             url: "about:blank".to_string(),
+            left: None,
+            top: None,
             width: None,
             height: None,
+            window_state: None,
             browser_context_id: Some(cdp_context_id.into()),
             enable_begin_frame_control: None,
             new_window: None,
             background: None,
             for_tab: None,
+            hidden: None,
         };
 
         let new_tab = self

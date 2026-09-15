@@ -23,8 +23,53 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_requests_total` | Counter | Total scraping requests received |
 | `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, session busy, selector not found, skip selector) are client-side conditions and are NOT counted. **`CAPACITY_EXHAUSTED` (5008) is the one 5xxx code that is also not counted** — a full pool is the pool working as configured under load, and counting it would make a busy scope indistinguishable from a breaking one (it would also drag `success_rate` down). That refused demand is counted on the coordinator as `requests_rejected_total{reason="no_slots"}` - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
 | `browser_hive_worker_request_duration_seconds` | Histogram | End-to-end `scrape_page` duration in seconds (observed on every return path, including early returns). Buckets: 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 60. Exposes `_bucket`, `_sum`, `_count` |
+| `browser_hive_worker_browser_processes{scope, type}` | Gauge | Browser processes by Chromium process type (see [Browser resources](#browser-resources)) |
+| `browser_hive_worker_browser_process_pss_bytes{scope, type}` | Gauge | Proportional set size of those processes, summed per type |
+| `browser_hive_worker_browser_process_max_pss_bytes{scope, type}` | Gauge | PSS of the largest single process of each type |
+| `browser_hive_worker_browser_targets{scope, type}` | Gauge | CDP targets the browser reports, by target type |
+| `browser_hive_worker_browser_contexts` | Gauge | CDP browser contexts that exist in the browser, the default context excluded |
+| `browser_hive_worker_process_resident_memory_bytes` | Gauge | RSS of the worker process itself, the browser excluded |
+| `browser_hive_worker_process_threads` | Gauge | Threads of the worker process |
 
-**Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `claimed_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). Counters are incremented in the request path.
+**Freshness**: pool gauges (`total_slots`, `total_contexts`, `active_contexts`, `claimed_contexts`, `available_slots`) are refreshed from live browser pool state on every Prometheus scrape, so they always reflect the current pool regardless of which code path changed it (requests, lifecycle recycling, pool recreation). The browser resource gauges are collected on every scrape too. Counters are incremented in the request path.
+
+### Browser resources
+
+A worker's memory limit is spent by the browser's processes, not by the worker, and the container's memory figure is only their sum. It cannot tell one bloated renderer from many small ones (out-of-process iframes), or from something that outlived the page it served. These gauges answer that without `kubectl exec`. Implementation: `crates/worker/src/browser_resources.rs`.
+
+- **Processes** are the worker's descendants in `/proc`, grouped by Chromium's `--type=` flag. The label set is closed:
+  - `browser`, `renderer`, `extension` (a renderer with `--extension-process`), `gpu`, `zygote`;
+  - `network` and `storage` (utility processes, told apart by `--utility-sub-type=`);
+  - `utility`, `other`.
+- **`browser` above 1** means a browser process that was never reaped — for example, the one a pool recreation replaced. A process with no `--type=` is counted as `browser`.
+- **Blind spot:** a process reparented away from the worker is not seen, which can happen only when the worker is not the container's PID 1.
+- **Memory is PSS** (`smaps_rollup`), not RSS. Renderers are forked from a zygote and share most of their pages, so summed RSS overstates the total several times over. PSS splits each shared page between the processes that map it, so the per-type sums add up.
+- **Targets** come from `Target.getTargets` over a browser-level CDP connection the metrics endpoint keeps for itself. It is separate from the one context creation uses, so a slow scrape never blocks a request. The label set is closed:
+  - `page`, `iframe`, `worker`, `shared_worker`, `service_worker`;
+  - `browser_ui`, the browser's own internal pages;
+  - `other`.
+- **A cross-site iframe appears as an `iframe` target.** This was checked against a real Chrome. `page` includes the browser's initial blank tab.
+- **An unreadable source leaves its gauges absent, not zero.** That covers:
+  - no `/proc` (any non-Linux host);
+  - a probe error;
+  - a probe over its 3 s budget, after which the next scrape skips the probe while the stuck one is still running.
+
+  Within a readable source every type is written, zero included.
+- **Cost per scrape:**
+  - one `smaps_rollup` read per browser process, which walks that process's page tables;
+  - two CDP round-trips.
+
+```promql
+# Where the memory goes, by process type
+sum by (type) (browser_hive_worker_browser_process_pss_bytes{scope="<scope>"})
+
+# Out-of-process iframes per page: high values point at site isolation, not at tab age
+browser_hive_worker_browser_targets{type="iframe"} / browser_hive_worker_browser_targets{type="page"}
+
+# Contexts the browser still holds after the pool let them go (isolated scopes only;
+# a `shared` scope creates no CDP contexts of its own)
+browser_hive_worker_browser_contexts - browser_hive_worker_total_contexts
+```
 
 **Capacity model**: each worker runs `WORKER_MAX_CONTEXTS` CDP browser contexts (default: 3), one tab per context, and each context processes exactly one request at a time. So the concurrency unit is a **context**, not a worker pod:
 
