@@ -211,6 +211,20 @@ triggers the OOMKills — renderer processes are — but unbounded. Re-measure a
 83 → 171 MiB at minutes 14–31 before. Still rising in small steps; the busy scope's pods do not live
 long enough (OOMKills) to show whether it levels off, so read a quieter scope over 12 h+.
 
+**Over a full night** (2026-09-16, same scope): every pod shows the same shape — ~12 MiB at start
+rising monotonically to 25–40 MiB, outliers at 47 and 55 MiB, i.e. ~7 MiB/h against ~20 MiB/h
+before the fork. No plateau anywhere, because no pod survives long enough to reach one. At 55 MiB
+against a 2 GiB limit this is 2.7 % and has nothing to do with the OOMKills, but it is still
+unbounded, and it cannot be read properly until the OOMKills stop.
+
+**A second upstream PR is worth tracking: rust-headless-chrome#567** (open, one line). When a
+browser-event listener disconnects, the transport treats it as fatal, closes the websocket and
+cancels every outstanding call — which this pool can only read as a dead browser, i.e. a spurious
+`recreate_browser_pool` and the loss of every session on that pod. #568, which the pin carries,
+fixed the neighbouring path (calls that already timed out), not this one. Not a memory fix. Before
+adding it, check production logs for "connection is closed" to see whether the path is actually
+being hit.
+
 **What else came with 1.0.18 → 1.0.22**, for tracing a regression: a regenerated CDP protocol (new
 optional fields in `Network.enable` and `Target.createTarget`, set to `None` here, so the requests on
 the wire are unchanged); `wait_for_initial_tab` waits 20 s instead of 10 s (not called here);
@@ -223,55 +237,88 @@ crates.io.
 **To close**: once a release contains #568, switch back to the version from crates.io, keep
 `tungstenite` on the version it resolves (see the comment in `Cargo.toml`), and remove this item.
 
-## Worker OOMKills are driven by renderer processes
+## Worker OOMKills: renderers set the floor, undisposed contexts set the slope
 
-**Status**: investigating (raised 2026-09-15)
+**Status**: cause identified 2026-09-16; context disposal implemented the same day, not deployed
 
 A busy downstream `reusable` scope (2 GiB limit, `max_contexts = 2`, Brave headless, isolated
-contexts) is OOMKilled repeatedly — one container lived 6 m 44 s. PSS snapshots of one pod:
+contexts, 7-12 concurrent pods) is OOMKilled continuously. With the browser resource metrics of
+v0.32.0 deployed, a 12-hour production night separates it into two independent phenomena. Figures
+below are scope-wide sums divided by the count of `gpu`/`network`/`storage` processes, of which
+Chromium runs exactly one per browser.
 
-| container age | renderers | renderer PSS | `worker` RSS | `worker` threads |
-|---|---:|---:|---:|---:|
-| ~3.5 min | 21 | ~1.47 GiB (the two tab renderers: 511 + 418 MiB) | — | 11 |
-| 14 min | 15 | 898 MiB | 83 MiB | 12 |
-| 31 min | 28 | 1.18 GiB | 171 MiB | 14 |
+**The floor: renderers.**
 
-A tab's renderer reaches 400–500 MiB within 2–3 minutes, so the memory is not a slow growth with
-tab age, and neither `max_lifetime` nor a per-tab rotation can be the main fix. A lower
-`WORKER_MAX_LIFETIME` did not prevent the kills.
+| process type | per pod | PSS per pod |
+|---|---:|---:|
+| renderer | ~15 (peak ~35) | ~736 MiB (peak ~1.57 GiB) |
+| network (NetworkService) | 1 | 173 MiB (peak 389 MiB) |
+| browser | 5 | 123 MiB |
+| gpu | 1 | 122 MiB |
+| zygote, utility, storage | ~4 | ~38 MiB |
 
-**Leading hypothesis, unconfirmed**: out-of-process iframes. Headless keeps site isolation on
-(`--disable-features=IsolateOrigins,site-per-process` is added only in headful), so every
-third-party site framed by a page gets its own renderer; `renderer-client-id` reached ~143 within
-3.5 minutes of browser start. Manual confirmation failed: the image has no `curl`, and a raw
-`/json/list` request over `/dev/tcp` returned 0 bytes.
+≈1.19 GiB the moment a pod is warm, of which renderers are 62 %. `browser_hive_worker_iframes_total`
+counted ~69 K out-of-process iframes in 12 h on that scope, essentially all of them ad exchanges,
+cookie-sync and RTB bidders — the hypothesis from the previous round, now measured. `container_memory_working_set_bytes` runs 5-10 % below our
+PSS+RSS figure (PSS also counts shared file-backed pages); both agree the pods sit at the ceiling.
 
-Plan, in order:
-1. **Deploy the browser resource gauges and read them** (implemented, not yet deployed; see
-   METRICS.md, "Browser resources"): processes and PSS per Chromium process type, CDP targets per
-   type, browser contexts, the worker's own RSS and threads. Also confirm there that the first
-   production deploy exposes them: `/proc` readable by the worker, and the target probe connecting.
-   The `iframe` target type has only been verified against a local Chrome, not Brave.
-   **Deployed 2026-09-15**: `/proc` and the target probe work in production, but every process was
-   classified as `browser` (Chromium rewrites its process title, so `cmdline` is space-joined, not
-   NUL-separated). Fixed in `classify_process`; the per-type process gauges need a redeploy.
-   First target readings (busy `reusable` scope, 8 pods): ~37 processes, ~3.4 `page`, ~4 `iframe`,
-   ~3 `worker` targets per pod on average; browser contexts go 2 → 4 when lifecycle recycling runs.
-   An `always_new` scope showed 0 `iframe` targets, which is **not** evidence of no iframes: the
-   gauge is read once per scrape, and a frame lives only while its request runs (locally ~1.5 s).
-   `browser_hive_worker_iframes_total` (the item below) counts them.
-2. Confirm or reject the iframe hypothesis from those numbers. If confirmed, the options are:
-   blocking third-party hosts (`BlockedUrlsMiddleware`), turning site isolation off (a
-   memory-vs-stealth trade-off — measure the block rate), fewer contexts per pod, or a larger limit.
-3. Dispose of empty CDP contexts (the item below). It is suspected of growing NetworkService, not
-   confirmed; the browser-context gauge from step 1 decides it.
-4. Per-tab rotation (close and reopen the tab inside the same CDP context every N requests) is
-   deprioritised by the data above; revisit only if renderer PSS still grows with tab age once the
-   fast part is explained.
+**The slope: NetworkService.** "Largest single process by type" over the same night shows
+`network` as repeated **monotone ramps with a vertical drop** — 04:00 ~390 MiB → 06:30 **852 MiB**
+(~185 MiB/h), then a drop when the pod dies, then another ramp. On the same panel the renderer
+maximum is noisy with no trend, `browser` and `gpu` are flat. Renderers are large but bounded by
+the request; only this one grows.
 
-Also seen, unexplained: an almost idle `always_new` pod held 0.3 → 1.4 CPU cores for hours, which
-dropped on restart. On the busy pod, gpu-process (swiftshader software rendering) showed 21 % CPU.
-The target gauges from step 1 are the first thing to check there.
+**Why it grows**: a non-default CDP BrowserContext is incognito-like, so its HTTP cache lives **in
+memory inside NetworkService**, next to its cookie store and socket pools. Up to v0.32.0 nothing disposed it (see
+"Context disposal must be verified in production"), and `reusable` recycling abandoned a context on
+every rotation. `browser_hive_worker_browser_contexts` confirms the accumulation directly: healthy
+pods sit at 2 (= `max_contexts`, nothing abandoned), long-lived ones climb a staircase to 16, of
+which 14 are not in the pool — and the steepest climb, 05:00-06:30, is the same window as the
+852 MiB ramp, with both dropping at the same instant. Roughly 50 MiB per abandoned context. (The
+counts are always even because both slots of a pod expire together and the lifecycle monitor
+recycles them in one tick.)
+
+**The arithmetic closes.** Every pod carries exactly one `OOMKilled` and one restart, spread evenly
+over the night, ~3 kills/hour across the scope → a pod lives ~3.3 h.
+
+| | |
+|---|---:|
+| floor once warm | 1.2-1.4 GiB |
+| headroom to the limit | 600-800 MiB |
+| NetworkService slope | ~185 MiB/h |
+| **predicted pod lifetime** | **3.2-4.3 h** |
+| **measured pod lifetime** | **~3.3 h** |
+
+This is a correlation of two independently collected signals, not a proof; the last link — that
+Chromium actually returns the memory on `Target.disposeBrowserContext` — can only be established by
+deploying the fix.
+
+**Order of work**, highest value first:
+
+1. **Dispose contexts** (the item below — implemented, awaiting deploy). Removes the slope. Only this stops a long-lived pod from
+   dying; everything else buys time.
+2. **Block list of ad-tech script hosts** (downstream, `BlockedUrlsMiddleware`). Lowers the floor.
+   Note the twist: the list provably cannot block an iframe *document*, but these iframes are
+   injected by JS from tag and ad-server hosts, and those scripts are ordinary sub-resources of the
+   main page, which the list does block. Test: `iframes_total` and `browser_processes{type="renderer"}`
+   must fall together; if only `third_party_requests_blocked_total` moves, the reasoning is wrong.
+   Never block the consent manager, `www.google.com` (reCAPTCHA lives there) or a generic JS CDN.
+3. **Explain the renderers without targets** (open sub-question below).
+4. A larger memory limit, as an anaesthetic while 1-2 are built.
+5. Turning site isolation off in headless — only if 1-2 are not enough, and with a block-rate
+   comparison, since it is a memory-vs-stealth trade.
+
+**Open sub-question: ~3 renderer processes per live target.** At the same instants, the scope had
+~154 renderer processes against ~55 targets that need one (`page` 23, `iframe` 24, `worker` 8) —
+~15 renderers per pod against ~5.5 targets. Cause unknown; do not guess it. The cheap test is one
+long-lived pod: if `browser_processes{type="renderer"}` rises while the target gauges stay flat,
+it is a second leak, independent of NetworkService.
+
+**Closed on the way**: the `browser` process type shows 5 per browser because anything without
+`--type=` lands there; "Largest single process by type" gives one real main of 167-218 MiB and the
+rest are negligible wrappers. A classification cosmetic, not memory. Per-pod out-of-process iframes
+average 0.5-2.8 (peaks 5-14) — lower than the counter suggests, because the sampler only sees the
+frames alive in that second; both numbers are right and answer different questions.
 
 ## Third-party request and iframe metrics
 
@@ -294,9 +341,12 @@ Goal: find the hosts worth adding to `BlockedUrlsMiddleware` and rank them.
   interval is now 1 s (confirmed by the user, 2026-09-15).
 
 **Open.**
-- **After the deploy**, compare `prometheus_tsdb_head_series` with the reading before it. On
-  2026-09-15 it was 1.26 M, with a 2.6–4.7 M sawtooth earlier that day before Prometheus moved
-  pods. Lower `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` (default 2000) if the growth is too much.
+- ~~Head series after the deploy~~ **answered 2026-09-16**: Prometheus grew from 1.2 M to
+  3.1-3.7 M head series overnight, but its TSDB Status page lists **no** `browser_hive_*` metric
+  and no label of ours among the top contributors — the growth is someone else's.
+  `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` stays at its default. Note for next time: the per-metric
+  breakdown is the **Status -> TSDB Status** page, not the `prometheus_tsdb_head_series` series,
+  which gives a total and cannot attribute it.
 - **Not verified end to end**: the blocked counter (the base worker has no list; unit-tested only),
   Linux, Brave, HTTPS, a proxy.
 - **Frames shorter than 1 s are still missed.** The exact alternative is event-driven:
@@ -323,7 +373,10 @@ were checked, not only the CDP events.
 | `iframe` targets from `Target.getTargets` | every cross-site frame, nested included | none (frames run in-process) |
 
 Consequences:
-- The list cannot reduce renderer processes, which is what the OOMKills are made of.
+- The list cannot reduce renderer processes **directly**. It may still do so indirectly: production
+  shows the iframes are injected by JS from tag and ad-server hosts, and those scripts are ordinary
+  sub-resources of the main page, which the list does block. Untested — see the test in "Worker
+  OOMKills: renderers set the floor, undisposed contexts set the slope".
 - An iframe-host metric fed from page-session events misses every frame nested inside a
   cross-site frame.
 
@@ -354,24 +407,122 @@ and fit inside `terminationGracePeriodSeconds`; `GRPC_REQUEST_TIMEOUT` is 320 s,
 simply wait for the longest possible request. Today this costs requests on every rollout, KEDA
 scale-down and spot preemption. A separate change from the memory work.
 
-## Empty CDP BrowserContexts are never disposed
+## Context disposal must be verified in production
 
-**Status**: residue of the tab-leak fix; needs an upstream change (raised 2026-07-27)
+**Status**: implemented 2026-09-16, not deployed (raised 2026-07-27 as "empty contexts are never
+disposed")
 
-Tabs are now closed at every context-removal site (`close_tab_detached` in
-`worker/src/browser_pool.rs`), so the per-request tab leak in `AlwaysNew` is gone. What remains is
-the empty CDP BrowserContext behind each closed tab: `Target.disposeBrowserContext` is rejected
-over a page session (`Not allowed`), and headless_chrome exposes no browser-level method call
-(`Transport::call_method_on_browser` exists but is unreachable from the public API).
+Every context-removal site now closes the tab **and** disposes the CDP BrowserContext
+(`release_context_detached` in `worker/src/browser_pool.rs`; the design and its constraints are in
+CLAUDE.md, "Removing a context from the pool does not free it in Chrome"). It is the fix for the
+OOMKill slope in "Worker OOMKills: renderers set the floor, undisposed contexts set the slope".
 
-Low priority — an empty context holds no renderer, no sockets and no proxy tunnel, which is what
-the memory and connection pressure actually came from.
+One deviation from the plan written before the code: disposal runs on a **dedicated**
+`BrowserCdpClient` socket (`BrowserPool::context_disposer`), not on the per-context-proxy
+`cdp_client`. Calls on one socket are serialised, so a slow disposal there would have held up context
+creation on the request path of per-context-proxy scopes; `cdp_client` itself is unchanged and still
+exists only for those scopes.
 
-**The blocker is gone as of 2026-07-31**: `worker/src/browser_cdp.rs` is exactly the "raw CDP call
-over the browser WebSocket" this item was waiting for, added for per-context proxy hosts. Disposing
-a context is now a matter of calling `Target.disposeBrowserContext` through that client at the
-removal sites — with the caveat that the client only exists for providers that route per context,
-so it would have to be created unconditionally first.
+**Verified locally** (Chrome and Brave on macOS, headless, via `BrowserCdpClient` directly, not
+through a running worker): the browser accepts `disposeBrowserContext` on the browser-level socket
+in 9-36 ms, both after the tab was closed and with the tab still open, and
+`Target.getBrowserContexts` drops by one each time. Closing a tab whose context was already disposed
+fails fast (`No session with given id`); disposing an unknown context is rejected (`Failed to find
+context`) and ends up as one WARN.
+
+**Not verified — what the deploy must show.** Read it on the scope that was being OOMKilled, no
+earlier than 4-6 h after the rollout (pods used to live ~3.3 h, so a shorter window proves nothing),
+best over a night. Dashboard "Browser Hive - Browser Resources":
+
+1. **The new binary is running.** The workspace version must be bumped for this, otherwise the
+   startup banner is identical to v0.32.0's (the fix ships as v0.33.0). Loki: `{app="worker-<scope>"} |= "Browser Hive library
+   version="` — every pod started after the rollout must print the new version. (Selector check
+   first: without the line filter the stream must return data.)
+2. **"Browser contexts: in the browser vs. not in the pool"** — the "not in the pool" series stays
+   near 0 and the browser total never climbs above `max_contexts` (brief +1/+2 during a recycle tick
+   is expected). Before: a staircase up to 16.
+3. **"Largest single process by type"**, series `network` — no monotone ramp; flat or saw-toothed
+   around a level. Before: 390 → 852 MiB in 2.5 h.
+4. **"Container restarts and OOMKills per pod"** — OOMKills drop from ~3/h across the scope towards
+   zero. If they only become rarer, the renderer floor (item 2 of "Order of work") is next.
+5. **"Memory per pod vs. container limit"** — pods stop marching up to the limit.
+6. **Loki, WARNs of the change**: `{app="worker-<scope>"} |= "Could not dispose CDP context"` and
+   `{app="worker-<scope>"} |= "context disposal client"` — expected empty; occasional lines around a
+   browser restart are fine, a steady stream means disposal is failing and 2-3 above will not move.
+
+If 2 holds but 3 does not, the slope has another cause and the OOM item reopens.
+
+## A replaced browser pool leaves its Chrome running
+
+**Status**: confirmed in production 2026-09-16 as the OOMKill cause of a downstream `always_new`
+scope; fixed the same day (`Drop for BrowserPool`), not deployed. Why the transport closes is still
+open
+
+`BrowserPool::start_lifecycle_monitor` spawns an endless task that holds clones of the pool's
+`Arc<Browser>`, its contexts and its CDP clients, and nothing stops it: `recreate_browser_pool`
+(`worker/src/service.rs`) only swaps the pool. headless_chrome kills the Chrome process only when the
+last `Arc<Browser>` is dropped (`BrowserInner` owns the `Process`, whose `Drop` sends the kill and
+removes the temporary profile directory). So after every pool replacement the old task keeps ticking
+and **the old Chrome keeps running**, renderers and NetworkService included, for the pod's lifetime.
+
+The replacement is triggered by `connection is closed` — headless_chrome's `ConnectionClosed`, i.e.
+its *transport* stopped — and that does not mean the process died.
+
+**Production, 2026-09-16 (v0.32.0), the `always_new` scope, 3-4 pods:**
+- Loki: 17 replacements in 24 h, all in this scope, none in any other. Every one is the same line:
+  `Browser process appears dead during context creation (always_new mode) ... Failed to create
+  isolated CDP context: Unable to make method calls because underlying connection is closed`.
+- "Browser main processes per pod" climbs in steps of exactly 5 — one browser's worth of the
+  `browser` process type (see the OOM item): one pod went 20 → 25 → 30 → 35 → 40 → 45, i.e. 4 → 9
+  Chrome instances, another 10 → 15. A pod that had just logged a replacement showed 10 (two Chromes)
+  within minutes.
+- "Browser processes by type": `gpu`, `network` and `storage` — one per browser — reach 11 across
+  3-4 pods.
+- "Memory per pod vs. container limit" rises in steps at the same moments, and the two pods with the
+  most Chromes are exactly the two OOMKilled (~12:45 and ~13:15). After the restart each pod sits at
+  300-500 MiB.
+
+**Why the transport closes is unknown**, and our logs cannot tell: headless_chrome logs through the
+`log` crate, and `init_logging` (`common/src/logging.rs`) installs the subscriber with
+`set_global_default`, which — unlike `.init()` — does not install the `log` bridge. The crate's own
+lines ("Transport loop got disconnected …", "Got a timeout while listening for browser events …")
+are therefore dropped. Candidate, unproven: the transport-shutdown path upstream
+rust-headless-chrome#567 fixes.
+
+**Fixed** by point 1 of the original plan: `Drop for BrowserPool` aborts the lifecycle monitor and
+SIGKILLs the old browser by PID (see CLAUDE.md, "Browser Pool Recovery"). Verified locally on Chrome
+and Brave with a real `BrowserPool` replaced under an `RwLock` while an extra `Arc<Browser>` clone
+was still held: the old main process became a zombie at once with no children left, and was reaped
+as soon as that clone was dropped.
+
+**Verification after deploy** (dashboard "Browser Hive - Browser Resources", the `always_new` scope,
+12-24 h):
+- "Browser main processes per pod" stays at 5 (one browser) — at most a brief 10 right after a
+  replacement. Before: steps of +5 up to 45.
+- "Browser processes by type": `gpu`/`network`/`storage` equal the pod count.
+- "Memory per pod vs. container limit": no steps; "Container restarts and OOMKills per pod": none.
+- Loki: `{app="worker-<scope>"} |= "Killed browser process"` — one line per replacement, i.e. as
+  many as `|= "Recreating browser pool due to dead browser process"`.
+  `|= "Could not kill browser process"` must stay empty.
+
+**Still open: why the transport closes** (~17 times a day in that scope). Our logs cannot say, see
+the next item. Candidate, unproven: the path upstream rust-headless-chrome#567 fixes. Decide on #567
+only once the cause is known.
+
+## headless_chrome's own log lines never reach Loki
+
+**Status**: open, someday (raised 2026-09-16) — deliberately postponed, the volume worries us
+
+headless_chrome logs through the `log` crate, and `init_logging` (`common/src/logging.rs`) installs
+the subscriber with `set_global_default`, which — unlike `SubscriberInitExt::init()` — does not
+install the `log` → `tracing` bridge. Every line the crate writes is dropped, including the ones that
+would explain a closed transport ("Transport loop got disconnected …", "Got a timeout while
+listening for browser events …") and its own "Killing Chrome".
+
+To try: install `tracing_log::LogTracer` and cap the `headless_chrome` target at `warn` through the
+`EnvFilter` (its `info` level is chatty). Before shipping, measure the line volume on one busy pod —
+the concern is the Loki bill, not correctness. Covers every downstream binary at once, since they all
+call `init_logging`.
 
 ## Per-context proxy hosts are verified on macOS Brave only
 

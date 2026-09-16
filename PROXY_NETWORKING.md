@@ -257,8 +257,9 @@ is private, so the parameter is unreachable through the crate. `worker/src/brows
 a second CDP client to `Browser::get_ws_url()` for that one call; the returned context id is handed
 to the crate's own `Context`, so tabs, Fetch auth and navigation stay on the crate's transport.
 Chosen over forking the crate — no fork to maintain, and the browser-level client is also the only
-route to `Target.disposeBrowserContext`, which is rejected over a page session (see CLAUDE.md on
-contexts that are removed from the pool but never disposed).
+route to `Target.disposeBrowserContext`, which is rejected over a page session and which the pool
+now uses, on a socket of its own, to dispose the contexts it removes (see CLAUDE.md, "Removing a
+context from the pool does not free it in Chrome").
 
 Two CDP clients against one browser do not race — CDP delivers a response to the connection that
 sent the request, so the two id spaces are independent — but that safety rests on rules the module

@@ -1794,7 +1794,7 @@ impl WorkerService {
         }
 
         // Release the tab lock before any path that can destroy this context.
-        // `destroy_context` -> `close_context_tab` takes the very same `context.tab` mutex to hand
+        // `destroy_context` -> `release_context` takes the very same `context.tab` mutex to hand
         // the tab to the detached closer, so holding it across a destroy makes this task await
         // itself: the request never returns and the slot is only freed when the client's deadline
         // drops the future. Two such paths exist below (the AlwaysNew early destroy and the

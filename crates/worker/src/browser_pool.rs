@@ -32,6 +32,18 @@ pub struct BrowserPool {
     /// same way the request path does.
     cdp_client: Option<Arc<BrowserCdpClient>>,
 
+    /// Browser-level CDP client that disposes the CDP BrowserContexts removed from the pool, in
+    /// every scope. `None` only when it could not connect, in which case contexts are abandoned
+    /// as they were before disposal existed.
+    ///
+    /// A socket of its own rather than `cdp_client`: calls on one socket are serialised, and a
+    /// disposal the browser is slow to answer must not hold up context creation on the request
+    /// path.
+    context_disposer: Option<Arc<BrowserCdpClient>>,
+
+    /// The lifecycle monitor task, aborted when the pool is dropped. See `Drop for BrowserPool`.
+    lifecycle_monitor: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+
     /// Latches the one-time warning about a provider handing out hosts that do not route.
     proxy_host_mismatch_warned: AtomicBool,
 
@@ -55,7 +67,7 @@ pub struct BrowserPool {
 /// not started processing yet is already busy, so a concurrent request can never collect it.
 ///
 /// The removed contexts are returned rather than dropped: dropping frees nothing inside Chrome,
-/// so the caller must pass each to `close_context_tab` — which it can only do after releasing
+/// so the caller must pass each to `release_context` — which it can only do after releasing
 /// the pool lock this function is called under.
 fn reclaim_leaked_always_new_contexts(
     contexts: &mut Vec<Arc<BrowserContext>>,
@@ -72,23 +84,6 @@ fn reclaim_leaked_always_new_contexts(
     leaked
 }
 
-/// Close a tab inside Chrome after its context has been removed from the pool.
-///
-/// Removing a context from the pool `Vec` frees nothing browser-side: headless_chrome never
-/// closes a target or disposes a context on drop (the pinned fork's `Drop for Tab` releases only
-/// the crate's own event thread), so a dropped handle leaves a live tab — with its renderer,
-/// sockets and proxy tunnels — inside Chrome. In
-/// `SessionMode::AlwaysNew` that would be one leaked tab per request, for the pod's lifetime.
-///
-/// The call runs **detached on the blocking pool**, for two reasons. `Tab::close` is a
-/// synchronous CDP round-trip, so it must not run on a runtime thread. And its wait is bounded
-/// only by `idle_browser_timeout` (1 hour, see `BrowserPool::new`), while the tab being closed
-/// is frequently the one that just stopped responding — awaiting it would stall the request
-/// path for that whole hour. Nothing depends on the outcome, so it is only logged.
-///
-/// The now-empty CDP BrowserContext is *not* disposed: `Target.disposeBrowserContext` is
-/// rejected over a page session (`Not allowed`) and headless_chrome exposes no browser-level
-/// method call. An empty context holds no renderer and no sockets, so that residue is minor.
 /// Choose the idle context with the lowest request count, or `None` if all are busy.
 ///
 /// Free function rather than a method so both lookups — the optimistic one under the read lock
@@ -132,55 +127,157 @@ fn select_soonest_unquarantined(
         .map(|(c, until)| (c.clone(), until))
 }
 
-fn close_tab_detached(tab: Arc<Tab>, context_id: uuid::Uuid) {
+/// The browser-level handle a removed context is disposed through: the disposal client and the
+/// context's CDP id.
+type Disposal = (Arc<BrowserCdpClient>, String);
+
+/// Release a removed context inside Chrome: close its tab, then dispose its CDP BrowserContext.
+///
+/// Removing a context from the pool `Vec` frees nothing browser-side: headless_chrome never
+/// closes a target or disposes a context on drop (the pinned fork's `Drop for Tab` releases only
+/// the crate's own event thread), so a dropped handle leaves a live tab — with its renderer,
+/// sockets and proxy tunnels — inside Chrome. In `SessionMode::AlwaysNew` that would be one leaked
+/// tab per request, for the pod's lifetime. Closing the tab is not enough either: the emptied
+/// context keeps its in-memory HTTP cache inside NetworkService (measured in production at ~50 MiB
+/// per context, the cause of the worker OOMKills), so it is disposed as well.
+///
+/// The work runs **detached on the blocking pool**, for two reasons. Both calls are synchronous
+/// CDP round-trips, so they must not run on a runtime thread. And the tab close waits up to
+/// `idle_browser_timeout` (1 hour, see `BrowserPool::new`), while the tab being closed is
+/// frequently the one that just stopped responding — awaiting it would stall the request path for
+/// that whole hour. Nothing depends on the outcome, so it is only logged.
+///
+/// The two steps run in this order, in one task. `disposeBrowserContext` would close the tab by
+/// itself, but closing it first means disposal normally finds an empty context, and the tab close
+/// stays exactly as it was before disposal existed. A failed tab close does not skip disposal: it
+/// usually means the tab was already gone, and the context still holds its cache.
+fn release_context_detached(
+    tab: Option<Arc<Tab>>,
+    disposal: Option<Disposal>,
+    context_id: uuid::Uuid,
+) {
+    if tab.is_none() && disposal.is_none() {
+        return;
+    }
     // The request span does not cross spawn_blocking; re-enter it so these lines keep ray_id.
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _guard = span.enter();
-        match tab.close(false) {
-            Ok(_) => debug!("Closed tab of removed context {}", context_id),
-            // Usually means the tab was already gone (dead CDP session) — benign, and the
-            // opposite of the leak this guards against.
-            Err(e) => debug!(
-                "Could not close tab of removed context {}: {}",
-                context_id, e
-            ),
+        if let Some(tab) = tab {
+            match tab.close(false) {
+                Ok(_) => debug!("Closed tab of removed context {}", context_id),
+                // Usually means the tab was already gone (dead CDP session) — benign, and the
+                // opposite of the leak this guards against.
+                Err(e) => debug!(
+                    "Could not close tab of removed context {}: {}",
+                    context_id, e
+                ),
+            }
+        }
+        if let Some((client, cdp_context_id)) = disposal {
+            match client.dispose_browser_context(&cdp_context_id) {
+                Ok(()) => debug!(
+                    "Disposed CDP context {} of removed context {}",
+                    cdp_context_id, context_id
+                ),
+                Err(e) => warn!(
+                    "Could not dispose CDP context {} of removed context {} - its memory stays \
+                     in the browser until the browser restarts: {:#}",
+                    cdp_context_id, context_id, e
+                ),
+            }
         }
     });
 }
 
-/// Take a removed context's tab and close it in Chrome. Must be called with the pool lock
-/// released. See `close_tab_detached`.
 /// How long context teardown may wait for `context.tab` before giving up.
 ///
 /// The lock is normally uncontended: whoever owns the context has finished with it by the time it
 /// is destroyed. The bound exists because the failure mode of an unbounded wait is far worse than
-/// the failure mode of a timeout — see [`close_context_tab`].
+/// the failure mode of a timeout — see [`release_context`].
 const TAB_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Hand the context's tab to the detached closer.
+/// Take a removed context's tab and hand it, with the context itself, to the detached releaser.
+/// Must be called with the pool lock released. See `release_context_detached`.
 ///
 /// The wait for `context.tab` is bounded on purpose. This runs on the request path (the
 /// `AlwaysNew` early destroy), so a caller still holding that mutex would park this task forever —
 /// which is exactly what shipped in v0.17.0, where `scrape_page_internal` held its `tab_guard`
 /// across the destroy and every `always_new` request hung until its client gave up. Timing out
-/// instead leaks one tab in Chrome: bad, but bounded, loud, and it still returns the response.
-async fn close_context_tab(context: &Arc<BrowserContext>) {
+/// instead leaks one tab and its context in Chrome: bad, but bounded, loud, and it still returns
+/// the response. Disposal is skipped on that path too, since it would close a tab someone holds.
+async fn release_context(context: &Arc<BrowserContext>, disposer: Option<&Arc<BrowserCdpClient>>) {
     let tab = match tokio::time::timeout(TAB_LOCK_TIMEOUT, context.tab.lock()).await {
         Ok(mut guard) => guard.take(),
         Err(_) => {
             warn!(
                 "Timed out after {:?} waiting for the tab lock of context {} - leaving its tab \
-                 open in Chrome. Some caller is holding context.tab across the destroy; that is a \
-                 bug in the caller, not a transient condition.",
+                 and CDP context open in Chrome. Some caller is holding context.tab across the \
+                 destroy; that is a bug in the caller, not a transient condition.",
                 TAB_LOCK_TIMEOUT, context.metadata.id
             );
             return;
         }
     };
 
-    if let Some(tab) = tab {
-        close_tab_detached(tab, context.metadata.id);
+    release_context_detached(tab, disposal_for(context, disposer), context.metadata.id);
+}
+
+/// The disposal to run for a removed context: `None` in `shared` mode (the default context is
+/// never disposed) and when the disposal client could not be connected.
+fn disposal_for(
+    context: &BrowserContext,
+    disposer: Option<&Arc<BrowserCdpClient>>,
+) -> Option<Disposal> {
+    Some((disposer?.clone(), context.cdp_context_id.clone()?))
+}
+
+/// A dropped pool takes its browser down with it.
+///
+/// The pool is dropped when `WorkerService::recreate_browser_pool` replaces it, and that happens on
+/// `connection is closed` — headless_chrome's *transport* stopped, which does not mean Chrome died.
+/// headless_chrome kills the process only when the last `Arc<Browser>` goes, and the lifecycle
+/// monitor held one forever: it is an endless task nobody stopped. Production showed the result —
+/// every replacement left the old Chrome running, up to 9 per pod, until the pod was OOMKilled.
+///
+/// Both halves are needed. Aborting the monitor releases its clones, so the crate's own teardown
+/// (kill, reap, temporary profile removal) runs once the remaining short-lived clones held by
+/// in-flight requests are gone. The explicit kill does not wait for that and does not depend on
+/// every clone being found.
+impl Drop for BrowserPool {
+    fn drop(&mut self) {
+        if let Some(handle) = self.lifecycle_monitor.get_mut().ok().and_then(Option::take) {
+            handle.abort();
+        }
+
+        if let Some(pid) = self.browser.get_process_id() {
+            kill_browser_process(pid);
+        }
+    }
+}
+
+/// Send SIGKILL to a browser process this worker launched.
+///
+/// Safe against PID reuse: the process is our own child and is reaped only by headless_chrome's
+/// `Drop` (`Child::wait`), which cannot have run while this pool still held an `Arc<Browser>`. Until
+/// then an exited process stays a zombie that keeps its PID, so the PID still names that process.
+/// Chrome's child processes (renderers, GPU, NetworkService) exit when the main process is gone.
+fn kill_browser_process(pid: u32) {
+    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: kill(2) has no memory-safety preconditions.
+    if unsafe { libc::kill(pid_t, libc::SIGKILL) } == 0 {
+        info!("Killed browser process {} of the dropped browser pool", pid);
+    } else {
+        let error = std::io::Error::last_os_error();
+        // ESRCH: already gone (or already reaped) - the case the kill exists to make certain.
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            warn!(
+                "Could not kill browser process {} of the dropped browser pool: {}",
+                pid, error
+            );
+        }
     }
 }
 
@@ -396,6 +493,20 @@ impl BrowserPool {
             None
         };
 
+        // Best-effort: a worker that cannot dispose contexts still serves requests, it only grows
+        // the way it did before disposal existed - which the WARN makes visible.
+        let context_disposer = match BrowserCdpClient::connect(browser.get_ws_url()) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(e) => {
+                warn!(
+                    "Could not connect the context disposal client - removed CDP contexts will \
+                     not be disposed and keep their memory in the browser: {:#}",
+                    e
+                );
+                None
+            }
+        };
+
         let lifecycle_config = scope_config.lifecycle.clone();
 
         // Clone proxy provider for per-context assignment
@@ -427,6 +538,8 @@ impl BrowserPool {
             proxy_config,
             proxy_provider,
             cdp_client,
+            context_disposer,
+            lifecycle_monitor: std::sync::Mutex::new(None),
             proxy_host_mismatch_warned: AtomicBool::new(false),
             tab_init_middlewares,
             total_contexts_created: Arc::new(AtomicU64::new(0)),
@@ -751,6 +864,7 @@ impl BrowserPool {
         let context_isolation = self.scope_config.context_isolation;
         let session_mode = self.scope_config.session_mode;
         let cdp_client = self.cdp_client.clone();
+        let context_disposer = self.context_disposer.clone();
         let launch_proxy_host = self.proxy_config.build_proxy_server();
 
         // Standalone background task: the request span never reaches it, so it opens its own.
@@ -784,7 +898,7 @@ impl BrowserPool {
                     }
                     drop(contexts_guard);
                     for context in &leaked {
-                        close_context_tab(context).await;
+                        release_context(context, context_disposer.as_ref()).await;
                     }
                     continue;
                 }
@@ -829,7 +943,7 @@ impl BrowserPool {
 
                     drop(contexts_guard);
                     for context in &expired {
-                        close_context_tab(context).await;
+                        release_context(context, context_disposer.as_ref()).await;
                     }
                     continue;
                 }
@@ -859,13 +973,17 @@ impl BrowserPool {
                             context.metadata.total_requests.load(Ordering::SeqCst)
                         );
 
-                        // Close the old tab in Chrome. Dropping the handle does not close it —
-                        // headless_chrome never closes a target on drop — so the recycled-away tab would
-                        // otherwise keep its renderer, sockets and proxy tunnel alive forever.
+                        // Close the old tab and dispose its CDP context in Chrome. Dropping the
+                        // handles does neither — headless_chrome never closes a target or a
+                        // context on drop — so the recycled-away tab would keep its renderer,
+                        // sockets and proxy tunnel, and the context its in-memory cache, forever.
+                        // Only spawned here; the blocking work runs after this lock is released.
                         let old_tab = context.tab.lock().await.take();
-                        if let Some(old_tab) = old_tab {
-                            close_tab_detached(old_tab, context.metadata.id);
-                        }
+                        release_context_detached(
+                            old_tab,
+                            disposal_for(context, context_disposer.as_ref()),
+                            context.metadata.id,
+                        );
 
                         // Create new context metadata
                         let mut metadata = BrowserContextMetadata::new();
@@ -1013,7 +1131,12 @@ impl BrowserPool {
             }
         };
 
-        tokio::spawn(monitor.instrument(span));
+        let handle = tokio::spawn(monitor.instrument(span));
+        if let Ok(mut slot) = self.lifecycle_monitor.lock() {
+            if let Some(previous) = slot.replace(handle) {
+                previous.abort();
+            }
+        }
     }
 
     async fn should_recycle_context(
@@ -1265,10 +1388,10 @@ impl BrowserPool {
             Ok(None)
         };
 
-        // Close the purged tabs only after the pool lock is released.
+        // Release the purged contexts only after the pool lock is released.
         drop(contexts);
         for context in &leaked {
-            close_context_tab(context).await;
+            release_context(context, self.context_disposer.as_ref()).await;
         }
 
         result
@@ -1281,9 +1404,9 @@ impl BrowserPool {
     /// a slot that can no longer be served correctly (an isolated context whose CDP context is
     /// gone), so the next request builds a fresh one instead of meeting the same broken slot.
     ///
-    /// The tab is closed in Chrome as well — removing the context from the pool `Vec` alone
-    /// leaks it, see `close_tab_detached`. Idempotent: a second call finds neither the context
-    /// nor a tab to close.
+    /// The tab is closed and the CDP context disposed in Chrome as well — removing the context
+    /// from the pool `Vec` alone leaks both, see `release_context_detached`. Idempotent: a second
+    /// call finds nothing to remove.
     pub async fn destroy_context(&self, context_id: &uuid::Uuid) {
         let removed = {
             let mut contexts = self.contexts.write().await;
@@ -1315,9 +1438,9 @@ impl BrowserPool {
             removed
         };
 
-        // Close the tab only after the pool lock is released.
+        // Release the context in Chrome only after the pool lock is released.
         for context in &removed {
-            close_context_tab(context).await;
+            release_context(context, self.context_disposer.as_ref()).await;
         }
     }
 

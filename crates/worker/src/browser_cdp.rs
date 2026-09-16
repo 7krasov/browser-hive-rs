@@ -18,7 +18,9 @@
 //! (`Target.getTargets`, `Target.getBrowserContexts`, see `browser_resources.rs`), and the iframe
 //! sampler another (`Target.getTargets`, see `third_party.rs`). Those calls create nothing and
 //! enable nothing, so the rules below hold for them unchanged; they are separate sockets so that a
-//! scrape waiting on a wedged browser never holds the lock context creation needs.
+//! scrape waiting on a wedged browser never holds the lock context creation needs. `BrowserPool`
+//! disposes removed contexts over yet another socket, for the same reason: a disposal the browser
+//! is slow to answer must not delay the creation of a context on the request path.
 //!
 //! # Invariants
 //!
@@ -131,6 +133,23 @@ impl BrowserCdpClient {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow!("createBrowserContext returned no browserContextId"))
+    }
+
+    /// Destroy a CDP BrowserContext and everything it still holds.
+    ///
+    /// A non-default context is incognito-like: its HTTP cache, cookie store and socket pools live
+    /// in memory inside the NetworkService process until the context is disposed. Closing the
+    /// context's last tab frees none of that, which is why this call exists — the crate offers no
+    /// way to make it (`Target.disposeBrowserContext` is rejected over a page session).
+    ///
+    /// Only ever pass a context that has already been removed from the pool: the browser closes
+    /// whatever targets the context still has, including one a request might be using.
+    pub fn dispose_browser_context(&self, browser_context_id: &str) -> Result<()> {
+        self.call(
+            "Target.disposeBrowserContext",
+            serde_json::json!({ "browserContextId": browser_context_id }),
+        )
+        .map(|_| ())
     }
 
     /// Every target the browser reports.
