@@ -494,6 +494,33 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Take a context out of service after a hard timeout.
+    ///
+    /// A hard timeout means a CDP call on this tab did not come back, and the tab is the only
+    /// handle there is to abort it. Closing it inline used to be the abort — but `Tab::close` is a
+    /// CDP call too, waiting up to `idle_browser_timeout` (1 hour) for the same unresponsive
+    /// target, and on a runtime thread it froze the whole worker for that hour (production
+    /// 2026-09-18: no request, lifecycle tick or metrics scrape for 60 minutes).
+    ///
+    /// So the context is removed instead of repaired: `destroy_context` closes the tab and disposes
+    /// the CDP context on the blocking pool, never awaited, and the slot is rebuilt fresh on
+    /// demand. Keeping the context would hand the same possibly-wedged renderer to the next
+    /// request. The cost is the context's cookies — in `dedicated` the whole session, which is
+    /// why the response carries no `context_id`.
+    ///
+    /// The caller must release `context.tab` first; `release_context` takes the same mutex.
+    async fn discard_stuck_context(&self, context: &Arc<BrowserContext>) {
+        warn!(
+            "Removing context {} from the pool after a hard timeout",
+            context.metadata.id
+        );
+        self.browser_pool
+            .read()
+            .await
+            .destroy_context(&context.metadata.id)
+            .await;
+    }
+
     /// Arm the AlwaysNew cleanup guard for a context, or nothing outside AlwaysNew mode.
     ///
     /// A helper because the retry path has to arm a second one for the replacement context, and
@@ -571,6 +598,24 @@ impl WorkerService {
             context.metadata.id.to_string()
         } else {
             String::new()
+        }
+    }
+
+    /// The session a request arrived with, echoed back on an answer that never touched it.
+    ///
+    /// Clients of `dedicated` scopes rely on the contract that a response without a session
+    /// means the session is gone (ERROR_HANDLING.md, "Session Management"). A request rejected
+    /// before its context is even looked up — an invalid URL — leaves the session intact, so it
+    /// must carry the id back, but only if the context still exists: echoing an id the pool no
+    /// longer has would keep the client on a dead session. Empty in every other mode.
+    async fn surviving_session_context_id(&self, context_id: &str) -> String {
+        if context_id.is_empty() || !self.config.scope.session_mode.returns_session_id() {
+            return String::new();
+        }
+        let pool = self.browser_pool.read().await;
+        match pool.find_context_by_id(context_id).await {
+            Some(context) => context.metadata.id.to_string(),
+            None => String::new(),
         }
     }
 
@@ -1434,7 +1479,7 @@ impl WorkerService {
         let navigation_result = tokio::select! {
             _ = self.cancellation_token.cancelled() => {
                 // Terminating - close tab and return immediately
-                let _ = tab_for_abort.close(false);
+                crate::browser_pool::close_tab_detached(tab_for_abort, context.metadata.id);
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(ScrapePageResponse {
                     success: false,
@@ -1454,7 +1499,8 @@ impl WorkerService {
                     "Navigation hard timeout after {}s - closing tab to abort",
                     NAVIGATION_TIMEOUT_SECS
                 );
-                let _ = tab_for_abort.close(false);
+                drop(tab_guard); // destroy_context takes this lock
+                self.discard_stuck_context(&context).await;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(ScrapePageResponse {
                     success: false,
@@ -1467,7 +1513,7 @@ impl WorkerService {
                     error_code: ErrorCode::TimeoutBrowser as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: self.addressable_context_id(&context),
+                    context_id: String::new(), // removed from the pool, see discard_stuck_context
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -1636,7 +1682,7 @@ impl WorkerService {
             tokio::select! {
                 _ = self.cancellation_token.cancelled() => {
                     // Terminating - close tab and return immediately
-                    let _ = tab_for_abort.close(false);
+                    crate::browser_pool::close_tab_detached(tab_for_abort, context.metadata.id);
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(ScrapePageResponse {
                         success: false,
@@ -1656,7 +1702,8 @@ impl WorkerService {
                         "Wait strategy hard timeout after {}ms (internal timeout was {}ms) - closing tab to abort",
                         hard_timeout_ms, wait_timeout
                     );
-                    let _ = tab_for_abort.close(false);
+                    drop(tab_guard); // destroy_context takes this lock
+                    self.discard_stuck_context(&context).await;
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(ScrapePageResponse {
                         success: false,
@@ -1669,7 +1716,7 @@ impl WorkerService {
                         error_code: ErrorCode::TimeoutBrowser as i32,
                         response_headers: std::collections::HashMap::new(),
                         execution_time_ms,
-                        context_id: self.addressable_context_id(&context),
+                        context_id: String::new(), // removed from the pool, see discard_stuck_context
                         ray_id: ray_id.to_string(),
                     });
                 }
@@ -1709,7 +1756,7 @@ impl WorkerService {
         let content = tokio::select! {
             _ = self.cancellation_token.cancelled() => {
                 // Terminating - close tab and return immediately
-                let _ = tab_for_abort.close(false);
+                crate::browser_pool::close_tab_detached(tab_for_abort, context.metadata.id);
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(ScrapePageResponse {
                     success: false,
@@ -1729,7 +1776,8 @@ impl WorkerService {
                     "get_content hard timeout after {}s - closing tab to abort",
                     GET_CONTENT_TIMEOUT_SECS
                 );
-                let _ = tab_for_abort.close(false);
+                drop(tab_guard); // destroy_context takes this lock
+                self.discard_stuck_context(&context).await;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(ScrapePageResponse {
                     success: false,
@@ -1742,7 +1790,7 @@ impl WorkerService {
                     error_code: ErrorCode::BrowserError as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: self.addressable_context_id(&context),
+                    context_id: String::new(), // removed from the pool, see discard_stuck_context
                     ray_id: ray_id.to_string(),
                 });
             }
@@ -2153,6 +2201,7 @@ impl WorkerServiceTrait for WorkerService {
         let _domain = match utils::extract_domain(&req.url) {
             Ok(d) => d,
             Err(e) => {
+                let context_id = self.surviving_session_context_id(&req.context_id).await;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(Response::new(ScrapePageResponse {
                     success: false,
@@ -2162,7 +2211,7 @@ impl WorkerServiceTrait for WorkerService {
                     error_code: ErrorCode::InvalidUrl as i32,
                     response_headers: std::collections::HashMap::new(),
                     execution_time_ms,
-                    context_id: String::new(), // No context created yet
+                    context_id,
                     ray_id: ray_id.clone(),
                 }));
             }

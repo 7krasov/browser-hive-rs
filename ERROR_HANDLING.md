@@ -349,6 +349,9 @@ Coordinator is shutting down, please retry
 
 **Client Action**: Fix the URL and retry.
 
+In a `dedicated` scope a request that carried a still-existing session gets that `session_id`
+back: the URL is rejected before the context is touched, so the session is intact.
+
 ---
 
 ### Scenario 2: Session Expired
@@ -492,27 +495,22 @@ Coordinator is shutting down, please retry
 
 ---
 
-### Scenario 6a: Tab Died After Hard Timeout (Automatic Recovery)
+### Scenario 6a: Hard Timeout Removes the Context
 
-This scenario happens internally when a previous request hit a hard timeout and the tab was closed to abort a stuck CDP call. The system automatically recovers without any client action needed.
+A hard timeout (navigation, wait strategy or `get_content` did not return within its bound) means a CDP call on the tab never came back. The request is answered with `TIMEOUT_BROWSER` (4041) and **no `context_id`**, and the context is removed from the pool: its tab is closed and its CDP context disposed in the background, never awaited.
 
-**What happens internally**:
-1. Previous request hits hard timeout (e.g., navigation stuck for 20s)
-2. Worker closes the tab via `tab.close(false)` to abort the CDP call
-3. Context remains in pool (in Reusable/Dedicated mode) with cookies/storage preserved
-4. Next request to this context gets "No session with given id" error
-5. Worker automatically creates new tab in the same CDP BrowserContext
-6. Request proceeds normally with session state preserved
+**Why removed rather than repaired**: aborting used to mean `tab.close(false)` inline, keeping the context. `Tab::close` is itself a CDP call to the same unresponsive target and waits up to `idle_browser_timeout` (1 hour); it ran on a runtime thread, and in production it froze a whole worker for exactly that hour. Keeping the context would also hand the possibly-wedged renderer to the next request.
 
-**When client sees this**: Never - the recovery is transparent. Client receives normal response.
+**Client impact**: `reusable`/`always_new` — none beyond the 4041 itself; the next request gets a fresh context. `dedicated` — the session ends (its cookies are gone) and the response carries no `session_id`, which tells the client to drop it (see "Session Management" below); a client that keeps sending it gets `SESSION_NOT_FOUND` (4002) and retries without it, per the usual rule.
 
-**Internal log message** (for debugging):
+**Internal log message**:
 ```
-WARN Tab CDP session dead ('No session with given id') - recreating tab for context ctx-123 (cdp_context_id: Some("ABC123"))
-INFO Successfully recreated tab after dead session for context ctx-123 (cdp_context_id: Some("ABC123"))
+WARN Wait strategy hard timeout after 50000ms (internal timeout was 40000ms) - closing tab to abort
+WARN Removing context ctx-123 from the pool after a hard timeout
+INFO Destroyed context ctx-123 (isolated) (1 contexts remaining)
 ```
 
-**Key benefit**: In Reusable mode, even after hard timeouts kill the tab, cookies and storage are preserved because the CDP BrowserContext survives. Only the tab (CDP Target) is recreated.
+A tab can still lose its CDP session for other reasons (a renderer crash). That case keeps the old automatic recovery: the next request meets "No session with given id", a new tab is created in the same CDP BrowserContext, cookies/storage are preserved and the client sees a normal response.
 
 ---
 
@@ -682,10 +680,31 @@ stored as data.
 
 ### Session Management
 
-When receiving `ERROR_CODE_SESSION_NOT_FOUND`:
-1. Clear the stored `session_id`
-2. Retry the request without `session_id`
-3. Store the new `session_id` from the response
+Only `dedicated` scopes return a `session_id`; in the other modes it is always empty and none of
+this applies. The contract, for a request that carried a `session_id`:
+
+1. **Response has a `session_id`** → store it, **replacing** the one you sent. It is normally the
+   same, but not always: when the browser process dies mid-request the worker retries in a fresh
+   context and returns *its* session.
+2. **Response has no `session_id`** → the session is gone; clear it. The next request starts a
+   new one.
+3. **`SESSION_NOT_FOUND` (4002)** → clear the session and retry without it. Still needed after
+   rule 2: a session can also end *between* requests, where no response could say so — idle
+   removal (`WORKER_MAX_IDLE_TIME_SECS`, 60 s by default in `dedicated`) and a coordinator
+   restart (sessions live in its memory).
+
+Rule 2 is exact for every answer the worker gives: an empty session means its context was
+removed — hard timeout (4041, or 5003 from `get_content`), `destroy_session_on_block` (HTTP
+403/429, reported as `success = true`), a slot whose CDP context was lost (5003), a dead browser
+(5003), a terminating pod (5006) or a context that no longer exists (4002). An invalid URL (4001)
+returns the session because the context was never touched, and `SESSION_BUSY` (4004) does too.
+
+**The one inexact case is `WORKER_UNREACHABLE` (5002)**, answered by the coordinator when it
+could not reach the worker: usually the pod is gone (and its sessions with it), but a network
+error or an RPC timeout leaves a live context behind. Following rule 2 there costs that
+session's cookies, and its context holds a slot until idle removal (up to ~2 minutes); keeping
+the session instead costs one 4002 if it was dead. Either is acceptable; rule 2 as written is
+the simpler client.
 
 ### Partial Content
 

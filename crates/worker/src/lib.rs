@@ -43,6 +43,32 @@ pub const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const LIBRARY_VERSION_BANNER: &str =
     concat!("Browser Hive library version=", env!("CARGO_PKG_VERSION"));
 
+/// The fewest runtime worker threads at which one blocked thread does not stop the worker.
+const MIN_RUNTIME_WORKER_THREADS: usize = 2;
+
+/// Log how many threads the tokio runtime has, and warn when it is a single one.
+///
+/// `#[tokio::main]` sizes the runtime from `available_parallelism`, which follows the container's
+/// CPU quota rounded down — a 1.5 CPU limit gives one thread. A synchronous CDP call that reaches
+/// a runtime thread then freezes gRPC, metrics and the lifecycle monitor at once (production
+/// 2026-09-18: one hour). Such calls are bugs to fix, but the thread count decides whether the
+/// next one costs one request or the whole pod.
+fn log_runtime_threads() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let workers = handle.metrics().num_workers();
+    if workers < MIN_RUNTIME_WORKER_THREADS {
+        warn!(
+            "Tokio runtime has {} worker thread(s): a single blocking call stalls the whole \
+             worker. Set #[tokio::main(worker_threads = N)] with N >= {}",
+            workers, MIN_RUNTIME_WORKER_THREADS
+        );
+    } else {
+        info!("Tokio runtime: {} worker threads", workers);
+    }
+}
+
 /// Run the worker service with given configuration
 ///
 /// This is the main entry point for running a Browser Hive worker.
@@ -102,6 +128,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     // serving an old binary (stale image, a pod that was never recreated), and without this
     // line the only way to tell is inspecting the binary inside the container.
     info!("{}", LIBRARY_VERSION_BANNER);
+    log_runtime_threads();
 
     info!(
         "Starting worker for scope: {} on {}:{} (session_mode: {})",

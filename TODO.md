@@ -237,6 +237,89 @@ crates.io.
 **To close**: once a release contains #568, switch back to the version from crates.io, keep
 `tungstenite` on the version it resolves (see the comment in `Cargo.toml`), and remove this item.
 
+## Synchronous CDP calls still run on runtime threads on the request path
+
+**Status**: plan agreed 2026-09-19, in progress; the two worst instances fixed in v0.34.0 (not yet deployed)
+
+Every headless_chrome call waits up to `idle_browser_timeout` (1 hour) for an answer. On
+2026-09-18 a downstream `reusable` worker froze for exactly one hour: a wait-strategy hard timeout
+closed the tab inline (`tab.close(false)` in the `select!` branch), the tab never answered, and the
+close held the runtime's only worker thread (1.5 CPU limit → 1 thread). No request, lifecycle tick
+or metrics scrape happened for 60 minutes; then the transport closed and the pool was recreated.
+
+Fixed: hard timeouts remove the context and close it detached (`discard_stuck_context`); shutdown
+aborts close detached; the lifecycle monitor builds replacements on the blocking pool, outside the
+pool lock; startup logs the runtime thread count and warns at 1; the downstream worker sets
+`worker_threads = 4`.
+
+Still synchronous on a runtime thread:
+
+- **Under the pool's `contexts` write lock** — the severe ones: `create_new_context` (CDP context,
+  tab, tab-init middlewares) inside `get_or_create_context` / `create_dedicated_context` /
+  `create_always_new_context`. One stuck creation stalls every context acquisition and the
+  lifecycle monitor for up to an hour: the runtime threads stay free, so gRPC and metrics likely
+  still answer, but no request is served — nearly the 2026-09-18 incident again.
+- **Under the `browser_pool` read lock**, stalling one request and its slot (which at
+  `max_contexts = 2` is half the pod) — in `scrape_page_internal`: lazy tab creation
+  (`create_tab_in_context` / `browser.new_tab()`), dead-tab recreation (`create_tab_in_context` /
+  `create_tab_shared`), `enable_fetch` (3 sites), `authenticate`, `Network.enable` +
+  `add_event_listener` for the response observer, and `Log.enable` / `Runtime.enable` in
+  diagnostics.
+- `Browser::new` in `BrowserPool::new` — startup / pool recreation only, out of scope.
+
+**Plan** (agreed 2026-09-19; ships as its own tag after v0.34.0):
+
+1. **One helper** for a bounded blocking CDP call: runs the closure on `spawn_blocking`
+   (re-entering the span), waits with `tokio::time::timeout`, returns an error naming the call on
+   expiry. The stuck thread stays in the blocking pool until headless_chrome gives up (≤ 1 h);
+   it holds a few KiB, and nothing stuck returns to the pool, so their number is bounded.
+2. **Context creation reserves, then builds outside the lock** — the lifecycle monitor's pattern:
+   under the write lock check `len + pending < max_contexts` and take a reservation (counted as
+   occupied in `available_slots`/`claimed_contexts`, released by RAII on every exit), drop the
+   lock, build through `SlotFactory` via the helper, re-lock and push.
+3. **Late completion cleans up after itself**: the blocking closure hands its result over a
+   oneshot; if the waiter already timed out (send fails), the closure disposes the context /
+   closes the tab it just created, so a call that finishes after the timeout leaks nothing.
+4. **Every per-tab call in `scrape_page_internal`** goes through the helper; on timeout the
+   context is removed (`discard_stuck_context`) and the request answers `BROWSER_ERROR` (5003)
+   with no `context_id` — the browser stalled, not the page (4041 stays for page timeouts).
+5. **Timeout 30 s** for every call (no measurement exists; CPU-throttled Brave can take seconds
+   to open a tab), plus a WARN naming the call when one takes over 5 s — the data for tuning it.
+6. Docs: CLAUDE.md "Browser Pool Recovery" rule, ERROR_HANDLING.md (5003 on a stalled setup
+   call), this item removed once deployed. Verify on k8s dev first: the hot path cannot be
+   exercised by unit tests.
+
+**Verify after deploy**: the startup line `Tokio runtime: 4 worker threads`; after the next
+hard timeout, `Removing context … after a hard timeout` followed by uninterrupted log lines.
+
+## The same scope OOMKilled 10 minutes after a clean browser restart
+
+**Status**: open, cause unknown
+
+Same incident, 2026-09-18. After the hour-long freeze the pool was recreated and the old Chrome was
+killed (`Killed browser process 8 of the dropped browser pool` — the v0.33.0 fix works). The new
+browser then served ~70 ordinary successful requests (one site, ~7 s each, 2 contexts) and the
+container was OOMKilled ~10 minutes later. Before the freeze the renderer PSS had also climbed to
+~1.5–1.7 GiB (largest single renderer ~945 MiB) on the same traffic. Hypothesis, not verified:
+each context reuses one tab, same-site navigations stay in one renderer process, and that
+renderer's heap grows with every page of this site. Things to check: `renderer` max-PSS against
+`total_requests` of the context; whether recycling after N requests (or a fresh tab per request
+inside the same context) flattens it.
+
+12-hour view of the largest single process of one pod (Kyiv time) supports the growth half of
+the hypothesis: the largest renderer climbs **linearly** after every restart (~0 → ~930 MiB in
+~25 min at 19:00, again to ~900 MiB 20:30–21:40), and in the earlier, lighter hours it is a
+sawtooth whose drops match context recycling (the scope recycles at `WORKER_MAX_REQUESTS=100` /
+`WORKER_MAX_LIFETIME=1h`). So one renderer keeps what every page it loaded left behind until
+its tab is closed. *What* it keeps (V8 heap, DOM, back/forward cache, DevTools network buffers)
+is not known. Both hour-long metric gaps (17:45–18:50 and 19:25–20:25) start at a renderer
+peak (~930–960 MiB): plausibly a renderer under memory pressure stops answering, the request
+hits its hard timeout and the old inline `tab.close` froze the worker — correlation only.
+Mitigations, cheapest first: lower `WORKER_MAX_REQUESTS` for the scope (config only; costs
+cookies and exit IP more often); rotate the **tab** inside the same CDP context every N requests
+(keeps cookies and exit IP; whether a new tab gets a fresh renderer needs checking); find what
+grows (`Runtime.getHeapUsage` / `Memory.getDOMCounters` per request).
+
 ## Worker OOMKills: renderers set the floor, undisposed contexts set the slope
 
 **Status**: cause identified 2026-09-16; context disposal implemented the same day, not deployed
