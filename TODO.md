@@ -237,60 +237,36 @@ crates.io.
 **To close**: once a release contains #568, switch back to the version from crates.io, keep
 `tungstenite` on the version it resolves (see the comment in `Cargo.toml`), and remove this item.
 
-## Synchronous CDP calls still run on runtime threads on the request path
+## Synchronous CDP calls on the request path: bounded, not yet deployed
 
-**Status**: plan agreed 2026-09-19, in progress; the two worst instances fixed in v0.34.0 (not yet deployed)
+**Status**: implemented in v0.35.0 (2026-09-19, not yet deployed); verify on k8s dev, then remove
+this item once deployed
 
 Every headless_chrome call waits up to `idle_browser_timeout` (1 hour) for an answer. On
 2026-09-18 a downstream `reusable` worker froze for exactly one hour: a wait-strategy hard timeout
-closed the tab inline (`tab.close(false)` in the `select!` branch), the tab never answered, and the
-close held the runtime's only worker thread (1.5 CPU limit → 1 thread). No request, lifecycle tick
-or metrics scrape happened for 60 minutes; then the transport closed and the pool was recreated.
+closed the tab inline, the tab never answered, and the close held the runtime's only worker
+thread. v0.34.0 fixed that instance (detached removal, recycling outside the lock, thread count).
 
-Fixed: hard timeouts remove the context and close it detached (`discard_stuck_context`); shutdown
-aborts close detached; the lifecycle monitor builds replacements on the blocking pool, outside the
-pool lock; startup logs the runtime thread count and warns at 1; the downstream worker sets
-`worker_threads = 4`.
+This change bounds the rest (see CLAUDE.md, "Bounded CDP calls"): context creation reserves a
+slot and builds outside the `contexts` write lock; every per-tab CDP call in
+`scrape_page_internal` (tab creation, `Fetch.enable`, `Network.enable`, diagnostics `enable`s,
+headless-marker and status-fallback `evaluate`s) and the lifecycle monitor's rebuild wait at most
+30 s; a late result is disposed; a stall removes the context and answers 5003 (5005 for context
+creation). (`authenticate` and `add_event_listener` make no CDP call — they only set local state.)
 
-Still synchronous on a runtime thread:
+Side effect worth knowing: a tab created lazily or after a closed connection in `shared` isolation
+now gets the tab init middlewares (UA override, blocked URLs); it used to be a bare
+`browser.new_tab()`.
 
-- **Under the pool's `contexts` write lock** — the severe ones: `create_new_context` (CDP context,
-  tab, tab-init middlewares) inside `get_or_create_context` / `create_dedicated_context` /
-  `create_always_new_context`. One stuck creation stalls every context acquisition and the
-  lifecycle monitor for up to an hour: the runtime threads stay free, so gRPC and metrics likely
-  still answer, but no request is served — nearly the 2026-09-18 incident again.
-- **Under the `browser_pool` read lock**, stalling one request and its slot (which at
-  `max_contexts = 2` is half the pod) — in `scrape_page_internal`: lazy tab creation
-  (`create_tab_in_context` / `browser.new_tab()`), dead-tab recreation (`create_tab_in_context` /
-  `create_tab_shared`), `enable_fetch` (3 sites), `authenticate`, `Network.enable` +
-  `add_event_listener` for the response observer, and `Log.enable` / `Runtime.enable` in
-  diagnostics.
-- `Browser::new` in `BrowserPool::new` — startup / pool recreation only, out of scope.
+**Not covered**: `Browser::new` (startup / pool recreation only).
 
-**Plan** (agreed 2026-09-19; ships as its own tag after v0.34.0):
-
-1. **One helper** for a bounded blocking CDP call: runs the closure on `spawn_blocking`
-   (re-entering the span), waits with `tokio::time::timeout`, returns an error naming the call on
-   expiry. The stuck thread stays in the blocking pool until headless_chrome gives up (≤ 1 h);
-   it holds a few KiB, and nothing stuck returns to the pool, so their number is bounded.
-2. **Context creation reserves, then builds outside the lock** — the lifecycle monitor's pattern:
-   under the write lock check `len + pending < max_contexts` and take a reservation (counted as
-   occupied in `available_slots`/`claimed_contexts`, released by RAII on every exit), drop the
-   lock, build through `SlotFactory` via the helper, re-lock and push.
-3. **Late completion cleans up after itself**: the blocking closure hands its result over a
-   oneshot; if the waiter already timed out (send fails), the closure disposes the context /
-   closes the tab it just created, so a call that finishes after the timeout leaks nothing.
-4. **Every per-tab call in `scrape_page_internal`** goes through the helper; on timeout the
-   context is removed (`discard_stuck_context`) and the request answers `BROWSER_ERROR` (5003)
-   with no `context_id` — the browser stalled, not the page (4041 stays for page timeouts).
-5. **Timeout 30 s** for every call (no measurement exists; CPU-throttled Brave can take seconds
-   to open a tab), plus a WARN naming the call when one takes over 5 s — the data for tuning it.
-6. Docs: CLAUDE.md "Browser Pool Recovery" rule, ERROR_HANDLING.md (5003 on a stalled setup
-   call), this item removed once deployed. Verify on k8s dev first: the hot path cannot be
-   exercised by unit tests.
-
-**Verify after deploy**: the startup line `Tokio runtime: 4 worker threads`; after the next
-hard timeout, `Removing context … after a hard timeout` followed by uninterrupted log lines.
+**Verify after deploy** (the hot path cannot be exercised by unit tests):
+- startup line `Tokio runtime: 4 worker threads`;
+- after a hard timeout or stall, `Removing context … after a hard timeout` / `… after a stalled
+  CDP call` followed by uninterrupted log lines;
+- `CDP call … took` WARNs: their durations are the data for tuning the 30 s `CALL_TIMEOUT`;
+- `CDP call … did not answer within 30s` should be rare; if frequent, the timeout is too tight
+  for a CPU-throttled browser.
 
 ## The same scope OOMKilled 10 minutes after a clean browser restart
 

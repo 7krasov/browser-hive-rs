@@ -1,4 +1,5 @@
 use crate::browser_cdp::BrowserCdpClient;
+use crate::cdp_call;
 use anyhow::{bail, Result};
 use browser_hive_common::{
     BrowserContextMetadata, ContextIsolation, ContextLifecycleConfig, ProxyConfig, ProxyParams,
@@ -6,10 +7,9 @@ use browser_hive_common::{
 };
 use headless_chrome::browser::context::Context as CdpContext;
 use headless_chrome::browser::tab::Tab;
-use headless_chrome::protocol::cdp::Target::CreateTarget;
 use headless_chrome::{Browser, LaunchOptions};
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -47,8 +47,12 @@ pub struct BrowserPool {
     /// Latches the one-time warning about a provider handing out hosts that do not route.
     proxy_host_mismatch_warned: AtomicBool,
 
-    // Browser customization middlewares
-    tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>>, // Applied to each new tab after creation
+    /// Creates the CDP side of slots and tabs (tab init middlewares included), on the blocking
+    /// pool. Shared with the lifecycle monitor.
+    slot_factory: Arc<SlotFactory>,
+
+    /// Slots reserved by contexts still being built outside the pool lock. See `SlotReservation`.
+    pending_creations: Arc<AtomicUsize>,
 
     // Metrics
     total_contexts_created: Arc<AtomicU64>,
@@ -168,42 +172,46 @@ fn release_context_detached(
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _guard = span.enter();
-        let disposed = match disposal {
-            Some((client, cdp_context_id)) => match client.dispose_browser_context(&cdp_context_id)
-            {
-                Ok(()) => {
-                    debug!(
-                        "Disposed CDP context {} of removed context {}",
-                        cdp_context_id, context_id
-                    );
-                    true
-                }
-                Err(e) => {
-                    warn!(
-                        "Could not dispose CDP context {} of removed context {} - its memory \
-                         stays in the browser until the browser restarts: {:#}",
-                        cdp_context_id, context_id, e
-                    );
-                    false
-                }
-            },
-            None => false,
-        };
-        if disposed {
-            return; // disposal closed the context's pages
-        }
-        if let Some(tab) = tab {
-            match tab.close(false) {
-                Ok(_) => debug!("Closed tab of removed context {}", context_id),
-                // Usually means the tab was already gone (dead CDP session) — benign, and the
-                // opposite of the leak this guards against.
-                Err(e) => debug!(
-                    "Could not close tab of removed context {}: {}",
-                    context_id, e
-                ),
-            }
-        }
+        release_context_now(tab, disposal, context_id);
     });
+}
+
+/// The body of [`release_context_detached`], for callers already on a blocking thread.
+fn release_context_now(tab: Option<Arc<Tab>>, disposal: Option<Disposal>, context_id: uuid::Uuid) {
+    let disposed = match disposal {
+        Some((client, cdp_context_id)) => match client.dispose_browser_context(&cdp_context_id) {
+            Ok(()) => {
+                debug!(
+                    "Disposed CDP context {} of removed context {}",
+                    cdp_context_id, context_id
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "Could not dispose CDP context {} of removed context {} - its memory \
+                     stays in the browser until the browser restarts: {:#}",
+                    cdp_context_id, context_id, e
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    if disposed {
+        return; // disposal closed the context's pages
+    }
+    if let Some(tab) = tab {
+        match tab.close(false) {
+            Ok(_) => debug!("Closed tab of removed context {}", context_id),
+            // Usually means the tab was already gone (dead CDP session) — benign, and the
+            // opposite of the leak this guards against.
+            Err(e) => debug!(
+                "Could not close tab of removed context {}: {}",
+                context_id, e
+            ),
+        }
+    }
 }
 
 /// Close a tab without waiting for Chrome's answer, leaving its context in place.
@@ -257,74 +265,99 @@ fn disposal_for(
     Some((disposer?.clone(), context.cdp_context_id.clone()?))
 }
 
-/// What the lifecycle monitor needs to build a replacement slot, owned so that the work can run
-/// on the blocking pool without the pool itself.
+/// Everything needed to create the CDP side of a pool slot, owned so that the work can run on
+/// the blocking pool without the pool itself — or its lock.
+///
+/// Every method here is blocking (each step is a CDP round-trip) and is meant to be called
+/// through `cdp_call::bounded*`, never directly on a runtime thread.
 struct SlotFactory {
     browser: Arc<Browser>,
     cdp_client: Option<Arc<BrowserCdpClient>>,
+    context_disposer: Option<Arc<BrowserCdpClient>>,
     tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>>,
     context_isolation: ContextIsolation,
 }
 
 impl SlotFactory {
-    /// Create the CDP side of a recycled slot: `(tab, cdp_context_id)`, either of which may be
-    /// missing when Chrome refused. Blocking — every step is a CDP round-trip.
-    fn create(&self, context_proxy_host: Option<&str>) -> (Option<Arc<Tab>>, Option<String>) {
-        match self.context_isolation {
-            ContextIsolation::Isolated => {
-                // Recycling must route the new context exactly like the request path does.
-                // Creating it with the plain call for a provider that routes per context would
-                // drop it onto the launch proxy, so the pool would stop rotating after the first
-                // lifecycle tick.
-                let created = match (&self.cdp_client, context_proxy_host) {
-                    (Some(client), Some(host)) => client
-                        .create_browser_context(host)
-                        .map_err(|e| e.to_string()),
-                    _ => self
-                        .browser
-                        .new_context()
-                        .map(|cdp_context| cdp_context.get_id().to_string())
-                        .map_err(|e| e.to_string()),
-                };
+    /// Create the CDP BrowserContext for a new slot and return its id.
+    ///
+    /// For providers that route per context the context is created with its own proxy, because
+    /// `Browser::new_context()` cannot carry one. There is no fallback to the plain path on
+    /// failure: it would put the slot on the launch proxy while the logs claimed rotation — the
+    /// exact silent single-host behaviour per-context routing exists to remove. Recycling must
+    /// route exactly like the request path, or the pool would stop rotating after the first
+    /// lifecycle tick.
+    fn create_cdp_context(&self, context_proxy_host: Option<&str>) -> Result<String> {
+        match (&self.cdp_client, context_proxy_host) {
+            (Some(client), Some(host)) => client.create_browser_context(host).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create isolated CDP context with its own proxy: {}",
+                    e
+                )
+            }),
+            _ => self
+                .browser
+                .new_context()
+                .map(|cdp_context| cdp_context.get_id().to_string())
+                .map_err(|e| anyhow::anyhow!("Failed to create isolated CDP context: {}", e)),
+        }
+    }
 
-                match created {
-                    Ok(ctx_id) => match CdpContext::new(&self.browser, ctx_id.clone()).new_tab() {
-                        Ok(new_tab) => {
-                            self.apply_middlewares(&new_tab);
-                            (Some(new_tab), Some(ctx_id))
-                        }
-                        Err(e) => {
-                            // Keep the context id: the CDP BrowserContext was created and
-                            // carries this slot's proxy, only the tab failed. Dropping the id
-                            // here would send the next request's lazy tab creation into the
-                            // browser's default context - no isolation, and the launch proxy
-                            // instead of the assigned host.
-                            warn!(
-                                "Failed to create tab in isolated context {} - keeping the \
-                                 context, the tab is created lazily on the next request: {}",
-                                ctx_id, e
-                            );
-                            (None, Some(ctx_id))
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to create isolated context during recycling: {}", e);
-                        (None, None)
+    /// Create the CDP side of a new slot for the request path: `(tab, cdp_context_id)`.
+    ///
+    /// All or nothing: a CDP context whose tab could not be created is disposed again rather
+    /// than leaked, since the caller gets an error and keeps nothing.
+    fn build(&self, context_proxy_host: Option<&str>) -> Result<(Arc<Tab>, Option<String>)> {
+        let cdp_context_id = match self.context_isolation {
+            ContextIsolation::Isolated => Some(self.create_cdp_context(context_proxy_host)?),
+            ContextIsolation::Shared => None,
+        };
+        match self.new_tab(cdp_context_id.as_deref()) {
+            Ok(tab) => Ok((tab, cdp_context_id)),
+            Err(e) => {
+                if let (Some(disposer), Some(id)) = (&self.context_disposer, &cdp_context_id) {
+                    if let Err(dispose_err) = disposer.dispose_browser_context(id) {
+                        debug!("Could not dispose CDP context {}: {:#}", id, dispose_err);
                     }
                 }
+                Err(e)
             }
-            ContextIsolation::Shared => match self.browser.new_tab() {
-                // Default browser context (shared cookies/storage)
-                Ok(new_tab) => {
-                    debug!("Successfully created tab during context recycling");
-                    self.apply_middlewares(&new_tab);
-                    (Some(new_tab), None)
+        }
+    }
+
+    /// Create the CDP side of a recycled slot: `(tab, cdp_context_id)`, either of which may be
+    /// missing when Chrome refused. Unlike [`Self::build`] it keeps what it got: the lifecycle
+    /// monitor always replaces the old slot, and the next request completes a partial one.
+    fn create(&self, context_proxy_host: Option<&str>) -> (Option<Arc<Tab>>, Option<String>) {
+        match self.context_isolation {
+            ContextIsolation::Isolated => match self.create_cdp_context(context_proxy_host) {
+                Ok(ctx_id) => match self.new_tab(Some(&ctx_id)) {
+                    Ok(new_tab) => (Some(new_tab), Some(ctx_id)),
+                    Err(e) => {
+                        // Keep the context id: the CDP BrowserContext was created and carries
+                        // this slot's proxy, only the tab failed. Dropping the id here would
+                        // send the next request's lazy tab creation into the browser's default
+                        // context - no isolation, and the launch proxy instead of the assigned
+                        // host.
+                        warn!(
+                            "Failed to create tab in isolated context {} - keeping the context, \
+                             the tab is created lazily on the next request: {}",
+                            ctx_id, e
+                        );
+                        (None, Some(ctx_id))
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to create isolated context during recycling: {}", e);
+                    (None, None)
                 }
+            },
+            ContextIsolation::Shared => match self.new_tab(None) {
+                Ok(new_tab) => (Some(new_tab), None),
                 Err(e) => {
                     warn!(
-                        "Failed to create tab during recycling (likely WebSocket timeout): {}. \
-                         Context will be created without tab - it will be lazily initialized on \
-                         next request.",
+                        "Failed to create tab during recycling: {}. Context will be created \
+                         without tab - it will be lazily initialized on next request.",
                         e
                     );
                     (None, None)
@@ -333,16 +366,66 @@ impl SlotFactory {
         }
     }
 
-    fn apply_middlewares(&self, tab: &Arc<Tab>) {
+    /// Open a tab in the given CDP BrowserContext, or in the browser's default context for
+    /// `None`, and apply the tab init middlewares to it.
+    ///
+    /// Callers must pass the slot's own context when it has one: cookies, storage and — for
+    /// providers that route per context — the proxy all live on the CDP context, so a tab in the
+    /// default context silently has none of them.
+    fn new_tab(&self, cdp_context_id: Option<&str>) -> Result<Arc<Tab>> {
+        let tab = match cdp_context_id {
+            // Tab creation, Fetch auth and navigation all stay on headless_chrome's own
+            // transport - the context id is browser state, so the crate can adopt it.
+            Some(id) => CdpContext::new(&self.browser, id.to_string())
+                .new_tab()
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create tab in CDP context {}: {}", id, e)
+                })?,
+            None => self
+                .browser
+                .new_tab()
+                .map_err(|e| anyhow::anyhow!("Failed to create tab: {}", e))?,
+        };
+
         for middleware in &self.tab_init_middlewares {
-            if let Err(e) = middleware.apply(tab) {
+            if let Err(e) = middleware.apply(&tab) {
                 warn!(
-                    "Failed to apply tab init middleware '{}' during recycling: {}",
+                    "Failed to apply tab init middleware '{}': {}",
                     middleware.name(),
                     e
                 );
             }
         }
+        Ok(tab)
+    }
+
+    /// Release what a creation made after nobody was left to receive it (see
+    /// `cdp_call::bounded_with_cleanup`). Already on a blocking thread.
+    fn discard(&self, tab: Option<Arc<Tab>>, cdp_context_id: Option<String>) {
+        let disposal = self.context_disposer.clone().zip(cdp_context_id);
+        warn!("Releasing a context whose creation finished after its caller gave up");
+        release_context_now(tab, disposal, uuid::Uuid::nil());
+    }
+}
+
+/// A pool slot promised to a context that is still being built, outside the pool lock.
+///
+/// Counted as occupied by every capacity check and by `get_stats` for as long as it lives, so
+/// the pool never over-commits while creation runs unlocked. Released on drop — on success
+/// under the same write lock that pushes the new context, and on every failure, timeout or
+/// dropped request by the drop itself.
+struct SlotReservation(Arc<AtomicUsize>);
+
+impl SlotReservation {
+    fn take(pending: &Arc<AtomicUsize>) -> Self {
+        pending.fetch_add(1, Ordering::SeqCst);
+        Self(pending.clone())
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -602,7 +685,7 @@ impl BrowserPool {
                  proxy from the pool",
                 scope_config.proxy_provider.name()
             );
-            Some(Arc::new(client))
+            Some(client)
         } else {
             None
         };
@@ -644,8 +727,18 @@ impl BrowserPool {
         };
         info!("Context isolation mode: {}", isolation_mode);
 
+        let browser = Arc::new(browser);
+        let cdp_client = cdp_client.map(Arc::new);
+        let slot_factory = Arc::new(SlotFactory {
+            browser: browser.clone(),
+            cdp_client: cdp_client.clone(),
+            context_disposer: context_disposer.clone(),
+            tab_init_middlewares,
+            context_isolation: scope_config.context_isolation,
+        });
+
         let pool = Self {
-            browser: Arc::new(browser),
+            browser,
             contexts: Arc::new(RwLock::new(Vec::new())),
             scope_config: scope_config.clone(),
             lifecycle_config,
@@ -655,7 +748,8 @@ impl BrowserPool {
             context_disposer,
             lifecycle_monitor: std::sync::Mutex::new(None),
             proxy_host_mismatch_warned: AtomicBool::new(false),
-            tab_init_middlewares,
+            slot_factory,
+            pending_creations: Arc::new(AtomicUsize::new(0)),
             total_contexts_created: Arc::new(AtomicU64::new(0)),
             total_contexts_recycled: Arc::new(AtomicU64::new(0)),
         };
@@ -830,75 +924,25 @@ impl BrowserPool {
             launch_proxy_host.clone()
         };
 
-        // Create tab based on isolation mode
-        let (new_tab, cdp_context_id) = match self.scope_config.context_isolation {
-            ContextIsolation::Isolated => {
-                // Create isolated CDP BrowserContext (like incognito - separate cookies/storage)
-                let context_id = match (&self.cdp_client, &context_proxy_host) {
-                    // Providers whose pool is a list of hosts: the context is created with its
-                    // own proxy, because `Browser::new_context()` cannot carry one.
-                    //
-                    // No fallback to the plain path on failure. Falling back would put the
-                    // request on the launch proxy while the logs claimed rotation - the exact
-                    // silent single-host behaviour this exists to remove.
-                    (Some(client), Some(host)) => {
-                        client.create_browser_context(host).map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to create isolated CDP context with its own proxy: {}",
-                                e
-                            )
-                        })?
-                    }
-                    _ => self
-                        .browser
-                        .new_context()
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to create isolated CDP context: {}", e)
-                        })?
-                        .get_id()
-                        .to_string(),
-                };
+        // The CDP work runs on the blocking pool with a bounded wait, never on a runtime thread:
+        // every step is a CDP round-trip that a wedged browser leaves unanswered for up to an
+        // hour. A creation that finishes after the wait gave up releases what it made.
+        let factory = self.slot_factory.clone();
+        let orphan_factory = self.slot_factory.clone();
+        let host = context_proxy_host.clone();
+        let (new_tab, cdp_context_id) = cdp_call::bounded_with_cleanup(
+            "Target.createBrowserContext/createTarget",
+            move || factory.build(host.as_deref()),
+            move |(tab, cdp_context_id)| orphan_factory.discard(Some(tab), cdp_context_id),
+        )
+        .await?;
 
-                // Tab creation, Fetch auth and navigation all stay on headless_chrome's own
-                // transport - the context id is browser state, so the crate can adopt it.
-                let cdp_context = CdpContext::new(&self.browser, context_id.clone());
-                let tab = cdp_context.new_tab().map_err(|e| {
-                    anyhow::anyhow!("Failed to create tab in isolated context: {}", e)
-                })?;
-
-                info!(
-                    "Created ISOLATED CDP context {} with tab (proxy: {})",
-                    context_id,
-                    proxy_host.as_deref().unwrap_or("direct connection")
-                );
-
-                (tab, Some(context_id))
-            }
-            ContextIsolation::Shared => {
-                // Create tab in default browser context (shared cookies/storage)
-                let tab = self
-                    .browser
-                    .new_tab()
-                    .map_err(|e| anyhow::anyhow!("Failed to create tab: {}", e))?;
-
-                (tab, None)
-            }
-        };
-
-        // Apply tab init middlewares to customize the newly created tab
-        for middleware in &self.tab_init_middlewares {
-            if let Err(e) = middleware.apply(&new_tab) {
-                warn!(
-                    "Failed to apply tab init middleware '{}': {}",
-                    middleware.name(),
-                    e
-                );
-            } else {
-                tracing::debug!(
-                    "Successfully applied tab init middleware '{}'",
-                    middleware.name()
-                );
-            }
+        if let Some(context_id) = &cdp_context_id {
+            info!(
+                "Created ISOLATED CDP context {} with tab (proxy: {})",
+                context_id,
+                proxy_host.as_deref().unwrap_or("direct connection")
+            );
         }
 
         let creation_time_ms = start_time.elapsed().as_millis();
@@ -974,12 +1018,7 @@ impl BrowserPool {
         let total_created = self.total_contexts_created.clone();
         let proxy_provider = self.proxy_provider.clone();
         let session_mode = self.scope_config.session_mode;
-        let slot_factory = Arc::new(SlotFactory {
-            browser: self.browser.clone(),
-            cdp_client: self.cdp_client.clone(),
-            tab_init_middlewares: self.tab_init_middlewares.clone(),
-            context_isolation: self.scope_config.context_isolation,
-        });
+        let slot_factory = self.slot_factory.clone();
         let context_disposer = self.context_disposer.clone();
         let launch_proxy_host = self.proxy_config.build_proxy_server();
 
@@ -1138,16 +1177,19 @@ impl BrowserPool {
                         launch_proxy_host.clone()
                     };
 
-                    // 2. Without the lock, on the blocking pool: build the replacement.
+                    // 2. Without the lock, on the blocking pool: build the replacement. A
+                    //    creation that stalls leaves the slot empty, like one Chrome refused; if
+                    //    it finishes later, it releases what it made.
                     let factory = slot_factory.clone();
-                    let span = tracing::Span::current();
-                    let (tab, cdp_context_id) = tokio::task::spawn_blocking(move || {
-                        let _guard = span.enter();
-                        factory.create(context_proxy_host.as_deref())
-                    })
+                    let orphan_factory = slot_factory.clone();
+                    let (tab, cdp_context_id) = cdp_call::bounded_with_cleanup(
+                        "recycle Target.createBrowserContext/createTarget",
+                        move || Ok(factory.create(context_proxy_host.as_deref())),
+                        move |(tab, cdp_context_id)| orphan_factory.discard(tab, cdp_context_id),
+                    )
                     .await
                     .unwrap_or_else(|e| {
-                        warn!("Recycling task failed: {}", e);
+                        warn!("Recycling context {} failed: {:#}", old.metadata.id, e);
                         (None, None)
                     });
 
@@ -1283,7 +1325,7 @@ impl BrowserPool {
         }
 
         // No idle context available (or dedicated context required) - try to create a new one
-        let mut contexts = self.contexts.write().await;
+        let contexts = self.contexts.write().await;
 
         if !proxy_params.requires_dedicated_context() {
             // Double-check after acquiring write lock (another task might have created one)
@@ -1293,10 +1335,11 @@ impl BrowserPool {
         }
 
         // Check if we're under the limit
-        if contexts.len() < self.scope_config.max_contexts as usize {
+        let occupied = self.occupied_slots(&contexts);
+        if occupied < self.scope_config.max_contexts as usize {
             info!(
                 "Creating new context on-demand ({}/{}){}",
-                contexts.len() + 1,
+                occupied + 1,
                 self.scope_config.max_contexts,
                 if proxy_params.requires_dedicated_context() {
                     " [dedicated]"
@@ -1305,11 +1348,12 @@ impl BrowserPool {
                 }
             );
 
-            let context = self.create_new_context(proxy_params).await?;
-            let context_arc = Arc::new(context);
-            contexts.push(context_arc.clone());
-
-            return Ok(Some(context_arc));
+            let reservation = SlotReservation::take(&self.pending_creations);
+            drop(contexts);
+            return self
+                .build_reserved_context(reservation, proxy_params, false)
+                .await
+                .map(Some);
         }
 
         // At maximum capacity. If the only reason nothing was selected is that every idle context
@@ -1333,10 +1377,41 @@ impl BrowserPool {
 
         info!(
             "Cannot create new context - at max capacity ({}/{})",
-            contexts.len(),
-            self.scope_config.max_contexts
+            occupied, self.scope_config.max_contexts
         );
         Ok(None)
+    }
+
+    /// Contexts in the pool plus slots reserved by contexts still being built.
+    fn occupied_slots(&self, contexts: &[Arc<BrowserContext>]) -> usize {
+        contexts.len() + self.pending_creations.load(Ordering::SeqCst)
+    }
+
+    /// Build a context for a slot reserved under the pool lock, then add it to the pool.
+    ///
+    /// The creation runs with the lock released: it is several CDP round-trips, and under the
+    /// write lock one that stalled blocked every context acquisition and the lifecycle monitor
+    /// with it. The reservation keeps the slot counted meanwhile and is released under the same
+    /// lock that pushes the context, so `len + pending` never dips in between.
+    ///
+    /// `busy` pre-marks the context before it becomes visible (AlwaysNew, see
+    /// `create_always_new_context`).
+    async fn build_reserved_context(
+        &self,
+        reservation: SlotReservation,
+        proxy_params: &ProxyParams,
+        busy: bool,
+    ) -> Result<Arc<BrowserContext>> {
+        let context = self.create_new_context(proxy_params).await?;
+        if busy {
+            context.metadata.is_busy.store(true, Ordering::SeqCst);
+        }
+        let context = Arc::new(context);
+
+        let mut contexts = self.contexts.write().await;
+        contexts.push(context.clone());
+        drop(reservation);
+        Ok(context)
     }
 
     /// Create a context that will belong to one session (Dedicated mode).
@@ -1353,9 +1428,10 @@ impl BrowserPool {
         &self,
         proxy_params: &ProxyParams,
     ) -> Result<Option<Arc<BrowserContext>>> {
-        let mut contexts = self.contexts.write().await;
+        let contexts = self.contexts.write().await;
 
-        if contexts.len() >= self.scope_config.max_contexts as usize {
+        let occupied = self.occupied_slots(&contexts);
+        if occupied >= self.scope_config.max_contexts as usize {
             info!(
                 "Cannot start a new session (Dedicated mode) - all {} session slots are claimed",
                 self.scope_config.max_contexts
@@ -1365,15 +1441,16 @@ impl BrowserPool {
 
         info!(
             "Starting a new session context (Dedicated mode) ({}/{}) with proxy params: country_code={:?}",
-            contexts.len() + 1,
+            occupied + 1,
             self.scope_config.max_contexts,
             proxy_params.country_code
         );
 
-        let context = Arc::new(self.create_new_context(proxy_params).await?);
-        contexts.push(context.clone());
-
-        Ok(Some(context))
+        let reservation = SlotReservation::take(&self.pending_creations);
+        drop(contexts);
+        self.build_reserved_context(reservation, proxy_params, false)
+            .await
+            .map(Some)
     }
 
     /// Create a new context without reusing idle ones (AlwaysNew mode).
@@ -1405,37 +1482,21 @@ impl BrowserPool {
         }
 
         // Check if we're under the limit
-        let result = if contexts.len() < self.scope_config.max_contexts as usize {
+        let occupied = self.occupied_slots(&contexts);
+        let reservation = if occupied < self.scope_config.max_contexts as usize {
             info!(
                 "Creating new context (AlwaysNew mode) ({}/{}) with proxy params: country_code={:?}",
-                contexts.len() + 1,
+                occupied + 1,
                 self.scope_config.max_contexts,
                 proxy_params.country_code
             );
-
-            // No `?` here: an early return would skip closing the purged tabs below.
-            match self.create_new_context(proxy_params).await {
-                Ok(context) => {
-                    // Pre-mark as busy while still holding the write lock, so the context is
-                    // never visible to the purge above as an idle (and therefore collectable)
-                    // context. ContextBusyGuard adopts this flag instead of setting it.
-                    context.metadata.is_busy.store(true, Ordering::SeqCst);
-
-                    let context_arc = Arc::new(context);
-                    contexts.push(context_arc.clone());
-
-                    Ok(Some(context_arc))
-                }
-                Err(e) => Err(e),
-            }
+            Some(SlotReservation::take(&self.pending_creations))
         } else {
-            // At maximum capacity
             info!(
                 "Cannot create new context (AlwaysNew mode) - at max capacity ({}/{})",
-                contexts.len(),
-                self.scope_config.max_contexts
+                occupied, self.scope_config.max_contexts
             );
-            Ok(None)
+            None
         };
 
         // Release the purged contexts only after the pool lock is released.
@@ -1444,7 +1505,16 @@ impl BrowserPool {
             release_context(context, self.context_disposer.as_ref()).await;
         }
 
-        result
+        // Pre-marked busy before it enters the pool, so the purge above never sees it as an idle
+        // (and therefore collectable) context. ContextBusyGuard adopts this flag instead of
+        // setting it.
+        match reservation {
+            Some(reservation) => self
+                .build_reserved_context(reservation, proxy_params, true)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Remove a context from the pool by its ID.
@@ -1514,8 +1584,13 @@ impl BrowserPool {
         // its slot. Everywhere else nothing is held between requests, so claimed is exactly the
         // busy count. Defined this way the number is a superset of `active_requests` in every
         // mode, which is what makes it usable as a single autoscaling signal.
+        //
+        // A slot reserved by a context still being built counts in both: a request is waiting
+        // for it, and it is as unavailable as a busy one.
+        let pending = self.pending_creations.load(Ordering::SeqCst);
+        let active_requests = active_requests + pending;
         let claimed_contexts = if self.scope_config.session_mode == SessionMode::Dedicated {
-            contexts.len().max(active_requests)
+            (contexts.len() + pending).max(active_requests)
         } else {
             active_requests
         };
@@ -1587,96 +1662,27 @@ impl BrowserPool {
         )
     }
 
-    /// Create a new tab in an existing CDP BrowserContext.
+    /// Open a new tab for an existing slot, with the tab init middlewares applied: inside the
+    /// slot's CDP BrowserContext when it has one (cookies, storage and the per-context proxy
+    /// survive), in the browser's default context for `None` (`shared` isolation).
     ///
-    /// This is used to recreate a tab after it dies (e.g., after hard timeout
-    /// closes it) while preserving the CDP context's session state (cookies, storage).
-    ///
-    /// # Parameters
-    /// * `cdp_context_id` - The CDP BrowserContext ID to create the tab in
-    ///
-    /// # Returns
-    /// * `Ok(Arc<Tab>)` - The newly created tab
-    /// * `Err` - Failed to create tab (context may be invalid)
-    pub fn create_tab_in_context(&self, cdp_context_id: &str) -> Result<Arc<Tab>> {
-        info!("Recreating tab in existing CDP context: {}", cdp_context_id);
-
-        let create_target = CreateTarget {
-            url: "about:blank".to_string(),
-            left: None,
-            top: None,
-            width: None,
-            height: None,
-            window_state: None,
-            browser_context_id: Some(cdp_context_id.into()),
-            enable_begin_frame_control: None,
-            new_window: None,
-            background: None,
-            for_tab: None,
-            hidden: None,
-        };
-
-        let new_tab = self
-            .browser
-            .new_tab_with_options(create_target)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create tab in CDP context {}: {}",
-                    cdp_context_id,
-                    e
-                )
-            })?;
-
-        // Apply tab init middlewares to the recreated tab
-        for middleware in &self.tab_init_middlewares {
-            if let Err(e) = middleware.apply(&new_tab) {
-                warn!(
-                    "Failed to apply tab init middleware '{}' to recreated tab: {}",
-                    middleware.name(),
-                    e
-                );
-            }
+    /// For a slot that has no tab yet, or whose tab lost its CDP session. Bounded like every
+    /// CDP call on the request path; a stall comes back as `cdp_call::StalledCall`, and a tab
+    /// that opens after the caller gave up is closed again.
+    pub async fn create_tab(&self, cdp_context_id: Option<&str>) -> Result<Arc<Tab>> {
+        match cdp_context_id {
+            Some(id) => info!("Creating tab in existing CDP context: {}", id),
+            None => info!("Creating tab in shared browser context"),
         }
-
-        info!(
-            "Successfully recreated tab in CDP context: {}",
-            cdp_context_id
-        );
-
-        Ok(new_tab)
-    }
-
-    /// Create a new tab in shared (default) browser context.
-    ///
-    /// This is used to recreate a tab when the previous one died in shared mode.
-    ///
-    /// # Parameters
-    ///
-    /// # Returns
-    /// * `Ok(Arc<Tab>)` - The newly created tab
-    /// * `Err` - Failed to create tab
-    pub fn create_tab_shared(&self) -> Result<Arc<Tab>> {
-        info!("Recreating tab in shared browser context");
-
-        let new_tab = self
-            .browser
-            .new_tab()
-            .map_err(|e| anyhow::anyhow!("Failed to create tab in shared context: {}", e))?;
-
-        // Apply tab init middlewares to the recreated tab
-        for middleware in &self.tab_init_middlewares {
-            if let Err(e) = middleware.apply(&new_tab) {
-                warn!(
-                    "Failed to apply tab init middleware '{}' to recreated tab: {}",
-                    middleware.name(),
-                    e
-                );
-            }
-        }
-
-        info!("Successfully recreated tab in shared context");
-
-        Ok(new_tab)
+        let factory = self.slot_factory.clone();
+        let id = cdp_context_id.map(str::to_string);
+        cdp_call::bounded_with_cleanup(
+            "Target.createTarget",
+            move || factory.new_tab(id.as_deref()),
+            // Close the tab only: the CDP context belongs to a slot that is still in the pool.
+            |tab| release_context_now(Some(tab), None, uuid::Uuid::nil()),
+        )
+        .await
     }
 }
 

@@ -279,9 +279,20 @@ total_requests: <count>, cache_size_mb: <size>) (after <ms>ms)
 Failed to create tab for context <id> (domain: <domain>): <error> (after <ms>ms)
 ```
 
+**BROWSER_ERROR** (a setup call on the tab went unanswered — the context is removed and the
+response carries no session):
+```
+CDP call <method> did not answer within 30s - the browser stopped responding - context <id> was removed from the pool (after <ms>ms)
+```
+Every synchronous CDP call on the request path (tab creation, `Fetch.enable`, `Network.enable`,
+the diagnostics `enable`s and `evaluate`s) waits at most 30 s. A stall while *creating* a context
+reaches the client as `CONTEXT_CREATION_FAILED` instead, with the same `CDP call … did not answer`
+text. A stall in the status fallback after the content was read keeps the response (with
+`status_code` 0) and drops only the session.
+
 **CONTEXT_CREATION_FAILED**:
 ```
-Failed to create new browser context: <error> (after <ms>ms)
+Failed to create context: <error>
 Failed to create context after pool recreation: <error>
 ```
 
@@ -694,9 +705,10 @@ this applies. The contract, for a request that carried a `session_id`:
    restart (sessions live in its memory).
 
 Rule 2 is exact for every answer the worker gives: an empty session means its context was
-removed — hard timeout (4041, or 5003 from `get_content`), `destroy_session_on_block` (HTTP
-403/429, reported as `success = true`), a slot whose CDP context was lost (5003), a dead browser
-(5003), a terminating pod (5006) or a context that no longer exists (4002). An invalid URL (4001)
+removed — hard timeout (4041, or 5003 from `get_content`), a CDP call that went unanswered for
+30 s (5003, or any outcome when it was the status read after the content), `destroy_session_on_block`
+(HTTP 403/429, reported as `success = true`), a slot whose CDP context was lost (5003), a dead
+browser (5003), a terminating pod (5006) or a context that no longer exists (4002). An invalid URL (4001)
 returns the session because the context was never touched, and `SESSION_BUSY` (4004) does too.
 
 **The one inexact case is `WORKER_UNREACHABLE` (5002)**, answered by the coordinator when it

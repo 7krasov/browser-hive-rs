@@ -1,4 +1,5 @@
 use crate::browser_pool::{BrowserContext, BrowserPool};
+use crate::cdp_call;
 use crate::diagnostics::DiagnosticsLimiter;
 use crate::metrics::Metrics;
 use anyhow::Result;
@@ -161,6 +162,15 @@ fn cross_site_redirect_target(requested_url: &str, final_url: &str) -> Option<St
     let requested_domain = psl::domain_str(&requested_host)?;
     let final_domain = psl::domain_str(&final_host)?;
     (requested_domain != final_domain).then(|| final_domain.to_string())
+}
+
+/// Enable the Fetch domain with auth handling, so the proxy's 407 challenge is answered.
+async fn enable_fetch(tab: &Arc<headless_chrome::Tab>) -> anyhow::Result<()> {
+    let tab = tab.clone();
+    cdp_call::bounded("Fetch.enable", move || {
+        tab.enable_fetch(None, Some(true)).map(|_| ())
+    })
+    .await
 }
 
 /// Calculate SHA256 hash of content for compact logging
@@ -509,16 +519,49 @@ impl WorkerService {
     /// why the response carries no `context_id`.
     ///
     /// The caller must release `context.tab` first; `release_context` takes the same mutex.
-    async fn discard_stuck_context(&self, context: &Arc<BrowserContext>) {
+    async fn discard_stuck_context(&self, context: &Arc<BrowserContext>, reason: &str) {
         warn!(
-            "Removing context {} from the pool after a hard timeout",
-            context.metadata.id
+            "Removing context {} from the pool after {}",
+            context.metadata.id, reason
         );
         self.browser_pool
             .read()
             .await
             .destroy_context(&context.metadata.id)
             .await;
+    }
+
+    /// End the attempt after a CDP call on this context's tab did not answer (see `cdp_call`).
+    ///
+    /// Same remedy as a hard timeout — the context is removed and the response carries no
+    /// `context_id` — but `BROWSER_ERROR` rather than `TIMEOUT_BROWSER`: the page never got as
+    /// far as loading, the browser stopped answering a setup call. Like `discard_stuck_context`,
+    /// the caller must release `context.tab` and the pool guard first.
+    async fn stalled_call_response(
+        &self,
+        context: &Arc<BrowserContext>,
+        error: &anyhow::Error,
+        ray_id: &str,
+        start_time: Instant,
+    ) -> ScrapePageResponse {
+        warn!("{:#}", error);
+        self.discard_stuck_context(context, "a stalled CDP call")
+            .await;
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        ScrapePageResponse {
+            success: false,
+            status_code: 0,
+            content: String::new(),
+            error_message: format!(
+                "{:#} - context {} was removed from the pool (after {}ms)",
+                error, context.metadata.id, execution_time_ms
+            ),
+            error_code: ErrorCode::BrowserError as i32,
+            response_headers: std::collections::HashMap::new(),
+            execution_time_ms,
+            context_id: String::new(), // removed from the pool
+            ray_id: ray_id.to_string(),
+        }
     }
 
     /// Arm the AlwaysNew cleanup guard for a context, or nothing outside AlwaysNew mode.
@@ -923,7 +966,6 @@ impl WorkerService {
         // Neither is reassigned any more: a request never continues against a pool that was
         // replaced under it, so there is no "re-acquire with the new pool" step.
         let browser_pool_guard = self.browser_pool.read().await;
-        let browser = browser_pool_guard.get_browser();
 
         // Use context-specific proxy if available, otherwise use global proxy
         let proxy_config = match context.metadata.assigned_proxy_config.as_ref() {
@@ -1007,13 +1049,19 @@ impl WorkerService {
             //
             // Isolated slots keep their CDP context across a failed recycling, so the tab goes
             // back inside it - same reasoning as the dead-tab recovery further down.
-            let created = match &context.cdp_context_id {
-                Some(cdp_ctx_id) => browser_pool_guard.create_tab_in_context(cdp_ctx_id),
-                None => browser.new_tab(),
-            };
+            let created = browser_pool_guard
+                .create_tab(context.cdp_context_id.as_deref())
+                .await;
             match created {
                 Ok(new_tab) => {
                     *tab_guard = Some(new_tab);
+                }
+                Err(e) if cdp_call::is_stalled(&e) => {
+                    drop(tab_guard);
+                    drop(browser_pool_guard);
+                    return Ok(self
+                        .stalled_call_response(&context, &e, ray_id, start_time)
+                        .await);
                 }
                 Err(e) => {
                     let error_msg = e.to_string();
@@ -1080,9 +1128,16 @@ impl WorkerService {
         // In such cases, we recreate the tab and try once more.
         if let Some((username, password)) = proxy_config.get_credentials() {
             // Try to enable Fetch domain to handle auth requests
-            let enable_result = tab.enable_fetch(None, Some(true));
+            let enable_result = enable_fetch(&tab).await;
 
             if let Err(e) = enable_result {
+                if cdp_call::is_stalled(&e) {
+                    drop(tab_guard);
+                    drop(browser_pool_guard);
+                    return Ok(self
+                        .stalled_call_response(&context, &e, ray_id, start_time)
+                        .await);
+                }
                 let error_msg = e.to_string();
 
                 // Check if this is a "dead tab" error (tab's CDP session closed but browser alive).
@@ -1095,51 +1150,37 @@ impl WorkerService {
                         context.cdp_context_id
                     );
 
-                    // Recreate tab in the appropriate context (isolated or shared)
-                    let new_tab = if let Some(cdp_ctx_id) = &context.cdp_context_id {
-                        // Isolated context - recreate tab in the same CDP BrowserContext
-                        // This preserves cookies and storage from previous requests
-                        match browser_pool_guard.create_tab_in_context(cdp_ctx_id) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                                return Ok(ScrapePageResponse {
-                                    success: false,
-                                    status_code: 0,
-                                    content: String::new(),
-                                    error_message: format!(
-                                        "Failed to recreate tab in CDP context {} for context {}: {} (after {}ms)",
-                                        cdp_ctx_id, context.metadata.id, e, execution_time_ms
-                                    ),
-                                    error_code: ErrorCode::BrowserError as i32,
-                                    response_headers: std::collections::HashMap::new(),
-                                    execution_time_ms,
-                                    context_id: self.addressable_context_id(&context),
-                                    ray_id: ray_id.to_string(),
-                                });
-                            }
+                    // Recreate the tab in the slot's own CDP BrowserContext (isolated), which
+                    // preserves cookies and storage from previous requests, or in the default
+                    // context (shared).
+                    let new_tab = match browser_pool_guard
+                        .create_tab(context.cdp_context_id.as_deref())
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(e) if cdp_call::is_stalled(&e) => {
+                            drop(tab_guard);
+                            drop(browser_pool_guard);
+                            return Ok(self
+                                .stalled_call_response(&context, &e, ray_id, start_time)
+                                .await);
                         }
-                    } else {
-                        // Shared context - recreate tab in default browser context
-                        match browser_pool_guard.create_tab_shared() {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                                return Ok(ScrapePageResponse {
-                                    success: false,
-                                    status_code: 0,
-                                    content: String::new(),
-                                    error_message: format!(
-                                        "Failed to recreate tab in shared context for context {}: {} (after {}ms)",
-                                        context.metadata.id, e, execution_time_ms
-                                    ),
-                                    error_code: ErrorCode::BrowserError as i32,
-                                    response_headers: std::collections::HashMap::new(),
-                                    execution_time_ms,
-                                    context_id: self.addressable_context_id(&context),
-                                    ray_id: ray_id.to_string(),
-                                });
-                            }
+                        Err(e) => {
+                            let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                            return Ok(ScrapePageResponse {
+                                success: false,
+                                status_code: 0,
+                                content: String::new(),
+                                error_message: format!(
+                                    "Failed to recreate tab (cdp_context_id: {:?}) for context {}: {} (after {}ms)",
+                                    context.cdp_context_id, context.metadata.id, e, execution_time_ms
+                                ),
+                                error_code: ErrorCode::BrowserError as i32,
+                                response_headers: std::collections::HashMap::new(),
+                                execution_time_ms,
+                                context_id: self.addressable_context_id(&context),
+                                ray_id: ray_id.to_string(),
+                            });
                         }
                     };
 
@@ -1147,7 +1188,14 @@ impl WorkerService {
                     *tab_guard = Some(new_tab);
 
                     // Retry enable_fetch on the recreated tab
-                    if let Err(e) = tab.enable_fetch(None, Some(true)) {
+                    if let Err(e) = enable_fetch(&tab).await {
+                        if cdp_call::is_stalled(&e) {
+                            drop(tab_guard);
+                            drop(browser_pool_guard);
+                            return Ok(self
+                                .stalled_call_response(&context, &e, ray_id, start_time)
+                                .await);
+                        }
                         let execution_time_ms = start_time.elapsed().as_millis() as u64;
                         return Ok(ScrapePageResponse {
                             success: false,
@@ -1185,17 +1233,23 @@ impl WorkerService {
                     // and as the lazy creation earlier: a request is never served from the
                     // browser's default context, which would silently cost it its isolation and,
                     // for providers that route per context, its proxy.
-                    let recreated = match &context.cdp_context_id {
-                        Some(cdp_ctx_id) => browser_pool_guard.create_tab_in_context(cdp_ctx_id),
-                        None => browser.new_tab(),
-                    };
+                    let recreated = browser_pool_guard
+                        .create_tab(context.cdp_context_id.as_deref())
+                        .await;
                     match recreated {
                         Ok(new_tab) => {
                             tab = new_tab.clone();
                             *tab_guard = Some(new_tab);
 
                             // Retry enable_fetch on fresh tab
-                            if let Err(e) = tab.enable_fetch(None, Some(true)) {
+                            if let Err(e) = enable_fetch(&tab).await {
+                                if cdp_call::is_stalled(&e) {
+                                    drop(tab_guard);
+                                    drop(browser_pool_guard);
+                                    return Ok(self
+                                        .stalled_call_response(&context, &e, ray_id, start_time)
+                                        .await);
+                                }
                                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                                 return Ok(ScrapePageResponse {
                                     success: false,
@@ -1212,6 +1266,13 @@ impl WorkerService {
                                     ray_id: ray_id.to_string(),
                                 });
                             }
+                        }
+                        Err(e) if cdp_call::is_stalled(&e) => {
+                            drop(tab_guard);
+                            drop(browser_pool_guard);
+                            return Ok(self
+                                .stalled_call_response(&context, &e, ray_id, start_time)
+                                .await);
                         }
                         Err(e) => {
                             let tab_error = e.to_string();
@@ -1352,13 +1413,26 @@ impl WorkerService {
             use headless_chrome::protocol::cdp::types::Event;
             use headless_chrome::protocol::cdp::Network;
 
-            match tab.call_method(Network::Enable {
-                max_total_buffer_size: None,
-                max_resource_buffer_size: None,
-                max_post_data_size: None,
-                report_direct_socket_traffic: None,
-                enable_durable_messages: None,
-            }) {
+            let tab_for_enable = tab.clone();
+            let enabled = cdp_call::bounded("Network.enable", move || {
+                tab_for_enable
+                    .call_method(Network::Enable {
+                        max_total_buffer_size: None,
+                        max_resource_buffer_size: None,
+                        max_post_data_size: None,
+                        report_direct_socket_traffic: None,
+                        enable_durable_messages: None,
+                    })
+                    .map(|_| ())
+            })
+            .await;
+            match enabled {
+                Err(e) if cdp_call::is_stalled(&e) => {
+                    drop(tab_guard);
+                    return Ok(self
+                        .stalled_call_response(&context, &e, ray_id, start_time)
+                        .await);
+                }
                 Err(e) => {
                     debug!(
                         "Failed to enable Network domain for response capture: {}",
@@ -1460,12 +1534,22 @@ impl WorkerService {
         // The session emits on drop, which is what covers the early returns below (hard
         // timeouts, cancellation) without a call at every `return`. Its default outcome is
         // "failed"; the success path calls mark_success() further down.
-        let mut diagnostics = crate::diagnostics::start_capture(
+        let mut diagnostics = match crate::diagnostics::start_capture(
             &tab,
             &self.config.scope.diagnostics,
             &self.diagnostics_limiter,
             &req.url,
-        );
+        )
+        .await
+        {
+            Ok(diagnostics) => diagnostics,
+            Err(e) => {
+                drop(tab_guard);
+                return Ok(self
+                    .stalled_call_response(&context, &e, ray_id, start_time)
+                    .await);
+            }
+        };
 
         // Navigate to URL (reusing existing tab!)
         // NOTE: Navigation errors are NOT critical - we still try to get content (chrome error page)
@@ -1500,7 +1584,7 @@ impl WorkerService {
                     NAVIGATION_TIMEOUT_SECS
                 );
                 drop(tab_guard); // destroy_context takes this lock
-                self.discard_stuck_context(&context).await;
+                self.discard_stuck_context(&context, "a hard timeout").await;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(ScrapePageResponse {
                     success: false,
@@ -1547,8 +1631,9 @@ impl WorkerService {
         // surface. Gated on the diagnostics session so it inherits the same domain filter and
         // never costs anything on a normal request.
         if diagnostics.is_some() && navigation_result.is_ok() {
-            let check_headless = || -> Result<(), anyhow::Error> {
-                let result = tab.evaluate(
+            let tab_for_markers = tab.clone();
+            let markers = cdp_call::bounded("Runtime.evaluate (headless markers)", move || {
+                let result = tab_for_markers.evaluate(
                     r#"
                     JSON.stringify({
                         webdriver: navigator.webdriver,
@@ -1568,17 +1653,22 @@ impl WorkerService {
                     "#,
                     false,
                 )?;
+                Ok(result
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_string)))
+            })
+            .await;
 
-                if let Some(value) = result.value {
-                    if let Some(json_str) = value.as_str() {
-                        info!("Diagnostics/headless markers: {}", json_str);
-                    }
+            match markers {
+                Ok(Some(json_str)) => info!("Diagnostics/headless markers: {}", json_str),
+                Ok(None) => {}
+                Err(e) if cdp_call::is_stalled(&e) => {
+                    drop(tab_guard);
+                    return Ok(self
+                        .stalled_call_response(&context, &e, ray_id, start_time)
+                        .await);
                 }
-                Ok(())
-            };
-
-            if let Err(e) = check_headless() {
-                warn!("Failed to check headless markers: {}", e);
+                Err(e) => warn!("Failed to check headless markers: {}", e),
             }
 
             // Uncomment to check proxy exit IP (adds ~1sec overhead per request)
@@ -1703,7 +1793,7 @@ impl WorkerService {
                         hard_timeout_ms, wait_timeout
                     );
                     drop(tab_guard); // destroy_context takes this lock
-                    self.discard_stuck_context(&context).await;
+                    self.discard_stuck_context(&context, "a hard timeout").await;
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(ScrapePageResponse {
                         success: false,
@@ -1777,7 +1867,7 @@ impl WorkerService {
                     GET_CONTENT_TIMEOUT_SECS
                 );
                 drop(tab_guard); // destroy_context takes this lock
-                self.discard_stuck_context(&context).await;
+                self.discard_stuck_context(&context, "a hard timeout").await;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 return Ok(ScrapePageResponse {
                     success: false,
@@ -1879,37 +1969,55 @@ impl WorkerService {
         // Fall back to the Performance API only when the observer captured nothing — the
         // Network domain could not be enabled, or the navigation produced no response such
         // as a chrome-error:// page. Returns 0 if it still cannot be determined.
+        //
+        // A stall here comes after the content was read, so the response stands; only the
+        // context goes, since its tab stopped answering.
+        let mut context_discarded = false;
         let status_code = if observed_status > 0 {
             observed_status
         } else {
-            tab.evaluate(
-                r#"
-                (() => {
-                    try {
-                        // Performance API - most reliable for navigation
-                        const nav = performance.getEntriesByType('navigation')[0];
-                        if (nav && nav.responseStatus) {
-                            return nav.responseStatus;
-                        }
+            let tab_for_status = tab.clone();
+            let status = cdp_call::bounded("Runtime.evaluate (status fallback)", move || {
+                let result = tab_for_status.evaluate(
+                    r#"
+                    (() => {
+                        try {
+                            // Performance API - most reliable for navigation
+                            const nav = performance.getEntriesByType('navigation')[0];
+                            if (nav && nav.responseStatus) {
+                                return nav.responseStatus;
+                            }
 
-                        // Check for chrome error pages
-                        const url = document.URL;
-                        if (url.includes('chrome-error://')) {
-                            return 0; // Connection error
-                        }
+                            // Check for chrome error pages
+                            const url = document.URL;
+                            if (url.includes('chrome-error://')) {
+                                return 0; // Connection error
+                            }
 
-                        // Unknown status
-                        return 0;
-                    } catch (e) {
-                        return 0;
+                            // Unknown status
+                            return 0;
+                        } catch (e) {
+                            return 0;
+                        }
+                    })()
+                    "#,
+                    false,
+                )?;
+                Ok(result.value.and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+            })
+            .await;
+            match status {
+                Ok(status) => status,
+                Err(e) => {
+                    if cdp_call::is_stalled(&e) {
+                        warn!("{:#} - status code unknown", e);
+                        self.discard_stuck_context(&context, "a stalled CDP call")
+                            .await;
+                        context_discarded = true;
                     }
-                })()
-                "#,
-                false,
-            )
-            .ok()
-            .and_then(|result| result.value.and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32
+                    0
+                }
+            }
         };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -2098,7 +2206,7 @@ impl WorkerService {
 
         // A context released as blocked is gone, so its id addresses nothing — the extra
         // condition on top of the usual per-mode rule.
-        let context_id = if session_destroyed {
+        let context_id = if session_destroyed || context_discarded {
             String::new()
         } else {
             self.addressable_context_id(&context)

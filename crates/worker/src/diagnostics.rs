@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::cdp_call;
 use crate::service::EventListenerGuard;
 
 /// Time budget for the final page-state snapshot.
@@ -308,31 +309,46 @@ impl Drop for DiagnosticsSession {
 /// request, in which case no CDP domain is touched and no listener is registered.
 ///
 /// Failures to enable a domain or register the listener are non-fatal — diagnostics never break
-/// a scrape.
-pub fn start_capture(
+/// a scrape. The one error returned is a stalled `enable` (`cdp_call::StalledCall`): the tab
+/// stopped answering, which the caller must handle like any other stalled call.
+pub async fn start_capture(
     tab: &Arc<Tab>,
     config: &DiagnosticsConfig,
     limiter: &Arc<DiagnosticsLimiter>,
     url: &str,
-) -> Option<DiagnosticsSession> {
+) -> anyhow::Result<Option<DiagnosticsSession>> {
     use headless_chrome::protocol::cdp::types::Event;
     use headless_chrome::protocol::cdp::{Log, Network, Runtime};
 
     if !config.is_active_for(url) {
-        return None;
+        return Ok(None);
     }
 
     // Log domain: uncaught JS errors and network-level console entries, with URLs and line
     // numbers, without the Runtime domain's fingerprinting surface.
-    if let Err(e) = tab.call_method(Log::Enable(None)) {
-        debug!("Failed to enable Log domain for diagnostics: {}", e);
+    let log_tab = tab.clone();
+    let enabled = cdp_call::bounded("Log.enable", move || {
+        log_tab.call_method(Log::Enable(None)).map(|_| ())
+    })
+    .await;
+    match enabled {
+        Err(e) if cdp_call::is_stalled(&e) => return Err(e),
+        Err(e) => debug!("Failed to enable Log domain for diagnostics: {}", e),
+        Ok(()) => {}
     }
 
     // Runtime domain: console.* and exception objects. Opt-in — enabling it is detectable by
     // anti-bot systems, so it must never be a side effect of turning diagnostics on.
     if config.capture_console {
-        if let Err(e) = tab.call_method(Runtime::Enable(None)) {
-            debug!("Failed to enable Runtime domain for diagnostics: {}", e);
+        let runtime_tab = tab.clone();
+        let enabled = cdp_call::bounded("Runtime.enable", move || {
+            runtime_tab.call_method(Runtime::Enable(None)).map(|_| ())
+        })
+        .await;
+        match enabled {
+            Err(e) if cdp_call::is_stalled(&e) => return Err(e),
+            Err(e) => debug!("Failed to enable Runtime domain for diagnostics: {}", e),
+            Ok(()) => {}
         }
     }
 
@@ -495,13 +511,13 @@ pub fn start_capture(
         }
     };
 
-    Some(DiagnosticsSession {
+    Ok(Some(DiagnosticsSession {
         buffer,
         limiter: limiter.clone(),
         mode: config.mode,
         succeeded: false,
         _listener_guard: listener_guard,
-    })
+    }))
 }
 
 /// Render a CDP `RemoteObject` the way a console would: by value when it has one, otherwise by
