@@ -1578,9 +1578,9 @@ impl WorkerService {
                 });
             }
             _ = tokio::time::sleep(Duration::from_secs(NAVIGATION_TIMEOUT_SECS)) => {
-                // Hard timeout on navigation - close tab to abort CDP call
+                // Hard timeout on navigation - discard the context, its CDP call cannot be aborted
                 warn!(
-                    "Navigation hard timeout after {}s - closing tab to abort",
+                    "Navigation hard timeout after {}s - discarding the context",
                     NAVIGATION_TIMEOUT_SECS
                 );
                 drop(tab_guard); // destroy_context takes this lock
@@ -1591,7 +1591,7 @@ impl WorkerService {
                     status_code: 0,
                     content: String::new(),
                     error_message: format!(
-                        "Navigation stuck - hard timeout after {}s (tab closed to abort)",
+                        "Navigation stuck - hard timeout after {}s (context discarded)",
                         NAVIGATION_TIMEOUT_SECS
                     ),
                     error_code: ErrorCode::TimeoutBrowser as i32,
@@ -1742,9 +1742,9 @@ impl WorkerService {
                     });
                 }
                 _ = tokio::time::sleep(Duration::from_millis(hard_timeout_ms)) => {
-                    // Hard timeout - close tab to abort CDP call
+                    // Hard timeout - discard the context, its CDP call cannot be aborted
                     warn!(
-                        "Wait strategy hard timeout after {}ms (internal timeout was {}ms) - closing tab to abort",
+                        "Wait strategy hard timeout after {}ms (internal timeout was {}ms) - discarding the context",
                         hard_timeout_ms, wait_timeout
                     );
                     drop(tab_guard); // destroy_context takes this lock
@@ -1758,7 +1758,7 @@ impl WorkerService {
                         status_code: 0,
                         content: String::new(),
                         error_message: format!(
-                            "Wait strategy stuck - hard timeout after {}ms (tab closed to abort)",
+                            "Wait strategy stuck - hard timeout after {}ms (context discarded)",
                             hard_timeout_ms
                         ),
                         error_code: ErrorCode::TimeoutBrowser as i32,
@@ -1819,9 +1819,9 @@ impl WorkerService {
                 });
             }
             _ = tokio::time::sleep(Duration::from_secs(GET_CONTENT_TIMEOUT_SECS)) => {
-                // Hard timeout on get_content - close tab to abort CDP call
+                // Hard timeout on get_content - discard the context, its CDP call cannot be aborted
                 warn!(
-                    "get_content hard timeout after {}s - closing tab to abort",
+                    "get_content hard timeout after {}s - discarding the context",
                     GET_CONTENT_TIMEOUT_SECS
                 );
                 drop(tab_guard); // destroy_context takes this lock
@@ -1832,7 +1832,7 @@ impl WorkerService {
                     status_code: 0,
                     content: String::new(),
                     error_message: format!(
-                        "get_content stuck - hard timeout after {}s (tab closed to abort)",
+                        "get_content stuck - hard timeout after {}s (context discarded)",
                         GET_CONTENT_TIMEOUT_SECS
                     ),
                     error_code: ErrorCode::BrowserError as i32,

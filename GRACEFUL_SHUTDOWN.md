@@ -5,10 +5,13 @@ This document describes the graceful shutdown implementation for Browser Hive's 
 ## Overview
 
 Browser Hive implements graceful shutdown to handle POSIX signals (SIGTERM, SIGINT) during pod termination, ensuring:
-- No request data loss
-- Clean browser context cleanup
-- Proper response to clients (including TERMINATING error code)
-- Automatic retry on healthy workers
+- Every in-flight request gets an answer (`ERROR_CODE_TERMINATING`) rather than a dropped connection
+- Automatic retry on healthy workers, by the coordinator
+
+⚠️ **It does not drain.** SIGTERM cancels in-flight requests at once instead of letting them
+finish, so a rollout, a KEDA scale-down or a spot preemption costs every request in flight on the
+pod; the coordinator retries them from scratch only while ≥ 10 s of the client's deadline remain.
+The fix is an open item in TODO.md ("Shutdown does not drain in-flight requests").
 
 ## Architecture
 
@@ -23,21 +26,26 @@ When a Worker receives SIGTERM:
 
 2. **Active Request Handling**
    - Blocking operations wrapped in `spawn_blocking` + `tokio::select!`
-   - When signal arrives, client gets TERMINATING response immediately
-   - Blocking thread continues as "zombie" until SIGKILL (acceptable)
+   - When the token is cancelled, the in-flight request answers TERMINATING immediately — it is
+     aborted, not finished
+   - Its tab is closed **detached** on the blocking pool (`close_tab_detached`); the context stays
+     in the pool. Never inline: `Tab::close` can wait up to an hour on an unresponsive tab
+   - The blocking thread may stay parked inside headless_chrome until SIGKILL (acceptable)
 
-3. **Graceful Wait** (t=0-60s)
-   - Waits for all active requests to complete
+3. **Graceful Wait**
+   - Waits for the request handlers to return — which, since they were cancelled in step 1, is
+     normally immediate
    - Polls every 500ms and logs remaining count
-   - There is no internal timeout: the process waits until all requests finish; the 60s limit comes from K8s `terminationGracePeriodSeconds` (SIGKILL)
+   - There is no internal timeout; the hard limit is K8s `terminationGracePeriodSeconds` (SIGKILL)
 
 4. **K8s Integration**
-   - Readiness probe removes pod from Service endpoints (2-5s propagation). This is **not**
-     what drains the worker: the coordinator discovers pods via the K8s API and connects to
-     pod IPs, so it never consults the Service. Routing stops because `HealthCheck` returns
-     `healthy = false` from t=0s, which the coordinator's health monitor sees within ~1s
-   - `preStop` hook delays 5s for endpoint propagation (for Service consumers)
-   - `terminationGracePeriodSeconds: 60`
+   - The `preStop` hook runs **before** SIGTERM is sent. During its sleep the worker still reports
+     itself healthy and keeps receiving requests, which step 1 then cancels
+   - Readiness probe removes pod from Service endpoints. This is **not** what stops routing: the
+     coordinator discovers pods via the K8s API and connects to pod IPs, so it never consults the
+     Service. Routing stops because `HealthCheck` returns `healthy = false` from SIGTERM on, which
+     the coordinator's health monitor sees within ~1s
+   - `terminationGracePeriodSeconds: 60` counts from the start of `preStop`
 
 ### Coordinator Graceful Shutdown
 
@@ -195,7 +203,7 @@ Expected output:
 ## Kubernetes Deployment
 
 See [K8S_DEPLOYMENT.md](./K8S_DEPLOYMENT.md) for complete K8s configuration including:
-- gRPC readiness probes
+- Readiness/liveness probes (TCP)
 - terminationGracePeriodSeconds
 - preStop hooks
 - RBAC configuration
@@ -210,9 +218,8 @@ spec:
   containers:
   - name: worker
     readinessProbe:
-      grpc:
+      tcpSocket:            # not grpc: - no grpc.health.v1 service is implemented
         port: 50052
-        service: scraper.worker.WorkerService
       initialDelaySeconds: 5
       periodSeconds: 2
     lifecycle:
@@ -254,18 +261,29 @@ Workers expose Prometheus metrics on port 9090 (see [METRICS.md](METRICS.md)). D
 - `browser_hive_worker_active_contexts{scope}` - Should decrease to 0 before shutdown
 - `browser_hive_worker_requests_total{scope}` - Total processed
 
+The coordinator counts the shutdown side (port 9090 of the coordinator, see METRICS.md):
+- `browser_hive_coordinator_requests_retried_total{scope, reason="terminating"}` - attempts re-sent to
+  another pod after a TERMINATING answer
+- `browser_hive_coordinator_requests_rejected_total{scope, reason="terminating"}` - requests that
+  still ended in TERMINATING (no retry possible)
+
+### Following one request across the retry
+
+Both services put `ray_id` on the request span, and the coordinator re-records `worker_id` on a
+TERMINATING retry, so `| json | span_ray_id="..."` in Loki shows every attempt of one request.
+
 ## Timing Breakdown
 
 ### Worker Shutdown Timeline
 
 ```
-t=0s:     SIGTERM → is_ready=false, cancel token
-t=0-2s:   Readiness probe starts failing; coordinator's health monitor (1s poll)
-          sees healthy=false and stops routing to this pod
-t=2-5s:   K8s removes pod from Service endpoints (cosmetic - nothing routes via Service)
-t=5s:     preStop hook completes
-t=0-60s:  Wait for active requests (check every 500ms)
-t=60s:    SIGKILL (force termination)
+t=0s:     Pod deleted → preStop hook starts (sleep 5); worker still healthy, still routed to
+t=5s:     preStop done → SIGTERM → is_ready=false, cancel token;
+          in-flight requests answer TERMINATING, the coordinator retries them elsewhere
+t=5-7s:   Coordinator's health monitor (1s poll) sees healthy=false, stops routing here;
+          readiness probe fails (cosmetic - nothing routes via Service)
+t=5s+:    Wait for the cancelled handlers to return (check every 500ms), then exit
+t=60s:    SIGKILL if still running
 ```
 
 ### Request During Shutdown
@@ -350,16 +368,6 @@ t=15s:    Coordinator forwards to client
 - `K8S_DEPLOYMENT.md` - Kubernetes deployment guide
 - `LOCAL_DEV.md` - Local development setup
 
-## Already Implemented
-
-- **Metrics for TERMINATING responses** —
-  `browser_hive_coordinator_requests_rejected_total{scope, reason="terminating"}`
-  (`crates/coordinator/src/metrics.rs`); worker-side failures are counted by
-  `browser_hive_worker_requests_failed`. See [METRICS.md](METRICS.md)
-- **Request correlation across the retry flow** — both services open an `info_span!` carrying
-  `ray_id`, and the coordinator re-records `worker_id` on a TERMINATING retry, so one Loki
-  query (`| json | span_ray_id="..."`) follows a request across the retry
-
 ## Future Improvements
 
 1. **Health check caching improvements**
@@ -370,9 +378,6 @@ t=15s:    Coordinator forwards to client
    - Configurable retry attempts
    - Custom retry timeout threshold
    - Circuit breaker for problematic workers
-   - A counter for retry attempts. Nothing counts them today: a TERMINATING retry is
-     invisible in the metrics unless it also ends in a rejection, and
-     `browser_hive_coordinator_request_duration_seconds` folds the retry into one observation
 
 3. **Testing**
    - Integration tests for graceful shutdown

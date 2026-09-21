@@ -95,8 +95,9 @@ src/
 └── lib.rs                 # Root crate facade (re-exports public API)
 
 ops/
-└── docker/
-    └── local/             # Docker Compose for local dev
+├── docker/
+│   └── local/             # Dockerfiles used by docker-compose.yml
+└── grafana/               # Grafana dashboards (see ops/grafana/README.md)
 ```
 
 ## Session Management
@@ -261,14 +262,19 @@ Every response includes:
 | `ERROR_CODE_NONE` | 0 | Success | Use content |
 | `ERROR_CODE_INVALID_URL` | 4001 | Invalid URL format | Fix URL |
 | `ERROR_CODE_SESSION_NOT_FOUND` | 4002 | Session expired | Retry without session |
+| `ERROR_CODE_SCOPE_NOT_FOUND` | 4003 | No such scope in the cluster | Fix the scope name |
 | `ERROR_CODE_SESSION_BUSY` | 4004 | The session's own context is still serving its previous request | Retry the same session after a short pause |
 | `ERROR_CODE_TIMEOUT_BROWSER` | 4041 | Browser timeout | Increase timeout |
 | `ERROR_CODE_SELECTOR_NOT_FOUND` | 4042 | Wait selector not found | Check selector |
 | `ERROR_CODE_SKIP_SELECTOR_FOUND` | 4043 | Skip selector found | Expected - skip content |
+| `ERROR_CODE_REDIRECT_TO_ANOTHER_DOMAIN` | 4050 | Navigation ended on another domain | Check the URL |
 | `ERROR_CODE_NO_WORKERS_AVAILABLE` | 5001 | No capacity in the scope right now | Retry with backoff (≥ 10 s if pods are restarting) |
 | `ERROR_CODE_WORKER_UNREACHABLE` | 5002 | The chosen worker could not be reached | Retry |
-| `ERROR_CODE_BROWSER_ERROR` | 5003 | Browser crashed | Retry - auto-recovers |
+| `ERROR_CODE_BROWSER_ERROR` | 5003 | Browser crashed or stopped answering | Retry - auto-recovers |
 | `ERROR_CODE_NETWORK_ERROR` | 5004 | Network error | Retry |
+| `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | The browser could not create a context | Retry |
+| `ERROR_CODE_TERMINATING` | 5006 | The pod is shutting down (the coordinator already retried) | Retry |
+| `ERROR_CODE_PROXY_ERROR` | 5007 | Proxy/tunnel failure | Retry |
 
 **The rule**: every `5xxx` code is retryable; in the `4xxx` range only `4002` (retry without the
 session), `4004` (retry the same session) and `4041` are. A 403 or 429 arrives as `success = true`
@@ -283,7 +289,7 @@ See [ERROR_HANDLING.md](ERROR_HANDLING.md) for complete error handling guide wit
 Each worker scope has independent configuration:
 - Custom proxy provider implementation
 - Contexts per pod
-- Lifecycle settings (max lifetime, max requests, cache limits)
+- Lifecycle settings (max lifetime, max requests, idle time)
 - Resource limits
 
 ### Proxy Providers
@@ -321,7 +327,7 @@ See [`src/lib.rs`](src/lib.rs) for the public API facade and re-exports.
 
 ### Metrics
 
-Workers expose Prometheus metrics on port `9090` at `/metrics`: pool capacity and busy/free slots (gauges refreshed on every scrape) plus request counters. See [METRICS.md](METRICS.md) for the full metric list, semantics, and a KEDA autoscaling guide.
+Workers expose Prometheus metrics on port `9090` at `/metrics`: pool capacity and busy/free slots, browser processes and their memory by type (gauges refreshed on every scrape), request counters, and the third-party hosts and iframes scraped pages load. The coordinator exposes its own, including requests it rejected without reaching a worker. See [METRICS.md](METRICS.md) for the full metric list, semantics, and a KEDA autoscaling guide.
 
 ## Development
 

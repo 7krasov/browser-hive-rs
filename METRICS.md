@@ -44,7 +44,7 @@ A worker's memory limit is spent by the browser's processes, not by the worker, 
   - `browser`, `renderer`, `extension` (a renderer with `--extension-process`), `gpu`, `zygote`;
   - `network` and `storage` (utility processes, told apart by `--utility-sub-type=`);
   - `utility`, `other`.
-- **`browser` above 1** means a browser process that was never reaped — for example, the one a pool recreation replaced. A process with no `--type=` is counted as `browser`.
+- **`browser` counts every process with no `--type=`**, so launcher wrappers land there next to the real main process: production Brave shows **5 per browser**, of which one holds memory ("Largest single process" tells them apart). A never-reaped browser — for example, the one a pool recreation replaced — shows as a **step of one browser's worth** (+5 there), not as "above 1".
 - **Blind spot:** a process reparented away from the worker is not seen, which can happen only when the worker is not the container's PID 1.
 - **Memory is PSS** (`smaps_rollup`), not RSS. Renderers are forked from a zygote and share most of their pages, so summed RSS overstates the total several times over. PSS splits each shared page between the processes that map it, so the per-type sums add up.
 - **Targets** come from `Target.getTargets` over a browser-level CDP connection the metrics endpoint keeps for itself. It is separate from the one context creation uses, so a slow scrape never blocks a request. The label set is closed:
@@ -95,6 +95,7 @@ Which foreign hosts the scraped pages load, ranked, to choose what `BlockedUrlsM
 
 **Cardinality.** Client input feeds both `page_site` and the hosts, so the `(page_site, host)` combinations are capped **per metric, per worker process** by `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` (default 2000). Past the cap a combination is counted as `page_site="other"`, host `"other"`: the total stays correct and only the breakdown is lost. Nothing is evicted, since a counter that disappears and comes back breaks `increase()`.
 - ⚠️ **Worst case is `3 × cap × pods` series**, and every rollout creates the set again under new pod names. A container restart (an OOMKill included) keeps the pod name and adds no series. Series that only exist in the worst case are never created: the real number is the combinations actually seen.
+- **To see what these metrics actually cost**, use Prometheus' **Status → TSDB Status** page: it breaks head series down by metric and label. `prometheus_tsdb_head_series` is only a total and cannot attribute growth.
 - **An `other` row in the dashboard tables** means a worker reached the cap. Nothing is logged.
 - Keeping `page_site` over dropping it was a deliberate choice for 300–800 scraped sites, accepting this cost (2026-09-15). Watch `prometheus_tsdb_head_series` after a deploy.
 

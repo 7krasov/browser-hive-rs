@@ -12,6 +12,7 @@ docker-compose up --build
 
 # Coordinator: http://localhost:50051 (gRPC)
 # Worker metrics: http://localhost:9090/metrics
+# Coordinator metrics: http://localhost:9091/metrics
 ```
 
 ### Rebuild after code changes
@@ -177,18 +178,23 @@ All responses include error information even when successful:
 
 Use `session_id` to reuse the same browser context in subsequent requests; `worker_id`/`context_id` are its components (for logging/debugging).
 
-**Important**: Check `success` field first, not just HTTP `status_code`.
+**Important**: Check `error_code` first, then `status_code`. A 403 or 429 from the origin arrives as
+`success: true`, `error_code: 0` with that `status_code` — `success` alone would store a block page.
 
 **Common error codes**:
 - `0` - Success
 - `4001` - Invalid URL (fix URL and retry)
-- `4002` - Session not found (retry without context_id)
+- `4002` - Session not found (retry without `session_id`)
 - `4004` - Session busy (retry the same session shortly; `dedicated` scopes only)
+- `4041` - Browser timeout (retry)
 - `4042` - Wait selector not found (check selector)
 - `4043` - Skip selector found (expected - skip content)
 - `5001` - No capacity in the scope right now (retry with backoff; also what a worker's full pool becomes)
 - `5003` - Browser error (retry - auto-recovers)
 - `5004` - Network error (retry with backoff)
+- `5005` - Context creation failed (retry)
+- `5006` - Terminating: the pod is shutting down (retry)
+- `5007` - Proxy/tunnel failure (retry)
 
 Rule of thumb: **every `5xxx` is retryable**; in `4xxx` only `4002`, `4004` and `4041` are.
 
@@ -199,6 +205,9 @@ See [ERROR_HANDLING.md](ERROR_HANDLING.md) for complete error handling guide.
 ```bash
 # View worker metrics
 curl http://localhost:9090/metrics
+
+# View coordinator metrics (host port 9091)
+curl http://localhost:9091/metrics
 ```
 
 See [METRICS.md](METRICS.md) for the metric list and semantics.

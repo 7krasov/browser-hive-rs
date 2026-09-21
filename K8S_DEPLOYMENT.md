@@ -35,32 +35,33 @@ spec:
           name: metrics
           protocol: TCP
 
-        # gRPC readiness probe that calls health_check().
+        # TCP, not `grpc:` — a K8s gRPC probe calls the standard grpc.health.v1.Health
+        # service, which neither binary implements, so it would never pass. The gRPC port
+        # opens only after the browser pool is up, so "port open" means "started".
         # NOTE: this removes the pod from the Service endpoints, which the coordinator does
         # not use — it discovers pods and polls HealthCheck itself (see "Health Check
-        # Behavior"). Kept for kubectl/rollout visibility, not as a drain mechanism.
+        # Behavior"). It gates rollouts, it does not drain.
         readinessProbe:
-          grpc:
+          tcpSocket:
             port: 50052
-            service: scraper.worker.WorkerService  # Full protobuf service name
           initialDelaySeconds: 5
           periodSeconds: 2
           timeoutSeconds: 3
           successThreshold: 1
           failureThreshold: 2
 
-        # Liveness probe to restart crashed workers
+        # Restarts a worker whose gRPC server is gone. It cannot see a wedged browser.
         livenessProbe:
-          grpc:
+          tcpSocket:
             port: 50052
-            service: scraper.worker.WorkerService
-          initialDelaySeconds: 10
+          initialDelaySeconds: 60   # browser launch + WORKER_MIN_CONTEXTS before the port opens
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
 
-        # Lifecycle hook for endpoint propagation delay (for Service consumers; the
-        # coordinator already stops routing on the first failed HealthCheck)
+        # Runs BEFORE SIGTERM: during the sleep the worker is still healthy and still
+        # routed to. Only useful for Service consumers; the coordinator stops routing on
+        # the first HealthCheck after SIGTERM. See GRACEFUL_SHUTDOWN.md.
         lifecycle:
           preStop:
             exec:
@@ -136,7 +137,10 @@ kind: Deployment
 metadata:
   name: browser-hive-coordinator
 spec:
-  replicas: 2
+  # Exactly one. Routing corrects the cached free-slot counts by the coordinator's own
+  # in-flight requests, which is exact only while one replica sees all of them (CLAUDE.md,
+  # "Free slots are the discovery cache corrected by..."). Sessions are also in-memory.
+  replicas: 1
   selector:
     matchLabels:
       app: browser-hive-coordinator
@@ -161,11 +165,10 @@ spec:
           name: metrics
           protocol: TCP
 
-        # gRPC readiness probe
+        # TCP for the same reason as the worker: no grpc.health.v1 service
         readinessProbe:
-          grpc:
+          tcpSocket:
             port: 50051
-            service: scraper.coordinator.ScraperCoordinator
           initialDelaySeconds: 3
           periodSeconds: 2
           timeoutSeconds: 3
@@ -173,9 +176,8 @@ spec:
           failureThreshold: 2
 
         livenessProbe:
-          grpc:
+          tcpSocket:
             port: 50051
-            service: scraper.coordinator.ScraperCoordinator
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 5
@@ -292,23 +294,23 @@ subjects:
 ### Worker Graceful Shutdown Timeline
 
 ```
-t=0s:   SIGTERM received
-        → Worker sets is_ready = false
-        → Readiness probe starts failing immediately
-        → Worker cancels all operations
+t=0s:   Pod deleted → preStop (sleep 5) starts; the worker is still healthy and routed to
 
-t=2-5s: K8s removes pod from Service endpoints
-        → Cosmetic here: the coordinator routes to pod IPs, not through the Service.
-          What stops new requests is HealthCheck reporting healthy=false (t=0s),
-          picked up by the coordinator's health monitor within ~1s
+t=5s:   SIGTERM received
+        → Worker sets is_ready = false, HealthCheck reports healthy=false
+        → Worker cancels all operations: in-flight requests answer TERMINATING
+          (aborted, not completed — the coordinator retries them elsewhere)
 
-t=0-60s: Worker waits for active requests to complete
-         → Returns TERMINATING to new requests
-         → Completes in-flight requests normally
+t=5-7s: Coordinator's health monitor (1s poll) stops routing to the pod;
+        K8s removes it from Service endpoints (cosmetic - nothing routes via the Service)
 
-t=60s:  SIGKILL sent (terminationGracePeriodSeconds)
+t=5s+:  Worker waits for the cancelled handlers to return, then exits
+
+t=60s:  SIGKILL sent (terminationGracePeriodSeconds, counted from preStop)
         → Pod force-terminated if still running
 ```
+
+In-flight requests are **not** drained — see the open item in TODO.md.
 
 ### Coordinator Graceful Shutdown Timeline
 
@@ -373,13 +375,12 @@ grpcurl -d '{"scope_name":"test","url":"https://example.com","timeout_seconds":3
 # In another terminal, delete the worker pod
 kubectl delete pod browser-hive-worker-xxx
 
-# The request should complete successfully or be retried on another worker
+# The request should be retried on another worker and complete there
 ```
 
 Expected behavior:
-1. Worker receives SIGTERM
-2. Worker returns TERMINATING for new requests
-3. Coordinator retries on another healthy worker
-4. Client receives successful response or final TERMINATING error
-5. Worker waits for active requests to complete
-6. Pod terminates after all requests finish (or 60s timeout)
+1. preStop sleeps 5 s, then the worker receives SIGTERM
+2. The in-flight request is aborted with TERMINATING
+3. Coordinator retries it on another healthy worker (if ≥ 10 s of its deadline remain)
+4. Client receives the retried response, or a final TERMINATING error
+5. The worker exits as soon as its cancelled handlers have returned (SIGKILL at 60 s otherwise)

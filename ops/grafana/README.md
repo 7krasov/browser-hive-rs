@@ -116,7 +116,8 @@ resources" section of METRICS.md.
   renderer (high max, few processes) vs. many small ones (low max, many processes).
 - **Out-of-process iframes per page** - high values mean the memory comes from what pages
   embed (a renderer per framed third-party site), not from tab age.
-- **Browser main processes per pod** - above 1 is a browser process that was never reaped.
+- **Browser main processes per pod** - counts launcher wrappers too (5 per browser for Brave in
+  production); a step up by one browser's worth is a browser process that was never reaped.
 - **Browser contexts: not in the pool** - contexts the browser still holds after the pool
   let them go; meaningful for isolated scopes only.
 - **Worker RSS / threads** - growth with uptime is a leak in the worker process itself.

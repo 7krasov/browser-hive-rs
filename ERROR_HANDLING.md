@@ -516,7 +516,7 @@ A hard timeout (navigation, wait strategy or `get_content` did not return within
 
 **Internal log message**:
 ```
-WARN Wait strategy hard timeout after 50000ms (internal timeout was 40000ms) - closing tab to abort
+WARN Wait strategy hard timeout after 50000ms (internal timeout was 40000ms) - discarding the context
 WARN Removing context ctx-123 from the pool after a hard timeout
 INFO Destroyed context ctx-123 (isolated) (1 contexts remaining)
 ```

@@ -237,10 +237,10 @@ crates.io.
 **To close**: once a release contains #568, switch back to the version from crates.io, keep
 `tungstenite` on the version it resolves (see the comment in `Cargo.toml`), and remove this item.
 
-## Synchronous CDP calls on the request path: bounded, not yet deployed
+## Synchronous CDP calls on the request path: bounded, deployed, not yet verified
 
-**Status**: implemented in v0.35.0 (2026-09-19, not yet deployed); verify on k8s dev, then remove
-this item once deployed
+**Status**: implemented in v0.35.0 (2026-09-19); deployed downstream (worker pins v0.36.1 as of
+2026-09-21). Nothing below has been read yet; remove this item once it has
 
 Every headless_chrome call waits up to `idle_browser_timeout` (1 hour) for an answer. On
 2026-09-18 a downstream `reusable` worker froze for exactly one hour: a wait-strategy hard timeout
@@ -260,7 +260,7 @@ now gets the tab init middlewares (UA override, blocked URLs); it used to be a b
 
 **Not covered**: `Browser::new` (startup / pool recreation only).
 
-**Verify after deploy** (the hot path cannot be exercised by unit tests):
+**To verify** (the hot path cannot be exercised by unit tests):
 - startup line `Tokio runtime: 4 worker threads`;
 - after a hard timeout or stall, `Removing context … after a hard timeout` / `… after a stalled
   CDP call` followed by uninterrupted log lines;
@@ -270,7 +270,9 @@ now gets the tab init middlewares (UA override, blocked URLs); it used to be a b
 
 ## The same scope OOMKilled 10 minutes after a clean browser restart
 
-**Status**: open, cause unknown
+**Status**: open, cause unknown. The renderer half of "Worker OOMKills" below — still reproduced
+after disposal was deployed (2026-09-21: OOMKills ~20 min after a pod starts, single renderer up to
+~770 MiB)
 
 Same incident, 2026-09-18. After the hour-long freeze the pool was recreated and the old Chrome was
 killed (`Killed browser process 8 of the dropped browser pool` — the v0.33.0 fix works). The new
@@ -298,7 +300,7 @@ grows (`Runtime.getHeapUsage` / `Memory.getDOMCounters` per request).
 
 ## Worker OOMKills: renderers set the floor, undisposed contexts set the slope
 
-**Status**: cause identified 2026-09-16; context disposal implemented the same day, not deployed
+**Status**: cause identified 2026-09-16; context disposal deployed and removes the slope (2026-09-21, see "Context disposal must be verified in production"); the renderer floor still OOMKills pods at 2 GiB
 
 A busy downstream `reusable` scope (2 GiB limit, `max_contexts = 2`, Brave headless, isolated
 contexts, 7-12 concurrent pods) is OOMKilled continuously. With the browser resource metrics of
@@ -352,19 +354,24 @@ This is a correlation of two independently collected signals, not a proof; the l
 Chromium actually returns the memory on `Target.disposeBrowserContext` — can only be established by
 deploying the fix.
 
-**Order of work**, highest value first:
+**Order of work**, highest value first (state as of 2026-09-21; the slope is gone with context
+disposal, what remains is the floor):
 
-1. **Dispose contexts** (the item below — implemented, awaiting deploy). Removes the slope. Only this stops a long-lived pod from
-   dying; everything else buys time.
-2. **Block list of ad-tech script hosts** (downstream, `BlockedUrlsMiddleware`). Lowers the floor.
+1. **Block list of ad-tech script hosts** (downstream, `BlockedUrlsMiddleware`). Lowers the floor.
+   Downstream now ships a list with the major ad exchanges in it, but its effect on renderers
+   **has not been measured**: on 2026-09-21 the scope still showed ~13 renderers per pod against
+   ~15 before, and whether the list was in force on those pods was not checked
+   (`span_blocked_requests`). Next step: read the test below, then extend the list with the top
+   hosts of `iframes_total`.
    Note the twist: the list provably cannot block an iframe *document*, but these iframes are
    injected by JS from tag and ad-server hosts, and those scripts are ordinary sub-resources of the
    main page, which the list does block. Test: `iframes_total` and `browser_processes{type="renderer"}`
    must fall together; if only `third_party_requests_blocked_total` moves, the reasoning is wrong.
    Never block the consent manager, `www.google.com` (reCAPTCHA lives there) or a generic JS CDN.
-3. **Explain the renderers without targets** (open sub-question below).
-4. A larger memory limit, as an anaesthetic while 1-2 are built.
-5. Turning site isolation off in headless — only if 1-2 are not enough, and with a block-rate
+2. **Explain the renderers without targets** (open sub-question below).
+3. A larger memory limit, as an anaesthetic while 1 is built — **applied** to that one scope
+   downstream (2 → 2.5 GiB, 2026-09-21, request unchanged). Re-read the OOMKill rate after it.
+4. Turning site isolation off in headless — only if 1 is not enough, and with a block-rate
    comparison, since it is a memory-vs-stealth trade.
 
 **Open sub-question: ~3 renderer processes per live target.** At the same instants, the scope had
@@ -373,15 +380,9 @@ deploying the fix.
 long-lived pod: if `browser_processes{type="renderer"}` rises while the target gauges stay flat,
 it is a second leak, independent of NetworkService.
 
-**Closed on the way**: the `browser` process type shows 5 per browser because anything without
-`--type=` lands there; "Largest single process by type" gives one real main of 167-218 MiB and the
-rest are negligible wrappers. A classification cosmetic, not memory. Per-pod out-of-process iframes
-average 0.5-2.8 (peaks 5-14) — lower than the counter suggests, because the sampler only sees the
-frames alive in that second; both numbers are right and answer different questions.
-
 ## Third-party request and iframe metrics
 
-**Status**: implemented 2026-09-15, not deployed. What the metrics count, the label rules and the
+**Status**: implemented 2026-09-15, deployed (read in production from 2026-09-16). What the metrics count, the label rules and the
 decisions (full hosts, requested-host attribution, keeping `page_site` under a cap) are in the
 "Third-party hosts and iframes" section of METRICS.md.
 
@@ -400,12 +401,6 @@ Goal: find the hosts worth adding to `BlockedUrlsMiddleware` and rank them.
   interval is now 1 s (confirmed by the user, 2026-09-15).
 
 **Open.**
-- ~~Head series after the deploy~~ **answered 2026-09-16**: Prometheus grew from 1.2 M to
-  3.1-3.7 M head series overnight, but its TSDB Status page lists **no** `browser_hive_*` metric
-  and no label of ours among the top contributors — the growth is someone else's.
-  `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` stays at its default. Note for next time: the per-metric
-  breakdown is the **Status -> TSDB Status** page, not the `prometheus_tsdb_head_series` series,
-  which gives a total and cannot attribute it.
 - **Not verified end to end**: the blocked counter (the base worker has no list; unit-tested only),
   Linux, Brave, HTTPS, a proxy.
 - **Frames shorter than 1 s are still missed.** The exact alternative is event-driven:
@@ -468,7 +463,7 @@ scale-down and spot preemption. A separate change from the memory work.
 
 ## Context disposal must be verified in production
 
-**Status**: implemented 2026-09-16, not deployed (raised 2026-07-27 as "empty contexts are never
+**Status**: implemented 2026-09-16, deployed; slope confirmed gone 2026-09-21, OOMKills not (raised 2026-07-27 as "empty contexts are never
 disposed")
 
 Every context-removal site now closes the tab **and** disposes the CDP BrowserContext
@@ -503,7 +498,7 @@ best over a night. Dashboard "Browser Hive - Browser Resources":
 3. **"Largest single process by type"**, series `network` — no monotone ramp; flat or saw-toothed
    around a level. Before: 390 → 852 MiB in 2.5 h.
 4. **"Container restarts and OOMKills per pod"** — OOMKills drop from ~3/h across the scope towards
-   zero. If they only become rarer, the renderer floor (item 2 of "Order of work") is next.
+   zero. If they only become rarer, the renderer floor (item 1 of "Order of work") is next.
 5. **"Memory per pod vs. container limit"** — pods stop marching up to the limit.
 6. **Loki, WARNs of the change**: `{app="worker-<scope>"} |= "Could not dispose CDP context"` and
    `{app="worker-<scope>"} |= "context disposal client"` — expected empty; occasional lines around a
@@ -511,11 +506,28 @@ best over a night. Dashboard "Browser Hive - Browser Resources":
 
 If 2 holds but 3 does not, the slope has another cause and the OOM item reopens.
 
+**First production reading, 2026-09-21** (3 h, a busy downstream `reusable` scope, 2 GiB limit,
+`max_contexts = 2`; every pod in the window already ran disposal — v0.34+ lines in its logs — and a
+rollout finished inside it). Only 3-5 were read; 1, 2 and 6 were not checked.
+
+- **3 holds.** `network` is flat: largest single NetworkService ~110-160 MiB, scope-wide ~100-120 MiB
+  per pod, no ramp on any pod. The slope is gone.
+- **4 and 5 do not.** ~10 OOMKills in 3 h across the scope, on pods of the new rollout too, the first
+  ~20 min after start. Pods sit at the limit on renderers alone: ~13 renderer processes and
+  ~1.1-1.6 GiB renderer PSS per pod, the largest single renderer up to ~770 MiB. So the renderer
+  floor (item 1 of "Order of work" in the OOM item) is what kills pods now, not a leak with age.
+- Precursor seen in Loki: `get_content hard timeout` ~1 ms after the wait selector was found, twice
+  in a row on fresh contexts (1-3 requests), 10 s before the pod went down — consistent with the
+  kernel killing a renderer mid-request, not verified.
+- Unexplained: that OOMKilled pod logged `Received SIGTERM` and shut down gracefully, instead of
+  dying silently as a whole-cgroup OOM kill would make it. The sender is unknown (events expired).
+- Downstream raised the limit of that scope to 2.5 GiB (item 3 of "Order of work").
+
 ## A replaced browser pool leaves its Chrome running
 
 **Status**: confirmed in production 2026-09-16 as the OOMKill cause of a downstream `always_new`
-scope; fixed the same day (`Drop for BrowserPool`), not deployed. Why the transport closes is still
-open
+scope; fixed the same day (`Drop for BrowserPool`, v0.33.0) and deployed. The verification below has
+not been read on that scope yet. Why the transport closes is still open
 
 `BrowserPool::start_lifecycle_monitor` spawns an endless task that holds clones of the pool's
 `Arc<Browser>`, its contexts and its CDP clients, and nothing stops it: `recreate_browser_pool`
@@ -554,7 +566,7 @@ and Brave with a real `BrowserPool` replaced under an `RwLock` while an extra `A
 was still held: the old main process became a zombie at once with no children left, and was reaped
 as soon as that clone was dropped.
 
-**Verification after deploy** (dashboard "Browser Hive - Browser Resources", the `always_new` scope,
+**To verify** (dashboard "Browser Hive - Browser Resources", the `always_new` scope,
 12-24 h):
 - "Browser main processes per pod" stays at 5 (one browser) — at most a brief 10 right after a
   replacement. Before: steps of +5 up to 45.
