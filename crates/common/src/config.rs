@@ -610,6 +610,17 @@ pub struct DiagnosticsConfig {
     /// extra CDP surface (see [`DiagnosticsConfig::capture_console`]).
     pub domains: Vec<String>,
 
+    /// Response `ErrorCode` values (numeric, e.g. `4042`) that may emit in
+    /// [`DiagnosticsMode::OnError`]. **Empty means every failure**, which is the historical
+    /// behaviour. A failure whose code is not listed is still captured — capture is decided
+    /// before the outcome exists — but neither logged nor given the post-request snapshots.
+    ///
+    /// Exists so diagnostics can stay on for every domain: the failures worth explaining on an
+    /// unknown site are the ones where the page did not render what was asked for
+    /// (`SELECTOR_NOT_FOUND`, `TIMEOUT_BROWSER`), while e.g. a proxy error already has a log
+    /// line of its own. Ignored in [`DiagnosticsMode::Always`].
+    pub error_codes: Vec<i32>,
+
     /// Maximum entries kept per category (JS errors, failed requests, console messages).
     /// Additional entries are counted and dropped, so one page stuck in an error loop cannot
     /// produce an unbounded log line.
@@ -636,6 +647,7 @@ impl Default for DiagnosticsConfig {
             enabled: false,
             mode: DiagnosticsMode::default(),
             domains: Vec::new(),
+            error_codes: Vec::new(),
             max_entries: DEFAULT_DIAGNOSTICS_MAX_ENTRIES,
             max_per_minute: DEFAULT_DIAGNOSTICS_MAX_PER_MINUTE,
             capture_console: false,
@@ -655,6 +667,7 @@ impl DiagnosticsConfig {
     /// | `WORKER_ENABLE_BROWSER_DIAGNOSTICS` | `false` |
     /// | `WORKER_DIAGNOSTICS_MODE` (`off`/`on_error`/`always`) | `on_error` |
     /// | `WORKER_DIAGNOSTICS_DOMAINS` (comma-separated, empty = all) | empty |
+    /// | `WORKER_DIAGNOSTICS_ERROR_CODES` (comma-separated numeric codes, empty = all failures) | empty |
     /// | `WORKER_DIAGNOSTICS_MAX_ENTRIES` | `20` |
     /// | `WORKER_DIAGNOSTICS_MAX_PER_MINUTE` (`0` = unlimited) | `10` |
     /// | `WORKER_DIAGNOSTICS_CONSOLE` | `false` |
@@ -675,6 +688,10 @@ impl DiagnosticsConfig {
             .map(|s| parse_domain_list(&s))
             .unwrap_or(defaults.domains);
 
+        let error_codes = std::env::var("WORKER_DIAGNOSTICS_ERROR_CODES")
+            .map(|s| parse_error_codes(&s))
+            .unwrap_or(defaults.error_codes);
+
         let max_entries = std::env::var("WORKER_DIAGNOSTICS_MAX_ENTRIES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -694,10 +711,21 @@ impl DiagnosticsConfig {
             enabled,
             mode,
             domains,
+            error_codes,
             max_entries,
             max_per_minute,
             capture_console,
         }
+    }
+
+    /// Whether a request that ended with `error_code` may be logged.
+    ///
+    /// Only the outcome part of the decision: the success/skip exemption of
+    /// [`DiagnosticsMode::OnError`] is applied by the caller, which knows it.
+    pub fn logs_error_code(&self, error_code: i32) -> bool {
+        self.mode == DiagnosticsMode::Always
+            || self.error_codes.is_empty()
+            || self.error_codes.contains(&error_code)
     }
 
     /// Whether diagnostics should be captured for a request to `url`.
@@ -728,6 +756,28 @@ fn parse_domain_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|d| d.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// Parse a comma-separated list of numeric error codes.
+///
+/// An entry that is not a number is dropped with a warning rather than failing startup. If every
+/// entry is dropped the list is empty, which means "every failure": a typo widens logging
+/// instead of silently hiding the failures being investigated.
+fn parse_error_codes(raw: &str) -> Vec<i32> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .filter_map(|c| match c.parse() {
+            Ok(code) => Some(code),
+            Err(_) => {
+                tracing::warn!(
+                    "WORKER_DIAGNOSTICS_ERROR_CODES: '{}' is not a numeric error code, ignored",
+                    c
+                );
+                None
+            }
+        })
         .collect()
 }
 
@@ -764,6 +814,33 @@ mod tests {
             vec!["example.com".to_string(), "foo.org".to_string()]
         );
         assert!(parse_domain_list("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_error_codes() {
+        assert_eq!(parse_error_codes(" 4042, 4041 ,,"), vec![4042, 4041]);
+        assert_eq!(parse_error_codes("4042,SELECTOR_NOT_FOUND"), vec![4042]);
+        assert!(parse_error_codes("").is_empty());
+    }
+
+    #[test]
+    fn test_logs_error_code() {
+        let all = DiagnosticsConfig::default();
+        assert!(all.logs_error_code(5004));
+
+        let filtered = DiagnosticsConfig {
+            error_codes: vec![4042, 4041],
+            ..Default::default()
+        };
+        assert!(filtered.logs_error_code(4042));
+        assert!(!filtered.logs_error_code(5004));
+
+        // `always` logs every request, so the filter does not apply.
+        assert!(DiagnosticsConfig {
+            mode: DiagnosticsMode::Always,
+            ..filtered
+        }
+        .logs_error_code(5004));
     }
 
     #[test]

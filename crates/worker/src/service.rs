@@ -1627,53 +1627,8 @@ impl WorkerService {
             error!("Navigation failed: {} - will still try to get content", e);
         }
 
-        // Headless-detection markers: a one-off snapshot of the stealth-relevant navigator
-        // surface. Gated on the diagnostics session so it inherits the same domain filter and
-        // never costs anything on a normal request.
-        if diagnostics.is_some() && navigation_result.is_ok() {
-            let tab_for_markers = tab.clone();
-            let markers = cdp_call::bounded("Runtime.evaluate (headless markers)", move || {
-                let result = tab_for_markers.evaluate(
-                    r#"
-                    JSON.stringify({
-                        webdriver: navigator.webdriver,
-                        userAgent: navigator.userAgent,
-                        languages: navigator.languages,
-                        platform: navigator.platform,
-                        hardwareConcurrency: navigator.hardwareConcurrency,
-                        deviceMemory: navigator.deviceMemory,
-                        hasChrome: typeof window.chrome !== 'undefined',
-                        hasPermissions: typeof navigator.permissions !== 'undefined',
-                        hasNotifications: 'Notification' in window,
-                        hasServiceWorker: 'serviceWorker' in navigator,
-                        documentHidden: document.hidden,
-                        outerWidth: window.outerWidth,
-                        outerHeight: window.outerHeight
-                    })
-                    "#,
-                    false,
-                )?;
-                Ok(result
-                    .value
-                    .and_then(|value| value.as_str().map(str::to_string)))
-            })
-            .await;
-
-            match markers {
-                Ok(Some(json_str)) => info!("Diagnostics/headless markers: {}", json_str),
-                Ok(None) => {}
-                Err(e) if cdp_call::is_stalled(&e) => {
-                    drop(tab_guard);
-                    return Ok(self
-                        .stalled_call_response(&context, &e, ray_id, start_time)
-                        .await);
-                }
-                Err(e) => warn!("Failed to check headless markers: {}", e),
-            }
-
-            // Uncomment to check proxy exit IP (adds ~1sec overhead per request)
-            // check_proxy_exit_ip(&tab);
-        }
+        // Uncomment to check proxy exit IP (adds ~1sec overhead per request)
+        // check_proxy_exit_ip(&tab);
 
         // Validate and get effective timeout
         let wait_timeout = if req.wait_timeout_ms > 0 {
@@ -1794,6 +1749,9 @@ impl WorkerService {
                     );
                     drop(tab_guard); // destroy_context takes this lock
                     self.discard_stuck_context(&context, "a hard timeout").await;
+                    if let Some(session) = diagnostics.as_mut() {
+                        session.set_error_code(ErrorCode::TimeoutBrowser as i32);
+                    }
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
                     return Ok(ScrapePageResponse {
                         success: false,
@@ -1919,15 +1877,26 @@ impl WorkerService {
             }
         };
 
-        // Page-state snapshot, while the tab is still alive: in AlwaysNew mode the early destroy
+        // Page-state and headless-marker snapshots, while the tab is still alive: in AlwaysNew mode the early destroy
         // below tears down the CDP context, after which evaluating anything on the tab fails.
         // Bounded by PAGE_STATE_BUDGET, independent of how much of the wait timeout was spent —
         // a leftover-based budget would be zero exactly on the timeouts worth diagnosing.
-        if diagnostics.is_some() && navigation_result.is_ok() {
-            if let Some(state) = crate::diagnostics::capture_page_state(tab.clone()).await {
-                if let Some(session) = diagnostics.as_ref() {
-                    session.set_page_state(state);
-                }
+        // Skipped when this outcome cannot be logged (see WORKER_DIAGNOSTICS_ERROR_CODES), so
+        // diagnostics left on for every domain cost a normal request no extra round-trip.
+        let provisional_error_code = match &wait_result {
+            Ok(WaitResult::Success) => None,
+            Ok(WaitResult::SkipSelectorFound) => Some(ErrorCode::SkipSelectorFound as i32),
+            Ok(WaitResult::WaitSelectorNotFound) => Some(ErrorCode::SelectorNotFound as i32),
+            Err(_) => Some(ErrorCode::TimeoutBrowser as i32),
+        };
+        let wants_snapshots = navigation_result.is_ok()
+            && diagnostics
+                .as_ref()
+                .is_some_and(|session| session.wants_snapshots(provisional_error_code));
+        if wants_snapshots {
+            let snapshots = crate::diagnostics::capture_snapshots(&tab).await;
+            if let Some(session) = diagnostics.as_ref() {
+                session.set_snapshots(snapshots);
             }
         }
 
@@ -2152,6 +2121,7 @@ impl WorkerService {
         // whether to log. A found skip_selector counts as success: the client asked for that
         // check, so it is an expected outcome rather than a malfunction to explain.
         if let Some(session) = diagnostics.as_mut() {
+            session.set_error_code(error_code as i32);
             if success || error_code == ErrorCode::SkipSelectorFound {
                 session.mark_success();
             }

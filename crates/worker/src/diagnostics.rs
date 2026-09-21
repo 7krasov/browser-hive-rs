@@ -12,6 +12,11 @@
 //! | Failed/blocked/aborted loads (with URL) | `Network.loadingFailed` + `Network.requestWillBeSent` | none — the `Network` domain is already enabled for the response observer |
 //! | `console.*` output, uncaught exceptions with stack | `Runtime.consoleAPICalled`, `Runtime.exceptionThrown` | `Runtime.enable` — **opt-in**, see [`DiagnosticsConfig::capture_console`] |
 //! | Final page state (readyState, node counts, title) | one `Runtime.evaluate` | one round-trip, bounded by [`PAGE_STATE_BUDGET`] |
+//! | Headless-detection markers (`navigator.*`) | one `Runtime.evaluate` | same |
+//!
+//! The two snapshots are taken only when the request may be logged
+//! ([`DiagnosticsSession::wants_snapshots`]), so with an error-code filter a normal request pays
+//! for the listeners alone.
 //!
 //! Events are only ever appended to a bounded in-memory buffer — nothing is logged per event.
 //! One request produces at most a handful of log lines, written once at the end.
@@ -70,6 +75,8 @@ struct DiagnosticsBuffer {
     request_urls: std::collections::HashMap<String, String>,
     /// Final page state snapshot (JSON), taken once at the end of the request.
     page_state: Option<String>,
+    /// Headless-detection markers (JSON), taken together with the page state.
+    headless_markers: Option<String>,
 }
 
 /// Which bucket a captured entry belongs to.
@@ -206,8 +213,11 @@ impl DiagnosticsLimiter {
 pub struct DiagnosticsSession {
     buffer: Arc<Mutex<DiagnosticsBuffer>>,
     limiter: Arc<DiagnosticsLimiter>,
-    mode: DiagnosticsMode,
+    config: DiagnosticsConfig,
     succeeded: bool,
+    /// The response's `ErrorCode`, once known. Early-return paths that never set it emit only
+    /// when no error-code filter is configured.
+    error_code: Option<i32>,
     /// Removes the CDP listener when the session ends.
     _listener_guard: Option<EventListenerGuard>,
 }
@@ -221,16 +231,42 @@ impl DiagnosticsSession {
         self.succeeded = true;
     }
 
-    /// Store the final page-state snapshot.
-    pub fn set_page_state(&self, json: String) {
-        self.buffer.lock().unwrap().page_state = Some(json);
+    /// Record the response's `ErrorCode`, which the error-code filter matches against.
+    pub fn set_error_code(&mut self, error_code: i32) {
+        self.error_code = Some(error_code);
+    }
+
+    /// Whether the end-of-request snapshots are worth taking, given the outcome as far as it is
+    /// known when they must be taken (before the AlwaysNew early destroy). `None` means the wait
+    /// so far looks successful — it can still turn into a failure (e.g. an off-domain redirect),
+    /// which is covered only when no filter is configured, as before the filter existed.
+    pub fn wants_snapshots(&self, provisional_error_code: Option<i32>) -> bool {
+        match provisional_error_code {
+            Some(code) => self.config.logs_error_code(code),
+            None => {
+                self.config.mode == DiagnosticsMode::Always || self.config.error_codes.is_empty()
+            }
+        }
+    }
+
+    /// Store the snapshots taken by [`capture_snapshots`].
+    pub fn set_snapshots(&self, snapshots: Snapshots) {
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.page_state = snapshots.page_state;
+        buffer.headless_markers = snapshots.headless_markers;
     }
 
     fn should_emit(&self) -> bool {
-        match self.mode {
+        match self.config.mode {
             DiagnosticsMode::Off => false,
             DiagnosticsMode::Always => true,
-            DiagnosticsMode::OnError => !self.succeeded,
+            DiagnosticsMode::OnError => {
+                !self.succeeded
+                    && match self.error_code {
+                        Some(code) => self.config.logs_error_code(code),
+                        None => self.config.error_codes.is_empty(),
+                    }
+            }
         }
     }
 }
@@ -299,6 +335,9 @@ impl Drop for DiagnosticsSession {
         }
         if let Some(state) = &buffer.page_state {
             info!("Diagnostics/page state: {}", state);
+        }
+        if let Some(markers) = &buffer.headless_markers {
+            info!("Diagnostics/headless markers: {}", markers);
         }
     }
 }
@@ -514,8 +553,9 @@ pub async fn start_capture(
     Ok(Some(DiagnosticsSession {
         buffer,
         limiter: limiter.clone(),
-        mode: config.mode,
+        config: config.clone(),
         succeeded: false,
+        error_code: None,
         _listener_guard: listener_guard,
     }))
 }
@@ -534,26 +574,62 @@ fn render_remote_object(obj: &headless_chrome::protocol::cdp::Runtime::RemoteObj
         .unwrap_or_else(|| format!("{:?}", obj.Type))
 }
 
-/// Snapshot the final page state, with a hard time bound.
+/// Answers "did the document finish, and did anything render at all", which separates a broken
+/// page from a page that simply lacked the selector.
+const PAGE_STATE_SCRIPT: &str = r#"JSON.stringify({
+    documentReady: document.readyState,
+    title: document.title || "(no title)",
+    url: document.URL,
+    scriptsCount: document.getElementsByTagName('script').length,
+    bodyChildrenCount: document.body ? document.body.children.length : 0,
+    htmlLength: document.documentElement.outerHTML.length
+})"#;
+
+/// The stealth-relevant `navigator` surface. Static once the page has loaded, so reading it at
+/// the end of the request sees what the site saw.
+const HEADLESS_MARKERS_SCRIPT: &str = r#"JSON.stringify({
+    webdriver: navigator.webdriver,
+    userAgent: navigator.userAgent,
+    languages: navigator.languages,
+    platform: navigator.platform,
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    deviceMemory: navigator.deviceMemory,
+    hasChrome: typeof window.chrome !== 'undefined',
+    hasPermissions: typeof navigator.permissions !== 'undefined',
+    hasNotifications: 'Notification' in window,
+    hasServiceWorker: 'serviceWorker' in navigator,
+    documentHidden: document.hidden,
+    outerWidth: window.outerWidth,
+    outerHeight: window.outerHeight
+})"#;
+
+/// End-of-request snapshots, taken while the tab is still alive.
+///
+/// A free function rather than a session method: the session holds a listener guard that is not
+/// `Sync`, so borrowing it across an `.await` would make the request future `!Send`.
+pub struct Snapshots {
+    page_state: Option<String>,
+    headless_markers: Option<String>,
+}
+
+/// Take the final page state and the headless-detection markers.
+pub async fn capture_snapshots(tab: &Arc<Tab>) -> Snapshots {
+    Snapshots {
+        page_state: evaluate_json(tab.clone(), "page state", PAGE_STATE_SCRIPT).await,
+        headless_markers: evaluate_json(tab.clone(), "headless markers", HEADLESS_MARKERS_SCRIPT)
+            .await,
+    }
+}
+
+/// Evaluate a script returning a JSON string, with a hard time bound.
 ///
 /// Runs after the wait strategy, so the tab may be dead or unresponsive; every failure mode is
-/// swallowed. Answers "did the document finish, and did anything render at all", which
-/// separates a broken page from a page that simply lacked the selector.
-pub async fn capture_page_state(tab: Arc<Tab>) -> Option<String> {
+/// swallowed — a snapshot must never change the request's outcome.
+async fn evaluate_json(tab: Arc<Tab>, what: &'static str, script: &'static str) -> Option<String> {
     let span = tracing::Span::current();
     let evaluate = tokio::task::spawn_blocking(move || {
         let _span_guard = span.enter();
-        tab.evaluate(
-            r#"JSON.stringify({
-                documentReady: document.readyState,
-                title: document.title || "(no title)",
-                url: document.URL,
-                scriptsCount: document.getElementsByTagName('script').length,
-                bodyChildrenCount: document.body ? document.body.children.length : 0,
-                htmlLength: document.documentElement.outerHTML.length
-            })"#,
-            false,
-        )
+        tab.evaluate(script, false)
     });
 
     match tokio::time::timeout(PAGE_STATE_BUDGET, evaluate).await {
@@ -563,17 +639,17 @@ pub async fn capture_page_state(tab: Arc<Tab>) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         Ok(Ok(Err(e))) => {
-            debug!("Page state snapshot failed: {}", e);
+            debug!("Diagnostics {} snapshot failed: {}", what, e);
             None
         }
         Ok(Err(e)) => {
-            debug!("Page state snapshot task failed: {}", e);
+            debug!("Diagnostics {} snapshot task failed: {}", what, e);
             None
         }
         Err(_) => {
             debug!(
-                "Page state snapshot timed out after {:?} - skipping",
-                PAGE_STATE_BUDGET
+                "Diagnostics {} snapshot timed out after {:?} - skipping",
+                what, PAGE_STATE_BUDGET
             );
             None
         }
@@ -636,6 +712,67 @@ mod tests {
         // A new window lets the next report through, carrying the suppressed count.
         limiter.state.lock().unwrap().window_start = Instant::now() - Duration::from_secs(61);
         assert_eq!(limiter.try_acquire(), Some(2));
+    }
+
+    fn session(config: DiagnosticsConfig) -> DiagnosticsSession {
+        DiagnosticsSession {
+            buffer: Arc::new(Mutex::new(DiagnosticsBuffer::default())),
+            limiter: Arc::new(DiagnosticsLimiter::new(0)),
+            config,
+            succeeded: false,
+            error_code: None,
+            _listener_guard: None,
+        }
+    }
+
+    fn filtered() -> DiagnosticsConfig {
+        DiagnosticsConfig {
+            enabled: true,
+            error_codes: vec![4042, 4041],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_error_code_filter_gates_emission() {
+        let mut listed = session(filtered());
+        listed.set_error_code(4042);
+        assert!(listed.should_emit());
+
+        let mut unlisted = session(filtered());
+        unlisted.set_error_code(5007);
+        assert!(!unlisted.should_emit());
+
+        // An early return that never set a code is not in any filter.
+        assert!(!session(filtered()).should_emit());
+    }
+
+    #[test]
+    fn test_no_filter_keeps_on_error_behaviour() {
+        let config = DiagnosticsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(session(config.clone()).should_emit());
+
+        let mut succeeded = session(config);
+        succeeded.set_error_code(0);
+        succeeded.mark_success();
+        assert!(!succeeded.should_emit());
+    }
+
+    #[test]
+    fn test_snapshots_only_for_loggable_outcomes() {
+        let s = session(filtered());
+        assert!(s.wants_snapshots(Some(4042)));
+        assert!(!s.wants_snapshots(Some(4043)));
+        assert!(!s.wants_snapshots(None));
+
+        let unfiltered = session(DiagnosticsConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(unfiltered.wants_snapshots(None));
     }
 
     #[test]

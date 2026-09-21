@@ -198,9 +198,10 @@ The returned `content` shows *what* a page ended up as, never *why*. A page whos
 | Uncaught JS errors, HTTP 4xx/5xx on sub-resources | `Log.entryAdded` | `Log.enable` |
 | Failed/blocked/aborted loads, with URL, `blockedReason` and `corsErrorStatus` | `Network.loadingFailed` + `Network.requestWillBeSent` | none — `Network` is already enabled for the response observer. Loads dropped by `BlockedUrlsMiddleware` (`blockedReason: inspector`, and the matching `ERR_BLOCKED_BY_CLIENT` console entries) are excluded: they are self-inflicted and would fill the entry cap |
 | `console.*`, uncaught exceptions with stack | `Runtime.consoleAPICalled`, `Runtime.exceptionThrown` | `Runtime.enable` — **opt-in**, see the warning below |
-| Final page state (readyState, node counts, title) | one `Runtime.evaluate` | one round-trip, bounded by `PAGE_STATE_BUDGET` (3s) |
+| Final page state (readyState, node counts, title) | one `Runtime.evaluate` | one round-trip, bounded by `PAGE_STATE_BUDGET` (3s) — **only when the outcome can be logged** |
+| Headless-detection markers (`navigator.webdriver`, UA, languages, …) | one `Runtime.evaluate` | same; taken together with the page state and emitted with the report (it used to be its own INFO line on *every* diagnostics-active request) |
 
-**Two independent gates.** *Capture* is decided **before navigation** (listeners must exist before the page loads, which is when the interesting failures happen), so it can only use configuration: `enabled` + `mode` + `domains`. *Logging* is decided **after** the request, from the outcome + entry caps + rate limit — this is what actually controls log volume, since almost all requests succeed.
+**Two independent gates.** *Capture* is decided **before navigation** (listeners must exist before the page loads, which is when the interesting failures happen), so it can only use configuration: `enabled` + `mode` + `domains`. *Logging* is decided **after** the request, from the outcome (success + `WORKER_DIAGNOSTICS_ERROR_CODES`) + entry caps + rate limit — this is what actually controls log volume, since almost all requests succeed.
 
 **Env variables** (parsed by `DiagnosticsConfig::from_env()`, which downstream workers with their own `main.rs` should call rather than re-implementing):
 
@@ -209,13 +210,14 @@ The returned `content` shows *what* a page ended up as, never *why*. A page whos
 | `WORKER_ENABLE_BROWSER_DIAGNOSTICS` | `false` | master switch |
 | `WORKER_DIAGNOSTICS_MODE` | `on_error` | `off` / `on_error` / `always` |
 | `WORKER_DIAGNOSTICS_DOMAINS` | empty = all | comma-separated; matches the host **and its subdomains** on a label boundary (`example.com` matches `a1.sub.example.com` but not `notexample.com`) |
+| `WORKER_DIAGNOSTICS_ERROR_CODES` | empty = every failure | comma-separated numeric `ErrorCode`s that may emit in `on_error` (e.g. `4042,4041`); ignored in `always`; a non-numeric entry is dropped with a WARN, so a list of typos means "every failure", never "none" |
 | `WORKER_DIAGNOSTICS_MAX_ENTRIES` | `20` | cap per category; duplicates collapse to `msg (xN)` without consuming the cap, overflow is counted |
 | `WORKER_DIAGNOSTICS_MAX_PER_MINUTE` | `10` | requests per minute that may emit; `0` = unlimited; suppressed count is reported with the next line |
 | `WORKER_DIAGNOSTICS_CONSOLE` | `false` | enable the `Runtime` domain for `console.*` capture |
 
 ⚠️ **`WORKER_DIAGNOSTICS_CONSOLE` is off by default on purpose**: enabling the CDP `Runtime` domain is a known anti-bot fingerprinting vector (vendors detect that the browser serialises exception objects for a listening debugger). Turning it on fleet-wide can raise the block rate and confound the very problem being debugged. Pair it with `WORKER_DIAGNOSTICS_DOMAINS`. Without it, JS errors and failed loads are still captured via `Log`/`Network`, which carry no such signal.
 
-**`on_error` semantics**: a found `skip_selector` counts as **success** — the client asked for that check, so it is an expected outcome, not a malfunction. Failures that do emit: navigation errors, `wait_selector` not found, off-domain redirects, hard timeouts.
+**`on_error` semantics**: a found `skip_selector` counts as **success** — the client asked for that check, so it is an expected outcome, not a malfunction. Failures that do emit: navigation errors, `wait_selector` not found, off-domain redirects, hard timeouts — narrowed by `WORKER_DIAGNOSTICS_ERROR_CODES` when it is set. **The code filter narrows logging, not capture**: listeners must exist before the outcome does, so every request to a matching domain still pays `Log.enable` and a listener; what the filter saves is the log volume and the two end-of-request snapshots. That is what makes diagnostics affordable fleet-wide (`DOMAINS` empty + `ERROR_CODES=4042,4041`). A `SELECTOR_NOT_FOUND`/`TIMEOUT_BROWSER` request consumes its whole wait budget, so such failures are self-limiting per pod (≤ `max_contexts × 60 / wait_timeout_s` a minute) and the rate limit rarely bites for them. Early-return paths that never record a code (`TERMINATING`, `get_content` failures) emit only with no filter; the wait-strategy hard timeout records `TIMEOUT_BROWSER`.
 
 **Emission is RAII** (`DiagnosticsSession::drop`), not an explicit call, so the hard-timeout / cancellation / panic paths — which `return` early from the handler and are the most interesting failures — are covered without a call at every return. The default outcome is therefore "failed"; the success path calls `mark_success()`.
 
