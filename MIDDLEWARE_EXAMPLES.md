@@ -291,9 +291,19 @@ use browser_hive_common::{BlockedResourceTypesMiddleware, TabInitMiddleware};
 let tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>> = vec![
     Box::new(DefaultTabInitMiddleware::new(headless)),
     // WORKER_BLOCKED_RESOURCE_TYPES=media  (unset or empty: no-op)
+    // Installs only the request interceptor; the worker enables Fetch. Never call
+    // `Fetch.enable` / `tab.enable_fetch` from a middleware: it replaces the worker's call and,
+    // behind a proxy with credentials, fails every request with ERR_INVALID_AUTH_CREDENTIALS.
     Box::new(BlockedResourceTypesMiddleware::from_env()),
 ];
 ```
+
+⚠️ **Fetch belongs to the worker.** `Fetch.enable` is called in one place, the worker's request
+path, which combines proxy authentication and the blocked types' patterns in one call. A second
+caller breaks proxy authentication whichever runs last: each call replaces the previous one, and
+Chrome answers the proxy's 407 only for requests matching the current patterns. Measured with an
+authenticating proxy: every navigation failed with `ERR_INVALID_AUTH_CREDENTIALS` (failed, not sent
+around the proxy). The same goes for `enable_request_interception`: a tab has one interceptor.
 
 - Names are CDP resource types, case-insensitive, comma-separated.
 - Chrome's Fetch filter rejects `texttrack`, `prefetch`, `websocket`, `manifest`, `signedexchange`,

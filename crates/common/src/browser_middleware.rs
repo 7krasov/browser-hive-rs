@@ -576,17 +576,37 @@ pub struct BlockedResourceType {
     pub label: &'static str,
 }
 
+impl BlockedResourceType {
+    /// The `Fetch.enable` pattern that pauses loads of this type.
+    pub fn fetch_pattern(&self) -> headless_chrome::protocol::cdp::Fetch::RequestPattern {
+        headless_chrome::protocol::cdp::Fetch::RequestPattern {
+            url_pattern: None,
+            resource_Type: Some(self.resource_type.clone()),
+            request_stage: None,
+        }
+    }
+}
+
 /// Drops every load of the configured resource types (`<video>`/`<audio>` for `media`) before it
 /// leaves the browser.
 ///
 /// # Why Fetch and not `Network.setBlockedURLs`
 ///
-/// `setBlockedURLs` matches URLs only; the resource type is known to Fetch interception. The
-/// middleware installs a request interceptor on the tab and enables `Fetch` with one pattern per
-/// type, so only loads of those types are paused. When the proxy has credentials the worker
-/// re-enables `Fetch` with no patterns before each request (to answer the auth challenge), which
-/// pauses every load — the interceptor still decides, so blocking keeps working, and that pausing
-/// happened before this middleware existed.
+/// `setBlockedURLs` matches URLs only; the resource type is known to Fetch interception.
+///
+/// # This middleware does not enable Fetch — the worker does
+///
+/// It only installs the tab's request interceptor, a local setting with no CDP call. `Fetch.enable`
+/// has exactly one caller, the worker's request path (`enable_fetch` in `worker/src/service.rs`),
+/// which learns the types from [`TabInitMiddleware::blocked_resource_types`]: with proxy
+/// credentials it enables Fetch for every load with auth handling (as it always did), otherwise
+/// with one pattern per blocked type, so nothing else is paused.
+///
+/// ⚠️ Two callers would not be safe in either order. Each `Fetch.enable` replaces the previous
+/// configuration, and Chrome answers the proxy's 407 only for requests matching the current
+/// patterns — measured 2026-09-22 with an authenticating proxy: enabling this type's patterns after
+/// the worker's auth call failed every navigation with `ERR_INVALID_AUTH_CREDENTIALS`, with
+/// `handleAuthRequests: true` passed along or not. The request fails; it does not bypass the proxy.
 ///
 /// A blocked load is reported by Chrome exactly like one dropped by [`BlockedUrlsMiddleware`]
 /// (`blockedReason: inspector`, `net::ERR_BLOCKED_BY_CLIENT.Inspector`), so it is counted in
@@ -600,6 +620,7 @@ pub struct BlockedResourceType {
 ///   embedded player runs in its own renderer.
 /// - **A tab has one request interceptor.** Another middleware calling
 ///   `enable_request_interception` replaces this one's, silently.
+/// - **Blocks nothing outside the browser-hive worker**, since Fetch is enabled there.
 ///
 /// # Configuration
 ///
@@ -665,7 +686,8 @@ impl TabInitMiddleware for BlockedResourceTypesMiddleware {
         use headless_chrome::protocol::cdp::Fetch;
         use headless_chrome::protocol::cdp::Network::ErrorReason;
 
-        // The interceptor must be in place before Fetch starts pausing loads.
+        // No `Fetch.enable` here: the worker owns it (see the type docs). A load that is paused
+        // for any other reason (proxy auth pauses every load) and is not of a blocked type goes on.
         let blocked: Vec<ResourceType> =
             self.types.iter().map(|t| t.resource_type.clone()).collect();
         tab.enable_request_interception(std::sync::Arc::new(
@@ -681,19 +703,8 @@ impl TabInitMiddleware for BlockedResourceTypesMiddleware {
             },
         ))?;
 
-        let patterns: Vec<Fetch::RequestPattern> = self
-            .types
-            .iter()
-            .map(|t| Fetch::RequestPattern {
-                url_pattern: None,
-                resource_Type: Some(t.resource_type.clone()),
-                request_stage: None,
-            })
-            .collect();
-        tab.enable_fetch(Some(&patterns), None)?;
-
         tracing::debug!(
-            "Installed blocked resource types on tab: {:?}",
+            "Installed blocked resource type interceptor on tab: {:?}",
             self.types.iter().map(|t| t.label).collect::<Vec<_>>()
         );
         Ok(())

@@ -164,11 +164,25 @@ fn cross_site_redirect_target(requested_url: &str, final_url: &str) -> Option<St
     (requested_domain != final_domain).then(|| final_domain.to_string())
 }
 
-/// Enable the Fetch domain with auth handling, so the proxy's 407 challenge is answered.
-async fn enable_fetch(tab: &Arc<headless_chrome::Tab>) -> anyhow::Result<()> {
+/// Enable the Fetch domain for this request: with auth handling when the proxy needs credentials,
+/// otherwise with only the blocked resource types' patterns, so nothing else is paused.
+///
+/// ⚠️ This is the **only** place `Fetch.enable` may be called. Each call replaces the previous
+/// configuration, and Chrome answers `Fetch.authRequired` only for requests matching the current
+/// patterns (measured 2026-09-22): a later call with narrower patterns or without
+/// `handleAuthRequests` fails every proxied request with `ERR_INVALID_AUTH_CREDENTIALS`. That is why
+/// `BlockedResourceTypesMiddleware` installs its interceptor but never enables Fetch itself.
+async fn enable_fetch(
+    tab: &Arc<headless_chrome::Tab>,
+    proxy_auth: bool,
+    blocked_types: &[browser_hive_common::BlockedResourceType],
+) -> anyhow::Result<()> {
     let tab = tab.clone();
+    let patterns: Option<Vec<_>> =
+        (!proxy_auth).then(|| blocked_types.iter().map(|t| t.fetch_pattern()).collect());
     cdp_call::bounded("Fetch.enable", move || {
-        tab.enable_fetch(None, Some(true)).map(|_| ())
+        tab.enable_fetch(patterns.as_deref(), proxy_auth.then_some(true))
+            .map(|_| ())
     })
     .await
 }
@@ -1129,12 +1143,14 @@ impl WorkerService {
 
         let mut tab = tab_guard.as_ref().unwrap().clone(); // Safe: we ensured tab exists above
 
-        // Enable proxy authentication before first navigation on this tab
+        // Enable Fetch before first navigation on this tab: for proxy authentication and/or for
+        // the blocked resource types (see `enable_fetch`, the only caller of `Fetch.enable`).
         // NOTE: This can fail if the tab's WebSocket connection has timed out (even though tab exists).
         // In such cases, we recreate the tab and try once more.
-        if let Some((username, password)) = proxy_config.get_credentials() {
-            // Try to enable Fetch domain to handle auth requests
-            let enable_result = enable_fetch(&tab).await;
+        let credentials = proxy_config.get_credentials();
+        let proxy_auth = credentials.is_some();
+        if proxy_auth || !self.blocked_resource_types.is_empty() {
+            let enable_result = enable_fetch(&tab, proxy_auth, &self.blocked_resource_types).await;
 
             if let Err(e) = enable_result {
                 if cdp_call::is_stalled(&e) {
@@ -1194,7 +1210,9 @@ impl WorkerService {
                     *tab_guard = Some(new_tab);
 
                     // Retry enable_fetch on the recreated tab
-                    if let Err(e) = enable_fetch(&tab).await {
+                    if let Err(e) =
+                        enable_fetch(&tab, proxy_auth, &self.blocked_resource_types).await
+                    {
                         if cdp_call::is_stalled(&e) {
                             drop(tab_guard);
                             drop(browser_pool_guard);
@@ -1248,7 +1266,9 @@ impl WorkerService {
                             *tab_guard = Some(new_tab);
 
                             // Retry enable_fetch on fresh tab
-                            if let Err(e) = enable_fetch(&tab).await {
+                            if let Err(e) =
+                                enable_fetch(&tab, proxy_auth, &self.blocked_resource_types).await
+                            {
                                 if cdp_call::is_stalled(&e) {
                                     drop(tab_guard);
                                     drop(browser_pool_guard);
@@ -1354,25 +1374,27 @@ impl WorkerService {
             }
 
             // Set proxy credentials
-            if let Err(e) = tab.authenticate(Some(username.clone()), Some(password.clone())) {
-                let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                return Ok(ScrapePageResponse {
-                    success: false,
-                    status_code: 0,
-                    content: String::new(),
-                    error_message: format!(
-                        "Failed to set auth for context {} (domain: {}): {} (after {}ms)",
-                        context.metadata.id, domain, e, execution_time_ms
-                    ),
-                    error_code: ErrorCode::BrowserError as i32,
-                    response_headers: std::collections::HashMap::new(),
-                    execution_time_ms,
-                    context_id: self.addressable_context_id(&context),
-                    ray_id: ray_id.to_string(),
-                });
-            }
+            if let Some((username, password)) = &credentials {
+                if let Err(e) = tab.authenticate(Some(username.clone()), Some(password.clone())) {
+                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                    return Ok(ScrapePageResponse {
+                        success: false,
+                        status_code: 0,
+                        content: String::new(),
+                        error_message: format!(
+                            "Failed to set auth for context {} (domain: {}): {} (after {}ms)",
+                            context.metadata.id, domain, e, execution_time_ms
+                        ),
+                        error_code: ErrorCode::BrowserError as i32,
+                        response_headers: std::collections::HashMap::new(),
+                        execution_time_ms,
+                        context_id: self.addressable_context_id(&context),
+                        ray_id: ray_id.to_string(),
+                    });
+                }
 
-            debug!("Enabled proxy authentication for tab before navigation");
+                debug!("Enabled proxy authentication for tab before navigation");
+            }
         }
         drop(browser_pool_guard); // Release read lock
 
