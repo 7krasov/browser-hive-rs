@@ -86,6 +86,13 @@ const MAX_TERMINATING_ATTEMPTS: u32 = 3;
 /// staleness in the coordinator's slot cache, where a *different* pod really does have room.
 const MAX_CAPACITY_ATTEMPTS: u32 = 2;
 
+/// An unreachable worker gets **one** retry. Nothing reached the client, so a retry cannot deliver
+/// a page twice, and the common cause is a pod killed mid-drain (a GKE Spot preemption grants 15 s,
+/// see the worker's `shutdown.rs`) — which another pod serves fine. But a worker can also die
+/// *because of* the request (a page that pushes the container past its memory limit), and then
+/// every attempt takes down another pod; one retry bounds that to one extra pod.
+const MAX_UNREACHABLE_ATTEMPTS: u32 = 2;
+
 /// How a worker answer that another pod could still serve should be retried.
 pub(crate) struct RetryPlan {
     reason: RetryReason,
@@ -119,6 +126,28 @@ fn classify_retry(error_code: i32, no_session: bool) -> Option<RetryPlan> {
         });
     }
     None
+}
+
+/// Decide whether a worker that could not be reached is worth trying another pod for.
+///
+/// A connect failure never reached the worker; a broken RPC may have run part of the scrape but
+/// returned nothing, which is the same position as a `TERMINATING` answer. A session is not
+/// retried: it lived in one context on the pod that is gone, and a context elsewhere would be a
+/// different session handed out under the old id.
+fn classify_unreachable_retry(no_session: bool) -> Option<RetryPlan> {
+    no_session.then_some(RetryPlan {
+        reason: RetryReason::WorkerUnreachable,
+        max_attempts: MAX_UNREACHABLE_ATTEMPTS,
+        code_name: "WORKER_UNREACHABLE",
+    })
+}
+
+/// What one attempt against a worker produced.
+enum AttemptOutcome {
+    /// The worker answered; the answer may still be a retryable error code.
+    Answered(browser_hive_proto::worker::ScrapePageResponse),
+    /// The worker could not be connected to, or the RPC broke; the message is for the client.
+    Unreachable(String),
 }
 
 fn classify_missing_scope(
@@ -806,7 +835,7 @@ impl ScraperCoordinator for CoordinatorService {
         let mut last_worker_endpoint = worker_endpoint.clone();
 
         // Retry loop for worker answers that another pod could still serve (see `retry_plan`)
-        let mut worker_response = loop {
+        let outcome = loop {
             attempt += 1;
 
             // This attempt occupies a slot on `last_worker_id` until the iteration ends — by
@@ -819,118 +848,90 @@ impl ScraperCoordinator for CoordinatorService {
                 .is_empty()
                 .then(|| self.in_flight.start(&last_worker_id));
 
-            // Connect to worker
-            let mut client = match WorkerServiceClient::connect(last_worker_endpoint.clone()).await
-            {
-                Ok(client) => client.max_decoding_message_size(MAX_WORKER_RESPONSE_SIZE),
+            // Connect to worker and send the attempt. Connect and RPC failures are operational
+            // errors, not infrastructure ones from the client's point of view: the client gets a
+            // parseable response carrying `ray_id` and `execution_time_ms` like every other error
+            // (built after the loop), after one retry on another pod where that is safe.
+            let outcome = match WorkerServiceClient::connect(last_worker_endpoint.clone()).await {
                 Err(e) => {
-                    // Unreachable worker is an operational error, not an infrastructure one from
-                    // the client's point of view: the coordinator answered, so the answer must be
-                    // a parseable response carrying `ray_id` and `execution_time_ms` like every
-                    // other error. Returning `Status::internal` here (as this did) forced clients
-                    // to read a free-text gRPC message and lost the tracing id with it.
                     warn!("Failed to connect to worker {}: {}", last_worker_id, e);
-                    request_metrics.reject(RejectReason::WorkerUnreachable);
-                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                    return Ok(Response::new(ScrapePageResponse {
-                        success: false,
-                        status_code: 0,
-                        content: String::new(),
-                        error_message: format!(
-                            "Failed to connect to worker {}: {}",
-                            last_worker_id, e
-                        ),
-                        error_code: browser_hive_proto::coordinator::ErrorCode::WorkerUnreachable
-                            as i32,
-                        response_headers: std::collections::HashMap::new(),
-                        session_id: String::new(),
-                        worker_id: last_worker_id.clone(),
-                        context_id: String::new(),
-                        execution_time_ms,
+                    AttemptOutcome::Unreachable(format!(
+                        "Failed to connect to worker {}: {}",
+                        last_worker_id, e
+                    ))
+                }
+                Ok(client) => {
+                    let mut client = client.max_decoding_message_size(MAX_WORKER_RESPONSE_SIZE);
+
+                    // Parse session_id to get context_id
+                    let context_id = if !req.session_id.is_empty() {
+                        SessionId::from_string(&req.session_id)
+                            .map(|sid| sid.context_id)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    // Calculate remaining time for this attempt
+                    let now = std::time::Instant::now();
+                    let remaining_time = request_deadline.saturating_duration_since(now);
+                    let timeout_seconds = remaining_time.as_secs().max(1) as u32; // At least 1 second
+
+                    let worker_request = browser_hive_proto::worker::ScrapePageRequest {
+                        url: req.url.clone(),
+                        timeout_seconds,
+                        context_id: context_id.clone(),
+                        wait_strategy: req.wait_strategy.clone(),
+                        wait_timeout_ms: req.wait_timeout_ms,
+                        wait_selector: req.wait_selector.clone(),
+                        skip_selector: req.skip_selector.clone(),
                         ray_id: ray_id.clone(),
-                    }));
+                        country_code: req.country_code.clone(),
+                    };
+
+                    debug!(
+                        "Attempt {}: Forwarding to worker {} (timeout: {}s, wait_timeout_ms={}, wait_selector={:?}, skip_selector={:?})",
+                        attempt,
+                        last_worker_id,
+                        timeout_seconds,
+                        worker_request.wait_timeout_ms,
+                        if worker_request.wait_selector.is_empty() { None } else { Some(&worker_request.wait_selector) },
+                        if worker_request.skip_selector.is_empty() { None } else { Some(&worker_request.skip_selector) }
+                    );
+
+                    // Set timeout for the gRPC request
+                    let mut request = Request::new(worker_request);
+                    request.set_timeout(GRPC_CLIENT_TIMEOUT);
+
+                    match client.scrape_page(request).await {
+                        Ok(resp) => AttemptOutcome::Answered(resp.into_inner()),
+                        // `InvalidArgument` is the worker rejecting the *request* (an unknown
+                        // `wait_strategy`, a `wait_timeout_ms` over the maximum), which is a
+                        // defect in the call and must reach the client as such instead of being
+                        // dressed up as an infrastructure problem it could retry forever.
+                        Err(e) if e.code() == tonic::Code::InvalidArgument => return Err(e),
+                        // The RPC itself failed: the worker died mid-request, or the connection
+                        // broke.
+                        Err(e) => {
+                            warn!("Worker {} RPC failed: {}", last_worker_id, e);
+                            AttemptOutcome::Unreachable(format!(
+                                "Worker {} became unreachable during the request: {}",
+                                last_worker_id, e
+                            ))
+                        }
+                    }
                 }
             };
 
-            // Parse session_id to get context_id
-            let context_id = if !req.session_id.is_empty() {
-                SessionId::from_string(&req.session_id)
-                    .map(|sid| sid.context_id)
-                    .unwrap_or_default()
-            } else {
-                String::new()
+            // Is this an outcome another pod could still serve?
+            let no_session = req.session_id.is_empty();
+            let plan = match &outcome {
+                AttemptOutcome::Answered(resp) => classify_retry(resp.error_code, no_session),
+                AttemptOutcome::Unreachable(_) => classify_unreachable_retry(no_session),
             };
-
-            // Calculate remaining time for this attempt
-            let now = std::time::Instant::now();
-            let remaining_time = request_deadline.saturating_duration_since(now);
-            let timeout_seconds = remaining_time.as_secs().max(1) as u32; // At least 1 second
-
-            let worker_request = browser_hive_proto::worker::ScrapePageRequest {
-                url: req.url.clone(),
-                timeout_seconds,
-                context_id: context_id.clone(),
-                wait_strategy: req.wait_strategy.clone(),
-                wait_timeout_ms: req.wait_timeout_ms,
-                wait_selector: req.wait_selector.clone(),
-                skip_selector: req.skip_selector.clone(),
-                ray_id: ray_id.clone(),
-                country_code: req.country_code.clone(),
-            };
-
-            debug!(
-                "Attempt {}: Forwarding to worker {} (timeout: {}s, wait_timeout_ms={}, wait_selector={:?}, skip_selector={:?})",
-                attempt,
-                last_worker_id,
-                timeout_seconds,
-                worker_request.wait_timeout_ms,
-                if worker_request.wait_selector.is_empty() { None } else { Some(&worker_request.wait_selector) },
-                if worker_request.skip_selector.is_empty() { None } else { Some(&worker_request.skip_selector) }
-            );
-
-            // Set timeout for the gRPC request
-            let mut request = Request::new(worker_request);
-            request.set_timeout(GRPC_CLIENT_TIMEOUT);
-
-            let response = match client.scrape_page(request).await {
-                Ok(resp) => resp,
-                // The RPC itself failed: the worker died mid-request, or the connection broke.
-                // `InvalidArgument` is the exception — it is the worker rejecting the *request*
-                // (an unknown `wait_strategy`, a `wait_timeout_ms` over the maximum), which is a
-                // defect in the call and must reach the client as such instead of being dressed
-                // up as an infrastructure problem it could retry forever.
-                Err(e) if e.code() == tonic::Code::InvalidArgument => return Err(e),
-                Err(e) => {
-                    warn!("Worker {} RPC failed: {}", last_worker_id, e);
-                    request_metrics.reject(RejectReason::WorkerUnreachable);
-                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                    return Ok(Response::new(ScrapePageResponse {
-                        success: false,
-                        status_code: 0,
-                        content: String::new(),
-                        error_message: format!(
-                            "Worker {} became unreachable during the request: {}",
-                            last_worker_id, e
-                        ),
-                        error_code: browser_hive_proto::coordinator::ErrorCode::WorkerUnreachable
-                            as i32,
-                        response_headers: std::collections::HashMap::new(),
-                        session_id: String::new(),
-                        worker_id: last_worker_id.clone(),
-                        context_id: String::new(),
-                        execution_time_ms,
-                        ray_id: ray_id.clone(),
-                    }));
-                }
-            };
-
-            let worker_resp = response.into_inner();
-
-            // Is this an answer another pod could still serve?
-            let Some(plan) = classify_retry(worker_resp.error_code, req.session_id.is_empty())
-            else {
+            let Some(plan) = plan else {
                 // Success, or an error no other worker would answer differently
-                break worker_resp;
+                break outcome;
             };
             let RetryPlan {
                 reason: retry_reason,
@@ -954,7 +955,7 @@ impl ScraperCoordinator for CoordinatorService {
                     "Not enough time remaining for retry ({:?} < {:?}), returning {} to client",
                     remaining_time, min_retry_time_remaining, code_name
                 );
-                break worker_resp;
+                break outcome;
             }
 
             if attempt >= max_attempts {
@@ -962,7 +963,7 @@ impl ScraperCoordinator for CoordinatorService {
                     "Max retry attempts ({}) reached, returning {} to client",
                     max_attempts, code_name
                 );
-                break worker_resp;
+                break outcome;
             }
 
             // Try to find another worker
@@ -975,7 +976,7 @@ impl ScraperCoordinator for CoordinatorService {
                 Some(w) => w,
                 None => {
                     warn!("Scope {} not found during retry", req.scope_name);
-                    break worker_resp;
+                    break outcome;
                 }
             };
 
@@ -995,12 +996,12 @@ impl ScraperCoordinator for CoordinatorService {
                 pick_most_free(candidates, |w| self.in_flight.free_slots(w), rotation)
             else {
                 warn!("No healthy workers available for retry");
-                break worker_resp;
+                break outcome;
             };
 
             if free_slots == 0 {
                 warn!("No available slots for retry");
-                break worker_resp;
+                break outcome;
             }
 
             last_worker_id = best_worker.pod_name.clone();
@@ -1015,6 +1016,28 @@ impl ScraperCoordinator for CoordinatorService {
             request_metrics.record_retry(retry_reason);
 
             debug!("Retrying on worker: {}", last_worker_id);
+        };
+
+        let mut worker_response = match outcome {
+            AttemptOutcome::Answered(resp) => resp,
+            AttemptOutcome::Unreachable(error_message) => {
+                request_metrics.reject(RejectReason::WorkerUnreachable);
+                let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                return Ok(Response::new(ScrapePageResponse {
+                    success: false,
+                    status_code: 0,
+                    content: String::new(),
+                    error_message,
+                    error_code: browser_hive_proto::coordinator::ErrorCode::WorkerUnreachable
+                        as i32,
+                    response_headers: std::collections::HashMap::new(),
+                    session_id: String::new(),
+                    worker_id: last_worker_id,
+                    context_id: String::new(),
+                    execution_time_ms,
+                    ray_id,
+                }));
+            }
         };
 
         // A worker that ran out of slots is answering about **capacity**, and capacity is the
@@ -1181,6 +1204,17 @@ mod tests {
 
         assert!(classify_retry(WorkerCode::CapacityExhausted as i32, false).is_none());
         assert!(classify_retry(CoordCode::Terminating as i32, false).is_some());
+    }
+
+    /// An unreachable worker earns one retry, and only without a session: the session's context
+    /// lived on the pod that is gone. One retry, because a request that killed its worker would
+    /// kill every pod it is sent to.
+    #[test]
+    fn an_unreachable_worker_is_retried_once_and_never_for_a_session() {
+        let plan = classify_unreachable_retry(true).expect("retryable");
+        assert_eq!(plan.reason, RetryReason::WorkerUnreachable);
+        assert_eq!(plan.max_attempts, 2);
+        assert!(classify_unreachable_retry(false).is_none());
     }
 
     /// Helper to create a WorkerEndpoint for testing

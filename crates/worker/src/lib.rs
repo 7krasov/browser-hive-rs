@@ -5,6 +5,7 @@ mod cdp_call;
 mod diagnostics;
 mod metrics;
 mod service;
+mod shutdown;
 mod third_party;
 
 pub mod providers;
@@ -16,10 +17,8 @@ pub use service::WorkerService;
 use anyhow::Result;
 use browser_hive_common::WorkerConfig;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::signal;
 use tokio_cancellation_ext::CancellationToken;
 use tonic::transport::Server;
 use tracing::{info, warn, Instrument};
@@ -148,6 +147,11 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
         warn!("{}", warning);
     }
 
+    // Read before anything is launched so a malformed value is reported at startup, not at the
+    // moment the pod is being stopped.
+    let drain_timeout = shutdown::drain_timeout_from_env();
+    info!("Shutdown drain timeout: {:?}", drain_timeout);
+
     // Create cancellation token for graceful shutdown
     let cancellation_token = CancellationToken::new();
 
@@ -202,7 +206,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     worker_service,
                 ),
             )
-            .serve_with_shutdown(addr, shutdown_signal(active_requests.clone(), is_ready.clone(), cancellation_token.clone())) => {
+            .serve_with_shutdown(addr, shutdown::shutdown_signal(active_requests.clone(), is_ready.clone(), cancellation_token.clone(), drain_timeout)) => {
             result?;
             info!("gRPC server shutdown complete");
         }
@@ -223,66 +227,4 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     info!("Worker shutdown complete");
     Ok(())
-}
-
-async fn shutdown_signal(
-    active_requests: Arc<AtomicUsize>,
-    is_ready: Arc<std::sync::atomic::AtomicBool>,
-    cancellation_token: CancellationToken,
-) {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            warn!("Received Ctrl+C signal");
-        },
-        _ = terminate => {
-            warn!("Received SIGTERM signal");
-        },
-    }
-
-    // Mark as not ready for K8s readiness probe
-    is_ready.store(false, Ordering::SeqCst);
-    info!("Worker marked as not ready (readiness probe will fail)");
-
-    // Cancel all ongoing operations
-    info!("Cancelling all active operations...");
-    cancellation_token.cancel();
-
-    let active_count = active_requests.load(Ordering::SeqCst);
-    if active_count > 0 {
-        info!(
-            "Starting graceful shutdown, waiting for {} active request(s) to complete...",
-            active_count
-        );
-
-        // Wait for all requests to complete
-        loop {
-            let remaining = active_requests.load(Ordering::SeqCst);
-            if remaining == 0 {
-                break;
-            }
-            info!("Waiting for {} request(s) to complete...", remaining);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        info!("All active requests completed");
-    } else {
-        info!("Starting graceful shutdown, no active requests");
-    }
 }

@@ -5,47 +5,54 @@ This document describes the graceful shutdown implementation for Browser Hive's 
 ## Overview
 
 Browser Hive implements graceful shutdown to handle POSIX signals (SIGTERM, SIGINT) during pod termination, ensuring:
-- Every in-flight request gets an answer (`ERROR_CODE_TERMINATING`) rather than a dropped connection
-- Automatic retry on healthy workers, by the coordinator
-
-⚠️ **It does not drain.** SIGTERM cancels in-flight requests at once instead of letting them
-finish, so a rollout, a KEDA scale-down or a spot preemption costs every request in flight on the
-pod; the coordinator retries them from scratch only while ≥ 10 s of the client's deadline remain.
-The fix is an open item in TODO.md ("Shutdown does not drain in-flight requests").
+- Requests already in flight are allowed to **finish**, up to a configurable bound
+- A request that arrives after the signal is answered `ERROR_CODE_TERMINATING` without being started,
+  and the coordinator re-sends it to a healthy worker
+- A worker killed before it finished (SIGKILL, e.g. a spot preemption) is retried once on another
+  worker by the coordinator
 
 ## Architecture
 
 ### Worker Graceful Shutdown
 
-When a Worker receives SIGTERM:
+Implemented in `crates/worker/src/shutdown.rs`. When a Worker receives SIGTERM:
 
-1. **Immediate Response** (t=0ms)
-   - Sets `is_ready = false` → K8s readiness probe fails
-   - Calls `cancellation_token.cancel()`
-   - New requests immediately return `ERROR_CODE_TERMINATING`
+1. **Stop taking work** (t=0)
+   - Sets `is_ready = false` → `HealthCheck` answers `healthy = false`; the coordinator's health
+     monitor (1 s poll) stops routing here
+   - A request that still arrives is answered `ERROR_CODE_TERMINATING` at once — nothing was done,
+     so the coordinator's retry costs the client nothing
 
-2. **Active Request Handling**
-   - Blocking operations wrapped in `spawn_blocking` + `tokio::select!`
-   - When the token is cancelled, the in-flight request answers TERMINATING immediately — it is
-     aborted, not finished
-   - Its tab is closed **detached** on the blocking pool (`close_tab_detached`); the context stays
-     in the pool. Never inline: `Tab::close` can wait up to an hour on an unresponsive tab
+2. **Drain** (t=0 … `WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 25 s)
+   - Requests in flight run to completion; the remaining count is logged when it changes
+   - At least 3 s pass even with nothing in flight, so the coordinator has seen `healthy = false`
+     before the gRPC server closes (otherwise it would connect to a closed port for up to a health
+     round)
+   - A second SIGTERM / Ctrl+C ends the drain at once
+
+3. **Cancel what is left** (drain timeout reached, or interrupted)
+   - `cancellation_token.cancel()`: blocking operations are wrapped in `spawn_blocking` +
+     `tokio::select!`, so each remaining request answers `TERMINATING` immediately; its tab is
+     closed **detached** on the blocking pool (`close_tab_detached`) and the context stays in the
+     pool. Never inline: `Tab::close` can wait up to an hour on an unresponsive tab
    - The blocking thread may stay parked inside headless_chrome until SIGKILL (acceptable)
-
-3. **Graceful Wait**
-   - Waits for the request handlers to return — which, since they were cancelled in step 1, is
-     normally immediate
-   - Polls every 500ms and logs remaining count
-   - There is no internal timeout; the hard limit is K8s `terminationGracePeriodSeconds` (SIGKILL)
+   - The worker waits for those handlers to return, then the gRPC server closes
 
 4. **K8s Integration**
-   - The `preStop` hook runs **before** SIGTERM is sent. During its sleep the worker still reports
-     itself healthy and keeps receiving requests, which step 1 then cancels
-   - Readiness probe removes pod from Service endpoints. This is **not** what stops routing: the
-     coordinator discovers pods via the K8s API and connects to pod IPs, so it never consults the
-     Service. Routing stops because `HealthCheck` returns `healthy = false` from SIGTERM on, which
-     the coordinator's health monitor sees within ~1s
-   - `terminationGracePeriodSeconds: 60` counts from the start of `preStop`
+   - Set `terminationGracePeriodSeconds` ≥ 3 s + drain timeout + a few seconds of margin. A drain
+     timeout ≥ the longest request a scope serves means rollouts and scale-downs abort nothing
+   - ⚠️ **The grace period is not always what the pod spec says.** On a GKE Spot preemption a
+     non-system pod gets at most **15 s**, whatever `terminationGracePeriodSeconds` is (the node
+     pool's `shutdownGracePeriodSeconds` can raise it to 120 s). The drain is then cut by SIGKILL;
+     the requests still running lose their connection and the coordinator retries them as an
+     unreachable worker (below), so a short real grace period costs no more than cancelling early
+   - **No `preStop` sleep is needed for the worker.** Routing stops because `HealthCheck` turns
+     unhealthy at SIGTERM, not because of Service endpoints (the coordinator discovers pods via the
+     K8s API and connects to pod IPs). A `preStop` sleep only delays that, and on a spot preemption
+     it spends part of the 15 s
+   - `terminationGracePeriodSeconds` counts from the start of `preStop`, if there is one
+   - `WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS=0` restores the old behaviour: cancel right after the 3 s
+     pause
 
 ### Coordinator Graceful Shutdown
 
@@ -80,7 +87,7 @@ When a Coordinator receives SIGTERM:
 4. **Graceful Wait**
    - Waits for all active requests to complete
    - Active requests may include retries to other workers
-   - No internal timeout: waits until all complete; K8s sends SIGKILL after `terminationGracePeriodSeconds` (60s)
+   - No internal timeout: waits until all complete; K8s sends SIGKILL after `terminationGracePeriodSeconds`
 
 ## Error Codes
 
@@ -96,6 +103,17 @@ Returned when Worker or Coordinator is shutting down.
 - Retries on different healthy worker (max 3 attempts)
 - Respects client timeout deadline
 - Returns final TERMINATING if all retries fail
+
+### ERROR_CODE_WORKER_UNREACHABLE (5002)
+
+Returned by the coordinator when it could not connect to the chosen worker, or the connection broke
+mid-request — most often a worker killed before its drain ended.
+
+**Coordinator automatically** retries it **once** on another healthy worker (2 attempts in total),
+under the same ≥ 10 s deadline guard, and never for a request carrying a `session_id` (the session
+lived on the pod that is gone). Only one retry because a worker can also die *because of* the
+request (a page that pushes the container over its memory limit), and every further attempt would
+take down another pod.
 
 ## Implementation Details
 
@@ -214,18 +232,18 @@ See [K8S_DEPLOYMENT.md](./K8S_DEPLOYMENT.md) for complete K8s configuration incl
 Worker Deployment:
 ```yaml
 spec:
-  terminationGracePeriodSeconds: 60
+  terminationGracePeriodSeconds: 360   # >= 3 s + drain timeout + margin
   containers:
   - name: worker
+    env:
+    - name: WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS
+      value: "330"                      # >= the longest request (320 s)
     readinessProbe:
       tcpSocket:            # not grpc: - no grpc.health.v1 service is implemented
         port: 50052
       initialDelaySeconds: 5
       periodSeconds: 2
-    lifecycle:
-      preStop:
-        exec:
-          command: ["/bin/sh", "-c", "sleep 5"]
+    # no preStop: routing stops on the HealthCheck answer, see above
 ```
 
 ## Monitoring
@@ -235,15 +253,17 @@ spec:
 During graceful shutdown, worker logs:
 ```
 WARN  Received SIGTERM signal
-INFO  Worker marked as not ready (readiness probe will fail)
-INFO  Cancelling all active operations...
-INFO  Starting graceful shutdown, waiting for 3 active request(s) to complete...
-INFO  Waiting for 3 request(s) to complete...
-INFO  Waiting for 2 request(s) to complete...
-INFO  Waiting for 1 request(s) to complete...
-INFO  All active requests completed
+INFO  Worker marked unhealthy; taking no new requests, draining in-flight ones for up to 330s
+INFO  Draining: 2 request(s) in flight, 329.9s left
+INFO  Draining: 1 request(s) in flight, 322.4s left
+INFO  All in-flight requests completed
+INFO  Starting gRPC server shutdown
+INFO  gRPC server shutdown complete
 INFO  Worker shutdown complete
 ```
+
+When the bound is reached: `WARN Drain timeout (…) reached with N request(s) still in flight;
+cancelling them`. The drain bound in force is logged at startup (`Shutdown drain timeout: …`).
 
 ### Coordinator Logs
 
@@ -263,9 +283,12 @@ Workers expose Prometheus metrics on port 9090 (see [METRICS.md](METRICS.md)). D
 
 The coordinator counts the shutdown side (port 9090 of the coordinator, see METRICS.md):
 - `browser_hive_coordinator_requests_retried_total{scope, reason="terminating"}` - attempts re-sent to
-  another pod after a TERMINATING answer
-- `browser_hive_coordinator_requests_rejected_total{scope, reason="terminating"}` - requests that
-  still ended in TERMINATING (no retry possible)
+  another pod after a TERMINATING answer; with the drain in place this should be close to zero
+  outside spot preemptions
+- `browser_hive_coordinator_requests_retried_total{scope, reason="worker_unreachable"}` - attempts
+  re-sent after a connect failure or a broken RPC — a pod killed mid-drain, or crashed
+- `browser_hive_coordinator_requests_rejected_total{scope, reason="terminating"}` /
+  `{reason="worker_unreachable"}` - requests that still ended that way (no retry possible)
 
 ### Following one request across the retry
 
@@ -277,13 +300,14 @@ TERMINATING retry, so `| json | span_ray_id="..."` in Loki shows every attempt o
 ### Worker Shutdown Timeline
 
 ```
-t=0s:     Pod deleted → preStop hook starts (sleep 5); worker still healthy, still routed to
-t=5s:     preStop done → SIGTERM → is_ready=false, cancel token;
-          in-flight requests answer TERMINATING, the coordinator retries them elsewhere
-t=5-7s:   Coordinator's health monitor (1s poll) sees healthy=false, stops routing here;
+t=0s:     Pod deleted → SIGTERM → is_ready=false; new requests answer TERMINATING
+t=0-2s:   Coordinator's health monitor (1s poll) sees healthy=false, stops routing here;
           readiness probe fails (cosmetic - nothing routes via Service)
-t=5s+:    Wait for the cancelled handlers to return (check every 500ms), then exit
-t=60s:    SIGKILL if still running
+t=0s+:    In-flight requests keep running
+t=3s+:    Server closes once nothing is in flight (never before 3s)
+t=drain:  Whatever is still running is cancelled → TERMINATING → coordinator retries elsewhere
+t=grace:  SIGKILL if still running (15s on a GKE Spot preemption) → connections break →
+          coordinator retries once as WORKER_UNREACHABLE
 ```
 
 ### Request During Shutdown
@@ -318,28 +342,22 @@ t=15s:    Coordinator forwards to client
 - Use `maxUnavailable: 1` in RollingUpdate strategy
 - Client should retry immediately (coordinator handles selection)
 
-### Worker takes 60s to shutdown
+### Worker takes long to shut down
 
-**Symptom**: Worker logs "SIGKILL sent after 60s"
-
-**Causes**:
-1. Active requests taking longer than 60s
-2. Blocking operation doesn't respect cancellation
-3. Browser context not releasing
-
-**Solutions**:
-- Check request timeout configuration
-- Verify wait strategies respect cancellation token
-- Review browser context lifecycle settings
+**Expected** while requests are in flight: the worker waits for them up to
+`WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS`. If pods are SIGKILLed before the drain ends
+(`Worker shutdown complete` missing from the log), the grace period is shorter than 3 s + drain
+timeout — or it was a spot preemption (15 s).
 
 ### Coordinator doesn't retry
 
-**Symptom**: Client gets TERMINATING without retry
+**Symptom**: Client gets TERMINATING or WORKER_UNREACHABLE without retry
 
 **Causes**:
 1. No healthy workers available
 2. Remaining time < 10s
-3. Max attempts (3) exhausted
+3. Max attempts exhausted (3 for TERMINATING, 2 for WORKER_UNREACHABLE)
+4. The request carried a `session_id` (never retried as WORKER_UNREACHABLE)
 
 **Solutions**:
 - Check health cache logs: "No healthy workers available for retry"
@@ -354,7 +372,7 @@ t=15s:    Coordinator forwards to client
 ### Core Implementation
 - `crates/tokio-cancellation-ext/` - Cancellation utilities
 - `crates/worker/src/service.rs` - Worker graceful shutdown
-- `crates/worker/src/lib.rs` - Worker signal handler
+- `crates/worker/src/shutdown.rs` - Worker signal handler and drain
 - `crates/coordinator/src/service.rs` - Coordinator with retry logic
 - `crates/coordinator/src/main.rs` - Coordinator signal handler
 - `crates/common/src/wait_strategy.rs` - Cancellation in wait loops

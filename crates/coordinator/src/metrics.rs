@@ -119,6 +119,9 @@ pub enum RetryReason {
     /// The chosen worker had no free slot by the time the request arrived
     /// (`ERROR_CODE_CAPACITY_EXHAUSTED`) — the coordinator's stats were a few seconds stale.
     NoSlots,
+    /// The chosen worker could not be connected to, or the connection broke mid-request — most
+    /// often a pod killed before its drain ended (a spot preemption grants 15 s).
+    WorkerUnreachable,
 }
 
 impl RetryReason {
@@ -126,12 +129,17 @@ impl RetryReason {
         match self {
             Self::Terminating => "terminating",
             Self::NoSlots => "no_slots",
+            Self::WorkerUnreachable => "worker_unreachable",
         }
     }
 }
 
 /// Same purpose as [`ALL_REJECT_REASONS`]: every series exists from process start.
-const ALL_RETRY_REASONS: [RetryReason; 2] = [RetryReason::Terminating, RetryReason::NoSlots];
+const ALL_RETRY_REASONS: [RetryReason; 3] = [
+    RetryReason::Terminating,
+    RetryReason::NoSlots,
+    RetryReason::WorkerUnreachable,
+];
 
 #[derive(Clone)]
 pub struct CoordinatorMetrics {

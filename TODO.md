@@ -370,11 +370,19 @@ disposal, what remains is the floor):
    Never block the consent manager, `www.google.com` (reCAPTCHA lives there) or a generic JS CDN.
 2. **Explain the renderers without targets** (open sub-question below).
 3. A larger memory limit, as an anaesthetic while 1 is built — **applied** to that one scope
-   downstream (2 → 2.5 GiB, 2026-09-21, request unchanged). Re-read the OOMKill rate after it.
+   downstream (2 → 2.5 GiB, 2026-09-21, request unchanged). **First reading, 2026-09-22** (12 h,
+   ~10 h after the rollout): no OOMKill or restart on that scope (before: ~3/h). Headroom is thin
+   — pods peak at ~2.2-2.4 GiB, the largest single renderer reached 720 MiB — so one heavy page on
+   a warm pod can still tip it. No evictions either (`kube_pod_status_reason{reason="Evicted"}` all
+   0), although the request is still 1.5 GiB and nodes are overcommitted by ~1 GiB per pod at peak
+   — re-check if the scope grows.
 4. Turning site isolation off in headless — only if 1 is not enough, and with a block-rate
    comparison, since it is a memory-vs-stealth trade.
 
-**Open sub-question: ~3 renderer processes per live target.** At the same instants, the scope had
+**Open sub-question: ~3 renderer processes per live target.** Unchanged with the block list in
+force (2026-09-22, 12 h: ~13.5 renderers per browser vs. ~3.8 live targets per browser —
+`page` 29, `iframe` 3, `worker` 6 across ~10 browsers), so the list did not lower the renderer
+count. At the same instants, the scope had
 ~154 renderer processes against ~55 targets that need one (`page` 23, `iframe` 24, `worker` 8) —
 ~15 renderers per pod against ~5.5 targets. Cause unknown; do not guess it. The cheap test is one
 long-lived pod: if `browser_processes{type="renderer"}` rises while the target gauges stay flat,
@@ -442,24 +450,29 @@ Candidates, all unverified:
 
 Not yet checked on Linux, over HTTPS, or through a proxy.
 
-## Shutdown does not drain in-flight requests
+## Shutdown drain and unreachable-worker retry: implemented, not verified
 
-**Status**: open, agreed, not started (raised 2026-09-15)
+**Status**: implemented 2026-09-22, not released or deployed yet. Remove this item once the checks
+below have been read
 
-- `shutdown_signal` (`worker/src/lib.rs`) cancels the token **before** waiting, so SIGTERM aborts
-  in-flight requests with `TERMINATING`. The coordinator retries those only with ≥ 10 s of
-  deadline left, from scratch.
-- During a `preStop` sleep the worker still reports itself healthy (`health_check` is
-  `is_ready && !cancelled`, and SIGTERM arrives only after preStop), so the coordinator keeps
-  routing new requests to a pod that is about to cancel them.
-- Between the gRPC server closing and the next health round, connects fail as
-  `WORKER_UNREACHABLE`, which is not retried.
+On SIGTERM the worker now drains in-flight requests (up to `WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS`)
+instead of cancelling them, and the coordinator retries a connect failure or a broken RPC once on
+another pod (GRACEFUL_SHUTDOWN.md, `worker/src/shutdown.rs`). Production nodes are GKE Spot, where a
+preemption grants 15 s whatever the pod spec says — which is why the coordinator retry is part of
+the same change. Downstream was handed the manifest side (drop the worker `preStop` sleep, set the
+drain timeout to 330, bump both the worker tag and the coordinator's `BASE_VERSION`).
 
-Proposed order on SIGTERM: report unhealthy → wait at least one coordinator health round → wait
-for in-flight requests with a bound → cancel what remains → exit. The bound must be configurable
-and fit inside `terminationGracePeriodSeconds`; `GRPC_REQUEST_TIMEOUT` is 320 s, so it cannot
-simply wait for the longest possible request. Today this costs requests on every rollout, KEDA
-scale-down and spot preemption. A separate change from the memory work.
+**To verify** (a busy scope, over a window with a rollout or KEDA scale-down):
+- startup line `Shutdown drain timeout: 330s` on every pod;
+- a stopped pod logs `Draining: …` then `All in-flight requests completed` and
+  `Worker shutdown complete`; `Drain timeout (…) reached` should be rare;
+- `requests_retried_total{reason="terminating"}` falls towards zero outside spot preemptions;
+- `requests_retried_total{reason="worker_unreachable"}` appears at preemptions and OOM kills, and
+  `requests_rejected_total{reason="worker_unreachable"}` drops against it.
+
+Known limits: a new request that reaches a draining pod is still answered TERMINATING and retried
+(cheap, nothing was started); the coordinator's health monitor polls sequentially with no
+connect/health-check timeout, so one hung pod can delay the others' health rounds (low priority).
 
 ## Context disposal must be verified in production
 

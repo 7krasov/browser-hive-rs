@@ -93,21 +93,26 @@ extra detail an operator needs is in the `reason` label, not in the enum.
 
 ### Retrying on another worker
 
-Two worker answers are worth re-sending to a different pod, and only two (`classify_retry` in
-`coordinator/src/service.rs`):
+Two worker answers and one failure to get an answer are worth re-sending to a different pod, and
+only those (`classify_retry` / `classify_unreachable_retry` in `coordinator/src/service.rs`):
 
 | Answer | Max attempts | Why |
 |---|---|---|
 | `ERROR_CODE_TERMINATING` (5006) | 3 | a rolling restart can hit several pods of a scope in turn |
 | `ERROR_CODE_CAPACITY_EXHAUSTED` (5008) | 2 (one retry) | covers the few seconds of staleness in the coordinator's slot cache, where another pod really does have room |
+| worker unreachable (connect failed, or the RPC broke) | 2 (one retry) | mostly a pod killed before its shutdown drain ended — a GKE Spot preemption grants 15 s (see GRACEFUL_SHUTDOWN.md) |
 
 Capacity deliberately gets **fewer** attempts. A 5008 answer means the scope is at its limit, and
 that is the worst moment to multiply RPCs across it — three attempts per client would turn a
 saturated scope into a self-amplifying load generator.
 
-A request carrying a `session_id` is **never** retried for capacity: the session lives in one
-context on one pod, so "somewhere else" is a different session. (TERMINATING is the exception — that
-pod is going away and the session with it.)
+An unreachable worker also gets only **one** retry: nothing reached the client, so a retry cannot
+deliver a page twice, but a worker can die *because of* the request (a page that pushes the
+container over its memory limit), and every further attempt would take down another pod.
+
+A request carrying a `session_id` is **never** retried for capacity or for an unreachable worker:
+the session lives in one context on one pod, so "somewhere else" is a different session.
+(TERMINATING is the exception — that pod is going away and the session with it.)
 
 Every retry increments `browser_hive_coordinator_requests_retried_total{scope, reason}`. Without it
 a successful retry is invisible: the client got a normal response, nothing was rejected, and the
@@ -748,8 +753,9 @@ could not be established, and the RPC broke mid-request because the pod died —
 `execution_time_ms` like every other response. They used to return `Status::internal`, which broke
 this document's own principle: the client had to parse free text and lost the tracing id with it.
 The mid-request case also recorded no rejection metric at all, so a pod dying under load looked like
-a batch of ordinary completed requests. Both now count
-`requests_rejected_total{reason="worker_unreachable"}`.
+a batch of ordinary completed requests. Both are now retried once on another pod when the request
+has no session (`requests_retried_total{reason="worker_unreachable"}`, see "Retrying on another
+worker"), and count `requests_rejected_total{reason="worker_unreachable"}` when that does not help.
 
 `INVALID_ARGUMENT` is the one status deliberately passed through from the worker: it is a defect in
 the call, and dressing it up as an infrastructure problem would have clients retrying it forever.

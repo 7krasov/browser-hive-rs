@@ -2249,8 +2249,13 @@ impl WorkerServiceTrait for WorkerService {
 
         let start_time = Instant::now();
 
-        // Check if worker is terminating - return immediately
-        if self.cancellation_token.is_cancelled() {
+        // A worker that has received SIGTERM takes no new work, even while it is still draining
+        // the requests it already has (`is_ready` drops at the signal, the token is cancelled
+        // only when the drain ends — see `shutdown.rs`). Nothing has been done yet, so the
+        // coordinator can re-send this request to another pod at no cost.
+        if self.cancellation_token.is_cancelled()
+            || !self.is_ready.load(std::sync::atomic::Ordering::SeqCst)
+        {
             let execution_time_ms = start_time.elapsed().as_millis() as u64;
             return Ok(Response::new(ScrapePageResponse {
                 success: false,

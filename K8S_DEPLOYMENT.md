@@ -23,7 +23,8 @@ spec:
         app: browser-hive-worker
         scope: your-scope-name
     spec:
-      terminationGracePeriodSeconds: 60  # Time between SIGTERM and SIGKILL
+      # Time between SIGTERM and SIGKILL: >= 3 s + WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS + margin
+      terminationGracePeriodSeconds: 360
       containers:
       - name: worker
         image: browser-hive-worker:latest
@@ -59,15 +60,15 @@ spec:
           timeoutSeconds: 5
           failureThreshold: 3
 
-        # Runs BEFORE SIGTERM: during the sleep the worker is still healthy and still
-        # routed to. Only useful for Service consumers; the coordinator stops routing on
-        # the first HealthCheck after SIGTERM. See GRACEFUL_SHUTDOWN.md.
-        lifecycle:
-          preStop:
-            exec:
-              command: ["/bin/sh", "-c", "sleep 5"]
+        # No preStop hook: the coordinator stops routing on the first HealthCheck after
+        # SIGTERM, not via Service endpoints, so a preStop sleep only delays the drain — and on a
+        # spot preemption (15 s on GKE) spends part of it. See GRACEFUL_SHUTDOWN.md.
 
         env:
+        # Let in-flight requests finish on SIGTERM, up to this bound (default 25 s).
+        # >= the longest request the scope serves; must fit terminationGracePeriodSeconds.
+        - name: WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS
+          value: "330"
         - name: WORKER_SCOPE_NAME
           value: "your-scope-name"
         - name: WORKER_GRPC_PORT
@@ -294,23 +295,23 @@ subjects:
 ### Worker Graceful Shutdown Timeline
 
 ```
-t=0s:   Pod deleted → preStop (sleep 5) starts; the worker is still healthy and routed to
+t=0s:     SIGTERM received
+          → Worker sets is_ready = false, HealthCheck reports healthy=false
+          → A request that still arrives answers TERMINATING at once (not started;
+            the coordinator re-sends it elsewhere)
+          → In-flight requests keep running
 
-t=5s:   SIGTERM received
-        → Worker sets is_ready = false, HealthCheck reports healthy=false
-        → Worker cancels all operations: in-flight requests answer TERMINATING
-          (aborted, not completed — the coordinator retries them elsewhere)
+t=0-2s:   Coordinator's health monitor (1s poll) stops routing to the pod;
+          K8s removes it from Service endpoints (cosmetic - nothing routes via the Service)
 
-t=5-7s: Coordinator's health monitor (1s poll) stops routing to the pod;
-        K8s removes it from Service endpoints (cosmetic - nothing routes via the Service)
+t=3s+:    Once nothing is in flight (and never before 3s) the gRPC server closes and the worker exits
 
-t=5s+:  Worker waits for the cancelled handlers to return, then exits
+t=drain:  WORKER_SHUTDOWN_DRAIN_TIMEOUT_SECS reached → the rest is cancelled → TERMINATING
+          → the coordinator retries it elsewhere
 
-t=60s:  SIGKILL sent (terminationGracePeriodSeconds, counted from preStop)
-        → Pod force-terminated if still running
+t=grace:  SIGKILL (terminationGracePeriodSeconds; 15s on a GKE Spot preemption)
+          → broken connections; the coordinator retries those once as WORKER_UNREACHABLE
 ```
-
-In-flight requests are **not** drained — see the open item in TODO.md.
 
 ### Coordinator Graceful Shutdown Timeline
 
@@ -341,7 +342,7 @@ The Coordinator:
 2. Runs background health cache (polls the worker's `HealthCheck` RPC every 1 second)
 3. Filters workers by health cache when selecting
 4. Falls back to all discovered workers if cache is empty
-5. Retries on healthy workers if first returns TERMINATING
+5. Retries on healthy workers if the first returns TERMINATING, or could not be reached (once)
 
 ⚠️ **The readiness probe does not affect routing.** It removes the pod from the Service's
 endpoints, but nothing in this system routes through that Service — the coordinator holds pod
@@ -351,13 +352,12 @@ visibility and for anything else that consumes the Service; do not rely on it to
 
 ## Spot Instance Configuration
 
-For AWS spot instances or preemptible nodes, reduce `terminationGracePeriodSeconds`:
-
-```yaml
-terminationGracePeriodSeconds: 60  # Spot nodes often give 30-120s notice
-```
-
-This ensures graceful shutdown completes before spot termination.
+A spot preemption does not honour `terminationGracePeriodSeconds`: GKE gives a non-system pod at
+most **15 s** (raise it on the node pool with `shutdownGracePeriodSeconds`, up to 120 s). Keep the
+drain timeout sized for rollouts and scale-downs anyway — on a preemption SIGKILL cuts the drain
+short, and the coordinator retries the requests it broke once on another worker
+(`requests_retried_total{reason="worker_unreachable"}`). A worker `preStop` sleep would spend part
+of those 15 s for nothing.
 
 ## Monitoring
 

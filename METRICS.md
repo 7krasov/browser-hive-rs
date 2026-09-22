@@ -203,14 +203,15 @@ Notes:
 ### `browser_hive_coordinator_requests_retried_total{scope, reason}`
 
 Attempts re-sent to a **different** worker (not requests — one request can be retried more than
-once). `reason` is `terminating` or `no_slots`.
+once). `reason` is `terminating`, `no_slots` or `worker_unreachable`.
 
 This counter exists because a **successful** retry is otherwise invisible: the client got a normal
 response, nothing was rejected, and the first worker's refusal is not a failure either. A scope that
 only stays healthy because half its requests are retried looks identical to a comfortable one.
 
 - `reason="no_slots"` rising is the **early warning** for capacity. `requests_rejected_total{reason="no_slots"}` is the same problem after it became visible to clients — by then requests are already being lost.
-- `reason="terminating"` rising outside a deploy window means pods are being restarted by something else (OOM kills, evictions, spot reclaims).
+- `reason="terminating"` should stay near zero now that workers drain on SIGTERM (GRACEFUL_SHUTDOWN.md): it counts requests that arrived after the signal, or outlived the drain timeout.
+- `reason="worker_unreachable"` is a pod that died with requests in flight — killed mid-drain (spot preemption), OOM-killed or crashed. Rising outside a deploy window, it is the request-side trace of OOM kills.
 
 ```promql
 # Retries as a share of traffic, per scope — watch this before rejections appear
@@ -218,7 +219,7 @@ sum by (scope) (rate(browser_hive_coordinator_requests_retried_total{reason="no_
 / clamp_min(sum by (scope) (rate(browser_hive_coordinator_requests_total[5m])), 0.0001)
 ```
 
-⚠️ Capacity gets **one** retry and TERMINATING gets up to three, on purpose: retrying hard against a
+⚠️ Capacity and an unreachable worker get **one** retry and TERMINATING gets up to three, on purpose: retrying hard against a
 scope that is already at its limit turns it into a self-amplifying load generator. See
 [ERROR_HANDLING.md](ERROR_HANDLING.md#retrying-on-another-worker).
 
