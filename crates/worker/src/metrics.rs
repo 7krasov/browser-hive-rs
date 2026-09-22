@@ -138,14 +138,16 @@ impl Metrics {
         // Enables robust concurrency sizing via Little's Law
         // (sum(rate(_sum)) = average in-flight requests, immune to scrape sampling)
         // and latency SLOs (p50/p95/p99 via histogram_quantile).
-        // Buckets are tuned for browser scraping (sub-second to ~1 minute).
+        // Buckets are tuned for browser scraping (sub-second to ~1 minute); 90..320 only show
+        // where the tail goes, up to the 320 s gRPC server timeout.
         let request_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "browser_hive_worker_request_duration_seconds",
                 "End-to-end scrape request duration in seconds",
             )
             .buckets(vec![
-                0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 60.0,
+                0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 60.0, 90.0, 120.0,
+                180.0, 320.0,
             ]),
             &["scope"],
         )?;

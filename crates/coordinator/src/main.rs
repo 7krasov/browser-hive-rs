@@ -6,7 +6,7 @@ mod worker_discovery;
 
 use anyhow::Result;
 use browser_hive_common::CoordinatorConfig;
-use service::CoordinatorService;
+use service::{CoordinatorService, GRPC_REQUEST_TIMEOUT};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,9 +15,6 @@ use tokio::signal;
 use tokio_cancellation_ext::CancellationToken;
 use tonic::transport::Server;
 use tracing::{info, warn, Instrument};
-
-// gRPC server timeout - maximum time for a single request
-const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
 
 async fn shutdown_signal(active_requests: Arc<AtomicUsize>, cancellation_token: CancellationToken) {
     let ctrl_c = async {

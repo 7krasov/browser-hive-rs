@@ -196,7 +196,8 @@ impl CoordinatorMetrics {
                 "End-to-end coordinator scrape_page duration in seconds",
             )
             .buckets(vec![
-                0.005, 0.05, 0.25, 1.0, 2.0, 5.0, 8.0, 13.0, 21.0, 34.0, 60.0,
+                0.005, 0.05, 0.25, 1.0, 2.0, 5.0, 8.0, 13.0, 21.0, 34.0, 60.0, 90.0, 120.0, 180.0,
+                320.0,
             ]),
             &["scope"],
         )?;

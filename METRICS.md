@@ -22,7 +22,7 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_available_slots` | Gauge | Free capacity: `total_slots - claimed_contexts` |
 | `browser_hive_worker_requests_total` | Counter | Total scraping requests received |
 | `browser_hive_worker_requests_failed` | Counter | Failed requests: any response with a 5xxx `error_code` (browser error, network error, context creation failed, terminating) plus gRPC-level infrastructure errors. 4xxx codes (invalid URL, session not found, session busy, selector not found, skip selector) are client-side conditions and are NOT counted. **`CAPACITY_EXHAUSTED` (5008) is the one 5xxx code that is also not counted** — a full pool is the pool working as configured under load, and counting it would make a busy scope indistinguishable from a breaking one (it would also drag `success_rate` down). That refused demand is counted on the coordinator as `requests_rejected_total{reason="no_slots"}` - see [ERROR_HANDLING.md](ERROR_HANDLING.md) |
-| `browser_hive_worker_request_duration_seconds` | Histogram | End-to-end `scrape_page` duration in seconds (observed on every return path, including early returns). Buckets: 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 60. Exposes `_bucket`, `_sum`, `_count` |
+| `browser_hive_worker_request_duration_seconds` | Histogram | End-to-end `scrape_page` duration in seconds (observed on every return path, including early returns). Buckets: 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 60, 90, 120, 180, 320 (the last four since 0.38.0, see below). Exposes `_bucket`, `_sum`, `_count` |
 | `browser_hive_worker_browser_processes{scope, type}` | Gauge | Browser processes by Chromium process type (see [Browser resources](#browser-resources)) |
 | `browser_hive_worker_browser_process_pss_bytes{scope, type}` | Gauge | Proportional set size of those processes, summed per type |
 | `browser_hive_worker_browser_process_max_pss_bytes{scope, type}` | Gauge | PSS of the largest single process of each type |
@@ -164,6 +164,17 @@ Two ways to measure `peak_busy_contexts`, with different robustness:
 The gauge and Little's Law numbers should agree; if the gauge peak is consistently lower,
 your scrape interval is too coarse to catch the true peak.
 
+**Buckets above 60 s (since 0.38.0).** Both request-duration histograms, worker and
+coordinator, used to end at 60, so every slower request fell into `+Inf` and
+`histogram_quantile` reported it as exactly 60. Dashboards read that as a 60 s cap that
+does not exist: the only hard bound is the 320 s gRPC server timeout. The buckets 90, 120,
+180 and 320 show where that tail goes. Existing queries keep working: `le="60"` and every
+lower bound are unchanged, `_sum`/`_count` are unaffected, and quantiles above 60 s become
+more precise instead of being clamped. One caveat: a range that spans the upgrade has no
+data for the new `le` series before it, so `increase(...{le="90"}[7d])` understates until
+the window is past the rollout. To count the tail with no dependency on the new buckets,
+use `_bucket{le="+Inf"} − _bucket{le="60"}`.
+
 ## Coordinator Metrics
 
 The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (implementation: `crates/coordinator/src/metrics.rs`). Controlled by `COORDINATOR_ENABLE_METRICS` (default `true`) and `COORDINATOR_METRICS_PORT` (default `9090`).
@@ -174,7 +185,7 @@ The coordinator exposes Prometheus metrics on port `9090` at `/metrics` too (imp
 |--------|------|--------|-------------|
 | `browser_hive_coordinator_requests_total` | Counter | `scope` | Scrape requests received, counted on completion (including futures dropped mid-request) |
 | `browser_hive_coordinator_requests_rejected_total` | Counter | `scope`, `reason` | Requests refused **without reaching a worker**. See the reason table below |
-| `browser_hive_coordinator_request_duration_seconds` | Histogram | `scope` | End-to-end coordinator duration: worker time plus routing, retries and the fresh-stats round trip. Buckets: 0.005 … 60 |
+| `browser_hive_coordinator_request_duration_seconds` | Histogram | `scope` | End-to-end coordinator duration: worker time plus routing, retries and the fresh-stats round trip. Buckets: 0.005 … 60, 90, 120, 180, 320 (the last four since 0.38.0, see below) |
 | `browser_hive_coordinator_scope_workers_total` | Gauge | `scope` | Worker pods discovered per scope, as the coordinator sees them |
 | `browser_hive_coordinator_scope_workers_healthy` | Gauge | `scope` | Of those, the pods that passed the last health check |
 | `browser_hive_coordinator_scope_available_slots` | Gauge | `scope` | Free slots per scope **as routing sees them**: the discovery cache corrected by the requests this coordinator has dispatched since (`coordinator/src/in_flight.rs`) |

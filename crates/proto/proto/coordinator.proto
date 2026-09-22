@@ -40,7 +40,7 @@ enum ErrorCode {
 message ScrapePageRequest {
   string scope_name = 1;
   string url = 2; //url for content to download
-  uint32 timeout_seconds = 3; //a timeout how to wait for the request
+  uint32 timeout_seconds = 3; //a timeout how to wait for the request; 0 = unset, server bound (320 s) applies
 
   // Session support - if specified, will use specified worker+context
   string session_id = 4;

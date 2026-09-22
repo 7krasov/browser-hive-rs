@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn, Instrument};
 
@@ -40,11 +41,55 @@ impl WorkerDiscoveryImpl {
     }
 }
 
+// gRPC server timeout - maximum time for a single request
+pub(crate) const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
+
+/// The client's time budget for a request.
+///
+/// `timeout_seconds` is a proto3 `uint32`, so a client that never sets it sends 0. Taken
+/// literally that is a deadline equal to the arrival time, which fails the retry guard on every
+/// attempt and silently disables all retries for that client. 0 therefore means "not set", and
+/// the server's own hard bound applies.
+fn client_budget(timeout_seconds: u32) -> Duration {
+    if timeout_seconds == 0 {
+        GRPC_REQUEST_TIMEOUT
+    } else {
+        Duration::from_secs(timeout_seconds as u64)
+    }
+}
+
 // gRPC client timeout when calling workers
 const GRPC_CLIENT_TIMEOUT: Duration = Duration::from_secs(330); // 10 seconds more than server timeout
 
 // Timeout for fetching fresh stats from worker (used to avoid stale cache rejections)
 const FRESH_STATS_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Bound on establishing a connection to a worker.
+//
+// Without it `connect` waits for the kernel's SYN retries (~127 s on Linux) when the pod IP
+// is black-holed — a node that vanished without sending RST — instead of failing fast into
+// the worker-unreachable retry.
+const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// HTTP/2 keepalive on connections to workers: a ping every interval, and the connection is
+// considered dead when a ping is not acknowledged within the timeout. This breaks an RPC whose
+// peer disappeared without FIN/RST (~20 s instead of the full request deadline), so the
+// worker-unreachable retry can take over. Deliberately not tighter: a CPU-starved worker
+// (Chrome busy under a 1.5 CPU limit) may answer pings late, and a false positive would
+// re-run a healthy page on another pod.
+const WORKER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const WORKER_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connect to a worker with a bounded connect time and HTTP/2 keepalive.
+async fn connect_worker(endpoint: &str) -> Result<WorkerServiceClient<Channel>> {
+    let channel = Endpoint::from_shared(endpoint.to_string())?
+        .connect_timeout(WORKER_CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(WORKER_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(WORKER_KEEPALIVE_TIMEOUT)
+        .connect()
+        .await?;
+    Ok(WorkerServiceClient::new(channel))
+}
 
 // Maximum size of a worker response the coordinator will decode.
 //
@@ -476,7 +521,7 @@ impl CoordinatorService {
                                 let worker_id = worker.pod_name.clone();
 
                                 // Try to connect and check health
-                                match WorkerServiceClient::connect(endpoint.clone()).await {
+                                match connect_worker(&endpoint).await {
                                     Ok(mut client) => {
                                         match client.health_check(Request::new(())).await {
                                             Ok(response) => {
@@ -826,7 +871,7 @@ impl ScraperCoordinator for CoordinatorService {
         tracing::Span::current().record("worker_id", worker_id.as_str());
 
         // Calculate request deadline
-        let request_deadline = start_time + Duration::from_secs(req.timeout_seconds as u64);
+        let request_deadline = start_time + client_budget(req.timeout_seconds);
         let min_retry_time_remaining = Duration::from_secs(10);
 
         let mut excluded_workers = HashSet::new();
@@ -852,7 +897,7 @@ impl ScraperCoordinator for CoordinatorService {
             // errors, not infrastructure ones from the client's point of view: the client gets a
             // parseable response carrying `ray_id` and `execution_time_ms` like every other error
             // (built after the loop), after one retry on another pod where that is safe.
-            let outcome = match WorkerServiceClient::connect(last_worker_endpoint.clone()).await {
+            let outcome = match connect_worker(&last_worker_endpoint).await {
                 Err(e) => {
                     warn!("Failed to connect to worker {}: {}", last_worker_id, e);
                     AttemptOutcome::Unreachable(format!(
@@ -1152,6 +1197,14 @@ impl ScraperCoordinator for CoordinatorService {
 mod tests {
     use super::*;
     use browser_hive_common::WorkerStats;
+
+    /// An unset `timeout_seconds` (proto3 default 0) must not read as an expired deadline, or the
+    /// retry guard would refuse every retry for a client that never sets the field.
+    #[test]
+    fn unset_timeout_uses_server_bound() {
+        assert_eq!(client_budget(0), GRPC_REQUEST_TIMEOUT);
+        assert_eq!(client_budget(45), Duration::from_secs(45));
+    }
 
     /// Only two worker answers earn a second pod. Everything else would be answered identically
     /// anywhere in the scope, so retrying spends the client's deadline for nothing.

@@ -757,6 +757,19 @@ a batch of ordinary completed requests. Both are now retried once on another pod
 has no session (`requests_retried_total{reason="worker_unreachable"}`, see "Retrying on another
 worker"), and count `requests_rejected_total{reason="worker_unreachable"}` when that does not help.
 
+**How fast "unreachable" is detected** (`connect_worker`, `coordinator/src/service.rs`). A pod
+killed by kubelet closes its sockets, so the stream fails at once. A node that disappears without
+a clean shutdown (a spot VM stopped before kubelet finishes, a kernel panic, a partition) sends no
+FIN/RST, and until 0.38.0 neither case was bounded. A new connection waited for the kernel's SYN
+retries, ~127 s on Linux, and an RPC that was already running hung until its deadline, which left
+too little time for the retry. Two bounds now cover this: a **5 s connect timeout**, and **HTTP/2
+keepalive** (a ping every 10 s, and the connection is dead when a ping is not acknowledged within
+10 s). A lost peer is therefore noticed in ~20 s, while the ≥10 s deadline guard can still allow
+the retry. The keepalive is deliberately not tighter: a worker short on CPU (Chrome under a 1.5
+CPU limit) may acknowledge pings late, and a false positive would re-run a healthy page on another
+pod. These bounds apply to the request path and the health monitor. Discovery and the fresh-stats
+probe already had their own timeouts.
+
 `INVALID_ARGUMENT` is the one status deliberately passed through from the worker: it is a defect in
 the call, and dressing it up as an infrastructure problem would have clients retrying it forever.
 
@@ -825,10 +838,10 @@ You'll get a full response with `TIMEOUT_BROWSER`, but no response with `DEADLIN
 **Q: When should I increase `timeout_seconds` vs `wait_timeout_ms`?**
 
 A:
-- `timeout_seconds`: Overall request timeout (use for very slow sites)
+- `timeout_seconds`: the client's time budget. The coordinator does **not** enforce it as a deadline. It uses it only to decide whether a retry on another pod still fits: at least 10 s of it must remain. `0` (the proto3 default when the field is not set) means "not set", and the coordinator's 320 s server bound applies instead. Before 0.38.0 an unset value read as an already-expired deadline and silently disabled every retry. Set it to the timeout your gRPC client actually uses, so the coordinator never starts a retry you will not wait for.
 - `wait_timeout_ms`: Wait strategy timeout (use when `network_idle` takes too long)
 
-If you get `TIMEOUT_BROWSER`, increase `wait_timeout_ms`. If gRPC times out, increase `timeout_seconds`.
+If you get `TIMEOUT_BROWSER`, increase `wait_timeout_ms`. If the call itself times out, that is your gRPC client's deadline (or the coordinator's 320 s bound); raise the client's deadline, and `timeout_seconds` with it.
 
 ---
 
