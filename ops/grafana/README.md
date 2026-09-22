@@ -127,8 +127,10 @@ resources" section of METRICS.md.
   patterns: iframes, loads that went out, and loads the list blocked. Each comes by host (summed
   over sites) and by site and host. A host still high in the loads table is not matched by any
   pattern; a row with `page_site="other"` means a worker reached its cap on label combinations.
-  Loads inside a cross-site iframe are not counted, and the list does not block iframes. See the
-  "Third-party hosts and iframes" section of METRICS.md.
+  Loads inside a cross-site iframe are not counted, and the list does not block iframes. The last
+  two panels show loads dropped by resource type (`WORKER_BLOCKED_RESOURCE_TYPES`), over time and
+  by site; they stay empty on a scope that blocks no type. See the "Third-party hosts and iframes"
+  section of METRICS.md.
 
 Gaps mean a source could not be read: a worker version without these gauges, a non-Linux
 host (process gauges), or a target probe that failed or ran past its 3 s budget.

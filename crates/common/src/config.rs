@@ -252,6 +252,14 @@ impl std::fmt::Debug for ScopeConfig {
 }
 
 impl ScopeConfig {
+    /// Resource types dropped by this scope's tab-init middlewares, in configuration order.
+    pub fn blocked_resource_types(&self) -> Vec<crate::browser_middleware::BlockedResourceType> {
+        self.tab_init_middlewares
+            .iter()
+            .flat_map(|m| m.blocked_resource_types().iter().cloned())
+            .collect()
+    }
+
     /// Check the configuration for combinations that cannot do what they say.
     ///
     /// Called fail-fast at worker startup, in the same spirit as the "a worker never starts

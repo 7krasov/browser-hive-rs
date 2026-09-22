@@ -84,7 +84,8 @@ Which foreign hosts the scraped pages load, ranked, to choose what `BlockedUrlsM
 |---|---|---|---|
 | `iframes_total` | a background sampler calls `Target.getTargets` every second over its own browser-level CDP connection | every cross-site frame, nested ones included | frames that live under a second (a frame lives only while its page is loaded); same-site frames |
 | `third_party_requests_total` | the page session's `Network` events (the response observer's listener): `requestWillBeSent`, then `loadingFinished` or a `loadingFailed` not caused by the list | the main page and frames running in its process | everything inside a cross-site iframe; `Document` loads (the page itself, and frame documents, which `iframes_total` counts); loads still pending when the request ends |
-| `third_party_requests_blocked_total` | same listener, `loadingFailed` with `blockedReason: inspector` | loads dropped by the list, any host, same-site included | same as above |
+| `third_party_requests_blocked_total` | same listener, `loadingFailed` with `blockedReason: inspector` | loads dropped by the list **or** by a blocked resource type, any host, same-site included | same as above |
+| `requests_blocked_by_type_total{page_site, resource_type}` | same listener: a blocked load whose type is in the scope's `BlockedResourceTypesMiddleware` list | loads dropped by type, per site | same as above. A load matched by both the URL list and a blocked type is attributed to the type — Chrome reports both kinds of block identically (`blockedReason: inspector`) |
 
 **Labels.**
 - **Hosts are full hosts**, not registrable domains: a block pattern is often written for one subdomain.
@@ -94,7 +95,7 @@ Which foreign hosts the scraped pages load, ranked, to choose what `BlockedUrlsM
 - **A frame is keyed by target id and host**, so a frame that navigates to another host is counted again.
 
 **Cardinality.** Client input feeds both `page_site` and the hosts, so the `(page_site, host)` combinations are capped **per metric, per worker process** by `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` (default 2000). Past the cap a combination is counted as `page_site="other"`, host `"other"`: the total stays correct and only the breakdown is lost. Nothing is evicted, since a counter that disappears and comes back breaks `increase()`.
-- ⚠️ **Worst case is `3 × cap × pods` series**, and every rollout creates the set again under new pod names. A container restart (an OOMKill included) keeps the pod name and adds no series. Series that only exist in the worst case are never created: the real number is the combinations actually seen.
+- ⚠️ **Worst case is `4 × cap × pods` series** (for `requests_blocked_by_type_total` the host is replaced by `resource_type`, so its real ceiling is `sites × configured types`, far below the cap), and every rollout creates the set again under new pod names. A container restart (an OOMKill included) keeps the pod name and adds no series. Series that only exist in the worst case are never created: the real number is the combinations actually seen.
 - **To see what these metrics actually cost**, use Prometheus' **Status → TSDB Status** page: it breaks head series down by metric and label. `prometheus_tsdb_head_series` is only a total and cannot attribute growth.
 - **An `other` row in the dashboard tables** means a worker reached the cap. Nothing is logged.
 - Keeping `page_site` over dropping it was a deliberate choice for 300–800 scraped sites, accepting this cost (2026-09-15). Watch `prometheus_tsdb_head_series` after a deploy.
@@ -107,6 +108,9 @@ topk(50, sum by (request_host) (increase(browser_hive_worker_third_party_request
 
 # Iframe hosts, same idea (the block list cannot reach these yet)
 topk(50, sum by (iframe_host) (increase(browser_hive_worker_iframes_total{scope="<scope>"}[1d])))
+
+# Is type blocking in force, and what it cuts (only types listed in WORKER_BLOCKED_RESOURCE_TYPES appear)
+sum by (resource_type) (increase(browser_hive_worker_requests_blocked_by_type_total{scope="<scope>"}[1d]))
 
 # How many sites load a host: a host used by one site is cheaper to reason about
 count by (request_host) (sum by (page_site, request_host) (increase(browser_hive_worker_third_party_requests_total{scope="<scope>"}[1d])) > 0)

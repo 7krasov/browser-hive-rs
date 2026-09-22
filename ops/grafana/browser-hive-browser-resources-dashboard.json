@@ -935,7 +935,7 @@
     {
       "type": "table",
       "title": "Blocked loads by host (top 100)",
-      "description": "Loads dropped by the scope's blocked-URL list, any host, over the dashboard range. A host absent here that is still in Third-party loads is not matched by any pattern. Summed over every site. A row with page_site=\"other\" means a worker reached its cap on label combinations (WORKER_THIRD_PARTY_METRICS_MAX_SERIES). increase() misses the first increments of a series that appeared inside the range, so rare hosts are undercounted.",
+      "description": "Loads dropped by the scope's blocked-URL list or blocked resource types (WORKER_BLOCKED_RESOURCE_TYPES), any host, over the dashboard range. A host absent here that is still in Third-party loads is not matched by any pattern. Summed over every site. A row with page_site=\"other\" means a worker reached its cap on label combinations (WORKER_THIRD_PARTY_METRICS_MAX_SERIES). increase() misses the first increments of a series that appeared inside the range, so rare hosts are undercounted.",
       "gridPos": {
         "h": 12,
         "w": 8,
@@ -1088,7 +1088,7 @@
     {
       "type": "table",
       "title": "Blocked loads by site and host (top 100)",
-      "description": "Loads dropped by the scope's blocked-URL list, any host, over the dashboard range. A host absent here that is still in Third-party loads is not matched by any pattern. page_site is the host the client requested, even after a redirect; unknown for an iframe whose context served no known site. A row with page_site=\"other\" means a worker reached its cap on label combinations (WORKER_THIRD_PARTY_METRICS_MAX_SERIES). increase() misses the first increments of a series that appeared inside the range, so rare hosts are undercounted.",
+      "description": "Loads dropped by the scope's blocked-URL list or blocked resource types (WORKER_BLOCKED_RESOURCE_TYPES), any host, over the dashboard range. A host absent here that is still in Third-party loads is not matched by any pattern. page_site is the host the client requested, even after a redirect; unknown for an iframe whose context served no known site. A row with page_site=\"other\" means a worker reached its cap on label combinations (WORKER_THIRD_PARTY_METRICS_MAX_SERIES). increase() misses the first increments of a series that appeared inside the range, so rare hosts are undercounted.",
       "gridPos": {
         "h": 12,
         "w": 8,
@@ -1117,6 +1117,110 @@
           "refId": "A",
           "datasource": "${datasource}",
           "expr": "topk(100, sum by (page_site, request_host) (increase(browser_hive_worker_third_party_requests_blocked_total{scope=~\"$scope\", pod=~\"$pod\"}[$__range])))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "Blocked"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Blocked loads by resource type",
+      "description": "Loads dropped by BlockedResourceTypesMiddleware (WORKER_BLOCKED_RESOURCE_TYPES), per interval, stacked. Empty when the scope blocks no type. A load matched by both the URL list and a blocked type counts here, since Chrome reports both kinds of block identically. HLS/DASH video (segments are xhr/fetch) and anything inside a cross-site iframe are never blocked by type, so they never appear.",
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 0,
+        "y": 94
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (resource_type) (increase(browser_hive_worker_requests_blocked_by_type_total{scope=~\"$scope\", pod=~\"$pod\"}[$__interval]))",
+          "legendFormat": "{{resource_type}}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Blocked loads by site and resource type (top 100)",
+      "description": "Loads dropped by BlockedResourceTypesMiddleware per site, over the dashboard range: which sites a type block actually touches. Check here first when a site starts failing after a type was enabled. page_site is the host the client requested, even after a redirect. A row with page_site=\"other\" means a worker reached its cap on label combinations (WORKER_THIRD_PARTY_METRICS_MAX_SERIES). increase() misses the first increments of a series that appeared inside the range.",
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 12,
+        "y": 94
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Blocked",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "topk(100, sum by (page_site, resource_type) (increase(browser_hive_worker_requests_blocked_by_type_total{scope=~\"$scope\", pod=~\"$pod\"}[$__range])))",
           "format": "table",
           "instant": true,
           "range": false

@@ -21,7 +21,8 @@
 //! Events are only ever appended to a bounded in-memory buffer — nothing is logged per event.
 //! One request produces at most a handful of log lines, written once at the end.
 //!
-//! Loads dropped by the scope's own blocked-URL list (`BlockedUrlsMiddleware`) are **not** signals
+//! Loads dropped by the scope's own blocked-URL list (`BlockedUrlsMiddleware`) or blocked resource
+//! types (`BlockedResourceTypesMiddleware`, which Chrome reports identically) are **not** signals
 //! and are filtered out of both channels that report them — `Network.loadingFailed` with
 //! `blockedReason: inspector`, and the `ERR_BLOCKED_BY_CLIENT` console entries that accompany
 //! them. They are expected, there can be dozens per page, and they would fill the entry cap with
@@ -444,7 +445,8 @@ pub async fn start_capture(
 
                 Event::NetworkLoadingFailed(ev) => {
                     // Loads we dropped ourselves via `Network.setBlockedURLs`
-                    // (`BlockedUrlsMiddleware`) are not diagnostics. They arrive with
+                    // (`BlockedUrlsMiddleware`) or `Fetch.failRequest`
+                    // (`BlockedResourceTypesMiddleware`) are not diagnostics. They arrive with
                     // `blockedReason: inspector`, there can be dozens per page, and they would
                     // fill `max_entries` and push out the failures that explain a bad page. The
                     // per-request count lives on the `scrape_page` span instead.

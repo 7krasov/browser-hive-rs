@@ -406,6 +406,9 @@ pub struct WorkerService {
     /// that, and it is precise rather than heuristic: whoever replaced the pool, a pool replaced
     /// during the request means *this* request's context is stale too.
     pool_generation: Arc<AtomicU64>,
+    /// Resource types the scope's middlewares drop, read once from the config: a blocked load of
+    /// one of these types is counted on `requests_blocked_by_type_total`.
+    blocked_resource_types: Arc<[browser_hive_common::BlockedResourceType]>,
 }
 
 impl WorkerService {
@@ -428,6 +431,8 @@ impl WorkerService {
             config.scope.diagnostics.max_per_minute,
         ));
 
+        let blocked_resource_types = config.scope.blocked_resource_types().into();
+
         Ok(Self {
             browser_pool: Arc::new(RwLock::new(browser_pool)),
             config,
@@ -440,6 +445,7 @@ impl WorkerService {
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             diagnostics_limiter,
             pool_generation: Arc::new(AtomicU64::new(0)),
+            blocked_resource_types,
         })
     }
 
@@ -1446,6 +1452,7 @@ impl WorkerService {
                     let proxy_holder = proxy_failure_holder.clone();
                     let blocked_counter = blocked_url_counter.clone();
                     let loads = third_party_loads.clone();
+                    let blocked_types = self.blocked_resource_types.clone();
                     let listener: Arc<
                         dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync,
                     > = Arc::new(move |event: &Event| {
@@ -1470,8 +1477,9 @@ impl WorkerService {
                                     ev.params.Type, ev.params.error_text
                                 ));
                             }
-                            // `inspector` is the reason CDP reports for a load dropped by
-                            // `Network.setBlockedURLs` — i.e. by our own list, never by the site.
+                            // `inspector` is the reason CDP reports for a load we dropped
+                            // ourselves — by `Network.setBlockedURLs` or by `Fetch.failRequest`
+                            // (`BlockedResourceTypesMiddleware`) — never for one the site dropped.
                             let blocked_by_list = matches!(
                                 ev.params.blocked_reason,
                                 Some(Network::BlockedReason::Inspector)
@@ -1479,7 +1487,19 @@ impl WorkerService {
                             if blocked_by_list {
                                 blocked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
+                            // Both kinds of block look the same, so a load of a blocked type is
+                            // attributed to the type even if the URL list matched it as well.
+                            let blocked_type = blocked_by_list
+                                .then(|| {
+                                    blocked_types
+                                        .iter()
+                                        .find(|t| t.resource_type == ev.params.Type)
+                                })
+                                .flatten();
                             if let Ok(mut loads) = loads.lock() {
+                                if let Some(t) = blocked_type {
+                                    loads.blocked_by_type(t.label);
+                                }
                                 loads.failed(&ev.params.request_id, blocked_by_list);
                             }
                         }

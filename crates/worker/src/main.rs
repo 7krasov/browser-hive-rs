@@ -168,10 +168,11 @@ fn load_config_from_env(
 
     // Create default tab init middlewares
     // Users can add custom middleware here (timezone override, WebGL spoofing, etc.)
-    let tab_init_middlewares: Vec<Box<dyn browser_hive_common::TabInitMiddleware>> =
-        vec![Box::new(
-            browser_hive_common::DefaultTabInitMiddleware::new(headless),
-        )];
+    // `WORKER_BLOCKED_RESOURCE_TYPES` (e.g. `media`) drops loads by type; unset blocks nothing.
+    let tab_init_middlewares: Vec<Box<dyn browser_hive_common::TabInitMiddleware>> = vec![
+        Box::new(browser_hive_common::DefaultTabInitMiddleware::new(headless)),
+        Box::new(browser_hive_common::BlockedResourceTypesMiddleware::from_env()),
+    ];
 
     let scope_config = ScopeConfig {
         name: scope_name,

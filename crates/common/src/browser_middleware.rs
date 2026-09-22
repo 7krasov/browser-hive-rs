@@ -1,4 +1,5 @@
 use anyhow::Result;
+use headless_chrome::protocol::cdp::Network::ResourceType;
 use std::ffi::OsStr;
 use std::fmt::Debug;
 
@@ -136,6 +137,13 @@ pub trait TabInitMiddleware: Debug + Send + Sync {
     /// Required for trait objects to be cloneable.
     /// Standard implementation: `Box::new(self.clone())`
     fn clone_box(&self) -> Box<dyn TabInitMiddleware>;
+
+    /// Resource types this middleware drops, so the worker can attribute the blocked loads it
+    /// observes to them (`browser_hive_worker_requests_blocked_by_type_total`). Only
+    /// [`BlockedResourceTypesMiddleware`] overrides it.
+    fn blocked_resource_types(&self) -> &[BlockedResourceType] {
+        &[]
+    }
 }
 
 /// Make Box<dyn TabInitMiddleware> cloneable
@@ -512,6 +520,198 @@ impl TabInitMiddleware for BlockedUrlsMiddleware {
     }
 }
 
+/// Environment variable read by [`BlockedResourceTypesMiddleware::from_env`]: a comma-separated
+/// list of CDP resource type names, case-insensitive (`media`, `media,font`).
+pub const BLOCKED_RESOURCE_TYPES_ENV: &str = "WORKER_BLOCKED_RESOURCE_TYPES";
+
+/// How a resource type behaves when blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeSupport {
+    /// Nothing on a page depends on it for content.
+    Safe,
+    /// Accepted, but blocking it can break pages or trip anti-bot checks. Allowed — the choice is
+    /// the deployment's — and warned about at startup.
+    Risky,
+    /// Chrome's `Fetch.enable` rejects it (`Unknown resource type in fetch filter`), and one such
+    /// type fails the whole call, i.e. disables every other type too. Dropped at startup.
+    Unsupported,
+}
+
+/// Every `Network.ResourceType`, by its lowercase CDP name.
+///
+/// `Unsupported` was measured against Chrome (2026-09-22), not taken from the protocol docs.
+/// `prefetch` is also useless as a type: a `<link rel=prefetch>` load arrives in
+/// `Fetch.requestPaused` as `Fetch`.
+const RESOURCE_TYPES: &[(&str, ResourceType, TypeSupport)] = {
+    use ResourceType as R;
+    use TypeSupport::*;
+    &[
+        ("document", R::Document, Risky),
+        ("stylesheet", R::Stylesheet, Risky),
+        ("image", R::Image, Risky),
+        ("media", R::Media, Safe),
+        ("font", R::Font, Safe),
+        ("script", R::Script, Risky),
+        ("texttrack", R::TextTrack, Unsupported),
+        ("xhr", R::Xhr, Risky),
+        ("fetch", R::Fetch, Risky),
+        ("prefetch", R::Prefetch, Unsupported),
+        ("eventsource", R::EventSource, Risky),
+        ("websocket", R::WebSocket, Unsupported),
+        ("manifest", R::Manifest, Unsupported),
+        ("signedexchange", R::SignedExchange, Unsupported),
+        ("ping", R::Ping, Risky),
+        ("cspviolationreport", R::CspViolationReport, Safe),
+        ("preflight", R::Preflight, Unsupported),
+        ("fedcm", R::FedCm, Unsupported),
+        ("other", R::Other, Risky),
+    ]
+};
+
+/// One resource type blocked by [`BlockedResourceTypesMiddleware`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockedResourceType {
+    pub resource_type: ResourceType,
+    /// Lowercase CDP name, used as the metric label.
+    pub label: &'static str,
+}
+
+/// Drops every load of the configured resource types (`<video>`/`<audio>` for `media`) before it
+/// leaves the browser.
+///
+/// # Why Fetch and not `Network.setBlockedURLs`
+///
+/// `setBlockedURLs` matches URLs only; the resource type is known to Fetch interception. The
+/// middleware installs a request interceptor on the tab and enables `Fetch` with one pattern per
+/// type, so only loads of those types are paused. When the proxy has credentials the worker
+/// re-enables `Fetch` with no patterns before each request (to answer the auth challenge), which
+/// pauses every load — the interceptor still decides, so blocking keeps working, and that pausing
+/// happened before this middleware existed.
+///
+/// A blocked load is reported by Chrome exactly like one dropped by [`BlockedUrlsMiddleware`]
+/// (`blockedReason: inspector`, `net::ERR_BLOCKED_BY_CLIENT.Inspector`), so it is counted in
+/// `blocked_requests` and the third-party blocked metric, and kept out of diagnostics, with no
+/// extra code.
+///
+/// # Limits
+///
+/// - **Streaming video is not caught**: HLS/DASH players fetch segments as `XHR`/`Fetch`.
+/// - **Cross-site iframes are not reached**, the same limit as [`BlockedUrlsMiddleware`] — an
+///   embedded player runs in its own renderer.
+/// - **A tab has one request interceptor.** Another middleware calling
+///   `enable_request_interception` replaces this one's, silently.
+///
+/// # Configuration
+///
+/// Types are given by CDP name, case-insensitive. Unknown names and types Chrome's Fetch filter
+/// rejects are dropped with a WARN; types that can break pages (`image`, `script`, `stylesheet`,
+/// `document`, `xhr`, `fetch`, …) are **kept** with a WARN. An empty list makes it a no-op.
+#[derive(Debug, Clone)]
+pub struct BlockedResourceTypesMiddleware {
+    types: Vec<BlockedResourceType>,
+}
+
+impl BlockedResourceTypesMiddleware {
+    /// Build the middleware from resource type names. Problems are logged here, at worker startup.
+    pub fn new(names: Vec<String>) -> Self {
+        let mut types: Vec<BlockedResourceType> = Vec::new();
+        for name in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+            let lowercase = name.to_ascii_lowercase();
+            let Some((label, resource_type, support)) =
+                RESOURCE_TYPES.iter().find(|(l, _, _)| *l == lowercase)
+            else {
+                tracing::warn!("Blocked resource type '{}' is unknown and is ignored", name);
+                continue;
+            };
+            match support {
+                TypeSupport::Unsupported => {
+                    tracing::warn!(
+                        "Blocked resource type '{}' is not accepted by Chrome's Fetch filter and \
+                         is ignored",
+                        name
+                    );
+                    continue;
+                }
+                TypeSupport::Risky => tracing::warn!(
+                    "Blocked resource type '{}' can break pages or trip anti-bot checks",
+                    name
+                ),
+                TypeSupport::Safe => {}
+            }
+            if types.iter().all(|t| t.label != *label) {
+                types.push(BlockedResourceType {
+                    resource_type: resource_type.clone(),
+                    label,
+                });
+            }
+        }
+        Self { types }
+    }
+
+    /// Build from [`BLOCKED_RESOURCE_TYPES_ENV`]; unset or empty blocks nothing.
+    pub fn from_env() -> Self {
+        let raw = std::env::var(BLOCKED_RESOURCE_TYPES_ENV).unwrap_or_default();
+        Self::new(raw.split(',').map(str::to_string).collect())
+    }
+}
+
+impl TabInitMiddleware for BlockedResourceTypesMiddleware {
+    fn apply(&self, tab: &headless_chrome::browser::tab::Tab) -> Result<()> {
+        if self.types.is_empty() {
+            return Ok(());
+        }
+
+        use headless_chrome::browser::tab::RequestPausedDecision;
+        use headless_chrome::protocol::cdp::Fetch;
+        use headless_chrome::protocol::cdp::Network::ErrorReason;
+
+        // The interceptor must be in place before Fetch starts pausing loads.
+        let blocked: Vec<ResourceType> =
+            self.types.iter().map(|t| t.resource_type.clone()).collect();
+        tab.enable_request_interception(std::sync::Arc::new(
+            move |_transport, _session_id, event: Fetch::events::RequestPausedEvent| {
+                if blocked.contains(&event.params.resource_Type) {
+                    RequestPausedDecision::Fail(Fetch::FailRequest {
+                        request_id: event.params.request_id,
+                        error_reason: ErrorReason::BlockedByClient,
+                    })
+                } else {
+                    RequestPausedDecision::Continue(None)
+                }
+            },
+        ))?;
+
+        let patterns: Vec<Fetch::RequestPattern> = self
+            .types
+            .iter()
+            .map(|t| Fetch::RequestPattern {
+                url_pattern: None,
+                resource_Type: Some(t.resource_type.clone()),
+                request_stage: None,
+            })
+            .collect();
+        tab.enable_fetch(Some(&patterns), None)?;
+
+        tracing::debug!(
+            "Installed blocked resource types on tab: {:?}",
+            self.types.iter().map(|t| t.label).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "blocked_resource_types"
+    }
+
+    fn clone_box(&self) -> Box<dyn TabInitMiddleware> {
+        Box::new(self.clone())
+    }
+
+    fn blocked_resource_types(&self) -> &[BlockedResourceType] {
+        &self.types
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +734,44 @@ mod tests {
     #[test]
     fn empty_list_is_accepted() {
         assert!(BlockedUrlsMiddleware::new(Vec::new()).patterns().is_empty());
+    }
+
+    fn labels(names: &[&str]) -> Vec<&'static str> {
+        BlockedResourceTypesMiddleware::new(names.iter().map(|n| n.to_string()).collect())
+            .blocked_resource_types()
+            .iter()
+            .map(|t| t.label)
+            .collect()
+    }
+
+    /// Unknown names and types Chrome's Fetch filter rejects are dropped: passing one to
+    /// `Fetch.enable` would fail the call and disable every other type with it. Risky types are
+    /// the deployment's choice and stay. Names are case-insensitive, blanks and repeats collapse.
+    #[test]
+    fn resource_types_are_filtered_and_normalised() {
+        assert_eq!(
+            labels(&[
+                " Media",
+                "FONT",
+                "",
+                "media",
+                "video",
+                "prefetch",
+                "textTrack",
+                "image"
+            ]),
+            vec!["media", "font", "image"]
+        );
+        assert!(labels(&[]).is_empty());
+    }
+
+    /// Every entry of the table carries the enum value its name stands for, so the label on the
+    /// metric and the type sent to CDP cannot drift apart.
+    #[test]
+    fn resource_type_table_matches_cdp_names() {
+        for (label, resource_type, _) in RESOURCE_TYPES {
+            let cdp_name = serde_json::to_value(resource_type).unwrap();
+            assert_eq!(cdp_name.as_str().unwrap().to_ascii_lowercase(), *label);
+        }
     }
 }

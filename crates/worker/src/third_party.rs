@@ -5,6 +5,11 @@
 //! - `browser_hive_worker_third_party_requests_total` — cross-site sub-resource loads.
 //! - `browser_hive_worker_third_party_requests_blocked_total` — loads dropped by the block list.
 //!
+//! A fourth, `browser_hive_worker_requests_blocked_by_type_total`, shares the cap and the
+//! `page_site` label but carries `resource_type` instead of a host: loads dropped by
+//! `BlockedResourceTypesMiddleware`. Those are in the host-level blocked counter as well, since
+//! Chrome reports both kinds of block identically.
+//!
 //! **Two sources, because neither sees everything.** With site isolation on, a cross-site iframe
 //! runs in its own renderer: the page's CDP session neither reports nor blocks what happens inside
 //! it, and never blocks the frame's own document. The frame itself is a target, though, and so is
@@ -38,7 +43,7 @@ use tracing::{debug, warn};
 /// Environment variable with the cap on label combinations, per metric, per worker process.
 pub const MAX_SERIES_ENV: &str = "WORKER_THIRD_PARTY_METRICS_MAX_SERIES";
 
-/// Worst case across the fleet is `3 × cap × pods` series, recreated with new pod names on every
+/// Worst case across the fleet is `4 × cap × pods` series, recreated with new pod names on every
 /// rollout. A container restart keeps its pod name, so an OOMKill mints no new series.
 pub const DEFAULT_MAX_SERIES: usize = 2000;
 
@@ -147,6 +152,7 @@ pub struct ThirdPartyMetrics {
     iframes: CappedCounter,
     requests: CappedCounter,
     blocked: CappedCounter,
+    blocked_by_type: CappedCounter,
 }
 
 impl ThirdPartyMetrics {
@@ -172,6 +178,13 @@ impl ThirdPartyMetrics {
                 "browser_hive_worker_third_party_requests_blocked_total",
                 "Loads of scraped pages dropped by the scope's blocked-URL list",
                 "request_host",
+                max_series,
+            )?,
+            blocked_by_type: CappedCounter::register(
+                registry,
+                "browser_hive_worker_requests_blocked_by_type_total",
+                "Loads of scraped pages dropped by the scope's blocked resource types",
+                "resource_type",
                 max_series,
             )?,
         })
@@ -238,6 +251,14 @@ impl RequestLoads {
         } else {
             self.count_sent(&load);
         }
+    }
+
+    /// A load dropped by `BlockedResourceTypesMiddleware`, by the type's metric label.
+    pub fn blocked_by_type(&self, resource_type: &str) {
+        let metrics = &self.metrics;
+        metrics
+            .blocked_by_type
+            .inc(&metrics.scope, &self.page_site, resource_type);
     }
 
     /// Documents are left out: the main one is the page itself, and a frame's document is what
@@ -453,6 +474,18 @@ mod tests {
         assert_eq!(value(&m.requests, "www.site.com", "t.redirect.io"), 0);
         assert_eq!(value(&m.requests, "www.site.com", "final.cdn.io"), 1);
         assert_eq!(value(&m.blocked, "www.site.com", "img.site.com"), 1);
+    }
+
+    #[test]
+    fn blocked_types_are_counted_per_site() {
+        let m = metrics(100);
+        let loads = m.request_loads("www.site.com".to_string());
+        loads.blocked_by_type("media");
+        loads.blocked_by_type("media");
+        loads.blocked_by_type("font");
+
+        assert_eq!(value(&m.blocked_by_type, "www.site.com", "media"), 2);
+        assert_eq!(value(&m.blocked_by_type, "www.site.com", "font"), 1);
     }
 
     #[test]

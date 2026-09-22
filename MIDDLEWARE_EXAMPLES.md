@@ -278,6 +278,35 @@ are counted per request and recorded on the worker's `scrape_page` span as `bloc
 They are deliberately kept **out** of browser diagnostics: dozens of self-inflicted blocks per
 page would fill `WORKER_DIAGNOSTICS_MAX_ENTRIES` and push out the failures that explain a bad page.
 
+
+## Example 4b: Blocking by Resource Type
+
+`BlockedResourceTypesMiddleware` drops every load of the given CDP resource types — `media` is the
+intended use (`<video>`/`<audio>`), `font` a candidate. It works through Fetch interception rather
+than `setBlockedURLs`, which cannot see the type. Configured from `WORKER_BLOCKED_RESOURCE_TYPES`:
+
+```rust
+use browser_hive_common::{BlockedResourceTypesMiddleware, TabInitMiddleware};
+
+let tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>> = vec![
+    Box::new(DefaultTabInitMiddleware::new(headless)),
+    // WORKER_BLOCKED_RESOURCE_TYPES=media  (unset or empty: no-op)
+    Box::new(BlockedResourceTypesMiddleware::from_env()),
+];
+```
+
+- Names are CDP resource types, case-insensitive, comma-separated.
+- Chrome's Fetch filter rejects `texttrack`, `prefetch`, `websocket`, `manifest`, `signedexchange`,
+  `preflight` and `fedcm` — and one rejected type fails the whole `Fetch.enable`. These (and unknown
+  names) are dropped with a startup WARN. `prefetch` could not work anyway: prefetches arrive as `fetch`.
+- Types that can break pages or trip anti-bot checks (`image`, `script`, `stylesheet`, `document`,
+  `xhr`, `fetch`, `eventsource`, `ping`, `other`) are **allowed** — the choice is the deployment's —
+  with a startup WARN.
+- Not caught: HLS/DASH video (segments are `xhr`/`fetch`) and anything inside a cross-site iframe.
+- A tab has **one** request interceptor; a second middleware installing its own replaces this one.
+- Blocked loads show up exactly like URL-list blocks (`span_blocked_requests`, the third-party
+  blocked metric) and additionally on `browser_hive_worker_requests_blocked_by_type_total{page_site,
+  resource_type}`. See METRICS.md.
 ## Example 5: Using Middleware in Production
 
 Here's how to configure middleware in your production worker binary:
