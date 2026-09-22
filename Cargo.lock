@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "browser-hive-common",
  "browser-hive-proto",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-common"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "anyhow",
  "headless_chrome",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-coordinator"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-proto"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "prost",
  "tonic",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "browser-hive-worker"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "anyhow",
  "async-trait",
