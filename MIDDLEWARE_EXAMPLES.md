@@ -235,8 +235,11 @@ let tab_init_middlewares: Vec<Box<dyn TabInitMiddleware>> = vec![
 
 ### Pattern syntax
 
-Patterns are sent to CDP **unchanged**. They are globs matched against the **whole URL** — the
-matcher knows nothing about hosts, paths or domains:
+Patterns are sent to CDP **unchanged**. Measured (2026-09-22, Chrome, macOS, headless): the
+pattern is split at every `*`, and a URL is blocked when it contains those pieces **in order,
+anywhere** — no anchoring to the start or end of the URL, `*` is the only special character, `?`
+is a literal and there is no escape syntax. The matcher knows nothing about hosts or paths; the
+patterns below work as host rules only because `://` and `/` frame the host:
 
 | Intent | Pattern |
 |---|---|
@@ -246,14 +249,28 @@ matcher knows nothing about hosts, paths or domains:
 | one path on a host | `*://example.com/tracker/*` |
 | one file, any subdomain | `*://*.example.com/beacon.js*` |
 
-Three things to know before writing a list:
+Things to know before writing a list:
 
-- A bare host (`example.com`) matches **nothing** — a URL never equals it. `BlockedUrlsMiddleware::new`
-  logs a WARN at startup for every pattern without a `*`, because the failure is otherwise silent.
-- `*example.com*` is not "the domain example.com". It also matches `notexample.com` and any URL
-  merely containing the string, such as `https://other.test/?ref=example.com`.
-- `?` is a **single-character wildcard**, not a literal — patterns that reach into a query string
-  rarely mean what they look like.
+- A bare host (`example.com`) matches **too much**, not nothing: it behaves like `*example.com*`
+  and blocks every URL containing the string — `notexample.com`, and any URL carrying it in a
+  query, such as `https://other.test/?ref=example.com`. `BlockedUrlsMiddleware::new` logs a WARN at
+  startup for every pattern without a `*`.
+- Even `*://example.com/*` also matches a URL that carries that address in its query string (a
+  redirect parameter), and it does not match the host with an explicit port.
+- There is no way to say "the URL **ends** with X": `*.m3u8` also blocks `x.m3u8.js` and
+  `a.m3u8x/b.js`. Narrow it with what follows instead — `*.m3u8?*` blocks only a manifest with a
+  query string.
+- `?` is a plain character, not a single-character wildcard. The `Fetch` domain's `urlPattern`
+  does treat `?` as a wildcard — it is a different matcher, do not assume the two agree.
+
+| Pattern | Blocked (measured) |
+|---|---|
+| `*.m3u8` | `playlist.m3u8`, `playlist.m3u8?token=1`, `playlist.m3u8x/a.js`, `x.m3u8.js` |
+| `*.m3u8?*` | only `playlist.m3u8?token=1` |
+| `*.m3u8\?*` | nothing |
+| `pla?list` | nothing (`plaXlist.js` is not matched) |
+| `example.com` | `notexample.com.js` too |
+| `*://blocked.test/*` | `/r?next=http://blocked.test/x` too |
 
 ### What must never be blocked
 

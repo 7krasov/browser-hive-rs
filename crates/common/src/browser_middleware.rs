@@ -414,8 +414,12 @@ impl TabInitMiddleware for DefaultTabInitMiddleware {
 ///
 /// # Pattern syntax
 ///
-/// Patterns go to CDP `Network.setBlockedURLs` **unchanged**. They are globs matched against the
-/// **whole URL**, not against a host — the domain structure means nothing to the matcher:
+/// Patterns go to CDP `Network.setBlockedURLs` **unchanged**. Measured (2026-09-22, Chrome, macOS,
+/// headless): the pattern is split at every `*`, and a URL is blocked when it contains those pieces
+/// **in order, anywhere** — there is no anchoring to the start or the end of the URL, `*` is the
+/// only special character, `?` is a literal, and there is no escape syntax. The matcher knows
+/// nothing about hosts or paths; the patterns below work as host rules only because `://` and `/`
+/// frame the host:
 ///
 /// | Intent | Pattern |
 /// |---|---|
@@ -425,14 +429,19 @@ impl TabInitMiddleware for DefaultTabInitMiddleware {
 /// | one path on a host | `*://example.com/tracker/*` |
 /// | one file, any subdomain | `*://*.example.com/beacon.js*` |
 ///
-/// Two consequences worth knowing before writing a list:
+/// Consequences worth knowing before writing a list:
 ///
-/// - A bare host (`example.com`) matches **nothing** — a URL never equals it. [`Self::new`] warns
-///   about every pattern without a `*` for that reason, since the failure is otherwise silent.
-/// - `*example.com*` is not "the domain example.com": it also matches `notexample.com` and any
-///   URL merely *containing* the string, such as `https://other.test/?ref=example.com`.
-/// - `?` is a **single-character wildcard**, not a literal. URLs are full of them, so a pattern
-///   that reaches into a query string rarely means what it looks like.
+/// - A bare host (`example.com`) matches **too much**, not nothing: with no anchoring it behaves
+///   like `*example.com*` and blocks every URL containing the string — `notexample.com`, and any
+///   URL carrying it in a query, such as `https://other.test/?ref=example.com`. [`Self::new`] warns
+///   about every pattern without a `*` for that reason.
+/// - Even `*://example.com/*` also matches a URL that carries that address in its query string
+///   (a redirect parameter), and it does not match the host with an explicit port.
+/// - There is no way to say "the URL **ends** with X": `*.m3u8` also blocks `x.m3u8.js` and
+///   `a.m3u8x/b.js`. Narrow it with what follows instead — `*.m3u8?*` blocks only the manifest
+///   with a query string.
+/// - `?` is a plain character, not a single-character wildcard (that is the `Fetch` domain's
+///   `urlPattern` syntax, a different matcher — do not assume the two agree).
 ///
 /// # What must never be blocked
 ///
@@ -460,14 +469,15 @@ pub struct BlockedUrlsMiddleware {
 impl BlockedUrlsMiddleware {
     /// Build the middleware from a list of URL patterns. See the type docs for the syntax.
     ///
-    /// Patterns are stored and sent verbatim. A pattern containing no `*` can never match and is
-    /// reported as a warning here — at construction, i.e. during worker startup — rather than
-    /// silently blocking nothing for the life of the pod.
+    /// Patterns are stored and sent verbatim. A pattern containing no `*` is almost always a bare
+    /// host that blocks far more than that host (see the type docs), so it is reported as a
+    /// warning here — at construction, i.e. during worker startup.
     pub fn new(patterns: Vec<String>) -> Self {
         for pattern in patterns.iter().filter(|p| !p.contains('*')) {
             tracing::warn!(
-                "Blocked-URL pattern '{}' contains no '*' and can never match: patterns are \
-                 matched against the whole URL, so a host has to be written as '*://{}/*'",
+                "Blocked-URL pattern '{}' contains no '*': it blocks every URL containing that \
+                 string anywhere, other hosts and query strings included; a host is written as \
+                 '*://{}/*'",
                 pattern,
                 pattern
             );
@@ -727,10 +737,10 @@ impl TabInitMiddleware for BlockedResourceTypesMiddleware {
 mod tests {
     use super::*;
 
-    /// Patterns reach CDP exactly as written. This is the decision the type documents: rewriting
-    /// a bare host into `*host*` would silently widen it to "this string anywhere in the URL",
-    /// which also matches `nothost.com` and `?ref=host`. A pattern that cannot match is reported
-    /// as a warning instead, so the mistake is loud rather than corrected into a different rule.
+    /// Patterns reach CDP exactly as written. This is the decision the type documents: the base
+    /// never reinterprets a pattern into the rule it guesses was meant. A bare host, which blocks
+    /// every URL containing it, is reported as a warning instead, so the mistake is loud rather
+    /// than corrected into a different rule.
     #[test]
     fn patterns_are_stored_verbatim() {
         let given = vec![
