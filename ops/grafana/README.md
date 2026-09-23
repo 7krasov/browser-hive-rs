@@ -114,6 +114,11 @@ resources" section of METRICS.md.
   OOMKill.
 - **Largest single process** together with **Browser processes by type** - one bloated
   renderer (high max, few processes) vs. many small ones (low max, many processes).
+- **Requests per context per 30 min** - pages a slot loaded, averaged over the scope. Compare it
+  with the scope's rotation settings: above `WORKER_MAX_REQUESTS` (scaled to 30 min) the request
+  cap rotates contexts, below it only `WORKER_MAX_LIFETIME` does. Fewer pages per context
+  alongside a larger renderer means the growth is not per page loaded. A scale-down shows up as a
+  jump, since the increase is spread over the slots that remain.
 - **Out-of-process iframes per page** - high values mean the memory comes from what pages
   embed (a renderer per framed third-party site), not from tab age.
 - **Browser main processes per pod** - counts launcher wrappers too (5 per browser for Brave in

@@ -160,6 +160,12 @@ fn load_config_from_env(
         default_block_quarantine_secs,
     )?);
 
+    // Both off unless asked for: they trade per-tab memory for a changed launch command line /
+    // a tab creation per request. See ScopeConfig and TODO.md ("The same scope OOMKilled…").
+    let disable_back_forward_cache =
+        env_parsed::<bool>("WORKER_DISABLE_BACK_FORWARD_CACHE", false)?;
+    let close_tab_after_request = env_parsed::<bool>("WORKER_CLOSE_TAB_AFTER_REQUEST", false)?;
+
     // Create default binary params middleware
     // Users in production can replace this with custom implementations
     let binary_params_middlewares: Vec<
@@ -195,6 +201,8 @@ fn load_config_from_env(
         context_isolation,
         destroy_session_on_block,
         block_quarantine,
+        disable_back_forward_cache,
+        close_tab_after_request,
     };
 
     Ok(WorkerConfig {

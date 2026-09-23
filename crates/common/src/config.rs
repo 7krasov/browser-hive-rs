@@ -88,6 +88,28 @@ pub struct ScopeConfig {
     /// [`ScopeConfig::validate`] warns when it is set elsewhere.
     #[allow(rustdoc::private_intra_doc_links)]
     pub block_quarantine: Duration,
+
+    /// Launch the browser with Chromium's back/forward cache disabled.
+    ///
+    /// The cache is on in headless and CDP navigations feed it: every page a reused tab navigates
+    /// away from stays alive — heap, dedicated workers and all — until Chromium evicts it
+    /// (measured 2026-09-23: four navigations in one tab, 3 → 15 live workers, largest renderer
+    /// 532 → 1002 MB). A scraper never navigates back, so the cache buys nothing here. Off by
+    /// default because it changes the launch command line; the feature is merged into the one
+    /// `--disable-features` switch Chromium honours. See TODO.md.
+    pub disable_back_forward_cache: bool,
+
+    /// Close a [`SessionMode::Reusable`] context's tab when its request ends; the next request
+    /// opens a fresh tab in the same CDP context.
+    ///
+    /// Between requests a reused tab keeps its last page loaded — renderer heap, dedicated workers
+    /// and cross-site iframes included — for as long as the context lives. Closing the tab ends
+    /// that renderer, while cookies, `localStorage`, the HTTP cache and the proxy stay on the CDP
+    /// context (measured 2026-09-23: the context survives its last tab, a new tab in it sends the
+    /// old cookies). Costs a tab creation (~0.1 s locally) on the next request and the
+    /// `sessionStorage` of the previous page. The close is detached, never awaited.
+    /// Only `reusable` acts on it; [`ScopeConfig::validate`] warns elsewhere.
+    pub close_tab_after_request: bool,
 }
 
 /// Controls how browser contexts share state within a Chrome process
@@ -247,6 +269,11 @@ impl std::fmt::Debug for ScopeConfig {
             .field("tab_init_middlewares", &tab_init_middleware_names)
             .field("context_isolation", &self.context_isolation)
             .field("destroy_session_on_block", &self.destroy_session_on_block)
+            .field(
+                "disable_back_forward_cache",
+                &self.disable_back_forward_cache,
+            )
+            .field("close_tab_after_request", &self.close_tab_after_request)
             .finish()
     }
 }
@@ -377,6 +404,14 @@ impl ScopeConfig {
             warnings.push(format!(
                 "scope '{}': block_quarantine has no effect in {} mode - only reusable chooses \
                  between contexts, so only there can a blocked one be skipped.",
+                self.name, mode
+            ));
+        }
+
+        if self.close_tab_after_request && self.session_mode != SessionMode::Reusable {
+            warnings.push(format!(
+                "scope '{}': close_tab_after_request has no effect in {} mode - only reusable \
+                 keeps an idle tab of nobody's request loaded.",
                 self.name, mode
             ));
         }
@@ -924,6 +959,8 @@ mod tests {
             context_isolation: ContextIsolation::Isolated,
             destroy_session_on_block: false,
             block_quarantine: Duration::ZERO,
+            disable_back_forward_cache: false,
+            close_tab_after_request: false,
         }
     }
 
@@ -1043,6 +1080,26 @@ mod tests {
             .expect("valid")
             .iter()
             .all(|w| !w.contains("block_quarantine")));
+    }
+
+    /// Only `reusable` keeps a tab loaded between requests of different clients; elsewhere the
+    /// context either dies with the request or belongs to one session.
+    #[test]
+    fn test_warns_about_close_tab_outside_reusable() {
+        let mut dedicated = scope(SessionMode::Dedicated);
+        dedicated.close_tab_after_request = true;
+        let warnings = dedicated.validate().expect("valid, just pointless");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("close_tab_after_request")));
+
+        let mut reusable = scope(SessionMode::Reusable);
+        reusable.close_tab_after_request = true;
+        assert!(reusable
+            .validate()
+            .expect("valid")
+            .iter()
+            .all(|w| !w.contains("close_tab_after_request")));
     }
 
     /// A pool that only grows on contention never grows under a client that sends one request at

@@ -483,6 +483,43 @@ fn apply_args(&self, args: &mut Vec<&'static OsStr>, headless: bool) {
 
 For dynamic args, you'll need to use a different approach (e.g., environment variables, `lazy_static!`, or `Box::leak`).
 
+### 5a. Feature Switches: Only the Last One Counts
+
+Chromium reads `--disable-features=` and `--enable-features=` as **one value each**. When the
+command line carries the same switch twice, the last one replaces the first; the two lists are
+**not** combined. Measured 2026-09-23 (Chrome 153 and Brave, headless):
+
+```text
+--disable-features=BackForwardCache --disable-features=TranslateUI
+    → only TranslateUI is disabled; the back/forward cache stays ON
+--disable-features=TranslateUI --disable-features=BackForwardCache
+    → only BackForwardCache is disabled; TranslateUI is back ON
+--disable-features=TranslateUI,BackForwardCache
+    → both disabled (one switch, comma-separated list)
+```
+
+The command line is built from three sources, in this order: headless_chrome's own `DEFAULT_ARGS`,
+then every `BrowserBinaryParamsMiddleware` in order, then the pool's options. Which switch wins is
+therefore a matter of position, not of intent.
+
+- **`--disable-features` is merged for you.** `BrowserPool::new` (`worker/src/launch_args.rs`)
+  collects every `--disable-features=` value from all three sources: headless_chrome's
+  (`TranslateUI,BlinkGenPropertyTrees`), the middlewares' and `ScopeConfig::disable_back_forward_cache`.
+  It passes them as a single switch and drops headless_chrome's default through
+  `ignore_default_args`. A middleware may push its own `--disable-features=…` safely. The startup
+  line `Chrome feature switch: …` shows the result.
+- **`--enable-features` is NOT merged, and already overrides a default.** headless_chrome passes
+  `--enable-features=NetworkService,NetworkServiceInProcess`, and the default middlewares
+  (`DefaultBinaryParamsMiddleware`, `BraveBinaryParamsMiddleware`) push
+  `--enable-features=TabDiscarding` after it. So only `TabDiscarding` is enabled, and the network
+  service runs as a separate process (the `network` type in the process metrics). This has been
+  the case since `TabDiscarding` was added. Changing it is an open decision in TODO.md, since
+  merging would move the network service into the browser process. A middleware that pushes
+  another `--enable-features=` cancels `TabDiscarding` the same way. Put every feature to enable in
+  **one** switch.
+- The same rule applies to any switch that takes a value (`--js-flags=`, `--proxy-server=`, …):
+  pass it once.
+
 ### 6. Test Middleware in Isolation
 
 Create unit tests for your middleware:

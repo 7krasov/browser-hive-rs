@@ -3,6 +3,7 @@ mod browser_pool;
 mod browser_resources;
 mod cdp_call;
 mod diagnostics;
+mod launch_args;
 mod metrics;
 mod service;
 mod shutdown;
@@ -103,6 +104,8 @@ fn log_runtime_threads() {
 ///             context_isolation: ContextIsolation::Isolated,
 ///             destroy_session_on_block: false, // Only meaningful for SessionMode::Dedicated (set true there)
 ///             block_quarantine: std::time::Duration::from_secs(300), // Only acted on in SessionMode::Reusable; ZERO disables
+///             disable_back_forward_cache: false, // true drops pages a reused tab navigated away from
+///             close_tab_after_request: false, // Only acted on in SessionMode::Reusable
 ///         },
 ///         grpc_port: 50052,
 ///         pod_name: "worker-1".to_string(),

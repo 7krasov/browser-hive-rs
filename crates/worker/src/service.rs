@@ -337,6 +337,35 @@ impl Drop for ContextBusyGuard {
     }
 }
 
+/// RAII guard that closes a `reusable` context's tab when the request ends
+/// (`ScopeConfig::close_tab_after_request`), so the page it leaves behind — renderer heap,
+/// dedicated workers, cross-site iframes — is not kept loaded until the context's next request.
+///
+/// Declared right after [`ContextBusyGuard`], so it drops **first**: the tab is taken while the
+/// context is still busy and no other request can have picked it up. The next request finds the
+/// slot without a tab and creates one in the same CDP context (the lazy path in
+/// `scrape_page_internal`), so cookies, storage and the proxy carry over. The close is detached:
+/// `Tab::close` can wait up to an hour on a wedged tab. RAII rather than a call at the end of the
+/// handler, so a request whose future is dropped mid-flight still releases its page.
+struct CloseTabGuard {
+    context: Arc<BrowserContext>,
+}
+
+impl Drop for CloseTabGuard {
+    fn drop(&mut self) {
+        // `try_lock` because Drop is synchronous. The request has released the tab by now and the
+        // context is still ours (busy), so the lock is free in practice; if it ever is not, the
+        // tab stays and the next request reuses it, which is the behaviour without this guard.
+        let Ok(mut tab) = self.context.tab.try_lock() else {
+            return;
+        };
+        // `None` after a hard timeout or stalled call: the context was removed with its tab.
+        if let Some(tab) = tab.take() {
+            crate::browser_pool::close_tab_detached(tab, self.context.metadata.id);
+        }
+    }
+}
+
 /// RAII guard that removes an AlwaysNew context from the pool when the request scope ends.
 ///
 /// Destruction must not depend on control flow reaching a cleanup statement. If the gRPC
@@ -951,6 +980,13 @@ impl WorkerService {
             }
         };
 
+        // Declared after `_busy_guard`, so it runs while the context is still busy.
+        let _close_tab_guard = (self.config.scope.close_tab_after_request
+            && self.config.scope.session_mode == SessionMode::Reusable)
+            .then(|| CloseTabGuard {
+                context: context.clone(),
+            });
+
         // Extract domain (used in error messages below)
         // NOTE: Invalid URL is not a gRPC error - we return response with error code
         let domain = match utils::extract_domain(&req.url) {
@@ -1022,7 +1058,8 @@ impl WorkerService {
 
         if tab_guard.is_none() {
             debug!(
-                "Tab not found in context {} - creating new tab (likely after recycling)",
+                "Tab not found in context {} - creating new tab (after recycling, or closed \
+                 after the previous request)",
                 context.metadata.id
             );
 

@@ -620,6 +620,26 @@ impl BrowserPool {
             middleware.apply_args(&mut chrome_args, scope_config.headless);
         }
 
+        // Chromium honours only the last `--disable-features` switch, so ours, the middlewares'
+        // and headless_chrome's own default are merged into one (see `launch_args`).
+        let extra_disabled: &[&str] = if scope_config.disable_back_forward_cache {
+            &["BackForwardCache"]
+        } else {
+            &[]
+        };
+        let merged = crate::launch_args::merge_disable_features(
+            &headless_chrome::browser::DEFAULT_ARGS,
+            chrome_args,
+            extra_disabled,
+        );
+        let mut chrome_args: Vec<&OsStr> = merged.args;
+        if let Some(switch) = merged.disable_features.as_deref() {
+            info!("Chrome feature switch: {}", switch);
+            chrome_args.push(OsStr::new(switch));
+        }
+        let ignored_defaults: Vec<&OsStr> =
+            merged.ignored_defaults.iter().map(OsStr::new).collect();
+
         if scope_config.headless {
             info!(
                 "Launching Chrome in HEADLESS mode (faster, more detectable) with {} args",
@@ -641,6 +661,7 @@ impl BrowserPool {
             // Default is 30 seconds which causes "connection is closed" errors during navigation
             // We set it to 1 hour - if browser is truly idle for that long, it's safe to restart
             .idle_browser_timeout(Duration::from_secs(3600))
+            .ignore_default_args(ignored_defaults)
             .args(chrome_args);
 
         // Use custom browser path if specified (e.g., for Brave: /usr/bin/brave-browser)
@@ -1813,6 +1834,8 @@ mod tests {
             context_isolation: isolation,
             destroy_session_on_block: false,
             block_quarantine: Duration::ZERO,
+            disable_back_forward_cache: false,
+            close_tab_after_request: false,
         }
     }
 

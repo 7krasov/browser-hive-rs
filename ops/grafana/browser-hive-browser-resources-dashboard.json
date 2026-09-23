@@ -320,13 +320,62 @@
     },
     {
       "type": "timeseries",
+      "title": "Requests per context per 30 min",
+      "description": "Pages one context (slot) loaded in the last 30 min, averaged over the scope: requests / total slots. Read it against the scope's context rotation: above WORKER_MAX_REQUESTS scaled to 30 min the request cap rotates contexts, below it only WORKER_MAX_LIFETIME does. Fewer pages per context with a larger renderer points away from per-page growth (see TODO.md, OOMKills). Averages across pods that came and went, so a scale-down shows up as a jump.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "min",
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum by (scope) (increase(browser_hive_worker_requests_total{scope=~\"$scope\", pod=~\"$pod\"}[30m])) / sum by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{scope}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
       "title": "Browser processes by type",
       "description": "Process count per Chromium process type, summed over the selected pods. Renderers far above the number of tabs point at site isolation (a renderer per framed third-party site).",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -375,7 +424,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 34
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -439,7 +488,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "collapsed": false,
       "panels": []
@@ -452,7 +501,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -505,7 +554,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 43
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -554,7 +603,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -607,7 +656,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 59
       },
       "collapsed": false,
       "panels": []
@@ -620,7 +669,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -666,7 +715,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 52
+        "y": 60
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -713,7 +762,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 68
       },
       "collapsed": false,
       "panels": []
@@ -726,7 +775,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 61
+        "y": 69
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -825,7 +874,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "collapsed": false,
       "panels": []
@@ -838,7 +887,7 @@
         "h": 12,
         "w": 8,
         "x": 0,
-        "y": 70
+        "y": 78
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -889,7 +938,7 @@
         "h": 12,
         "w": 8,
         "x": 8,
-        "y": 70
+        "y": 78
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -940,7 +989,7 @@
         "h": 12,
         "w": 8,
         "x": 16,
-        "y": 70
+        "y": 78
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -991,7 +1040,7 @@
         "h": 12,
         "w": 8,
         "x": 0,
-        "y": 82
+        "y": 90
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -1042,7 +1091,7 @@
         "h": 12,
         "w": 8,
         "x": 8,
-        "y": 82
+        "y": 90
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -1093,7 +1142,7 @@
         "h": 12,
         "w": 8,
         "x": 16,
-        "y": 82
+        "y": 90
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -1144,7 +1193,7 @@
         "h": 12,
         "w": 12,
         "x": 0,
-        "y": 94
+        "y": 102
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -1197,7 +1246,7 @@
         "h": 12,
         "w": 12,
         "x": 12,
-        "y": 94
+        "y": 102
       },
       "datasource": "${datasource}",
       "fieldConfig": {

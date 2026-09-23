@@ -270,9 +270,10 @@ now gets the tab init middlewares (UA override, blocked URLs); it used to be a b
 
 ## The same scope OOMKilled 10 minutes after a clean browser restart
 
-**Status**: open, cause unknown. The renderer half of "Worker OOMKills" below — still reproduced
-after disposal was deployed (2026-09-21: OOMKills ~20 min after a pod starts, single renderer up to
-~770 MiB)
+**Status**: open. Prime suspect since 2026-09-23 is the back/forward cache (measured locally, see
+below), not yet verified in production. The renderer half of "Worker OOMKills" below — still
+reproduced after disposal was deployed (2026-09-21: OOMKills ~20 min after a pod starts, single
+renderer up to ~770 MiB)
 
 Same incident, 2026-09-18. After the hour-long freeze the pool was recreated and the old Chrome was
 killed (`Killed browser process 8 of the dropped browser pool` — the v0.33.0 fix works). The new
@@ -293,10 +294,68 @@ its tab is closed. *What* it keeps (V8 heap, DOM, back/forward cache, DevTools n
 is not known. Both hour-long metric gaps (17:45–18:50 and 19:25–20:25) start at a renderer
 peak (~930–960 MiB): plausibly a renderer under memory pressure stops answering, the request
 hits its hard timeout and the old inline `tab.close` froze the worker — correlation only.
-Mitigations, cheapest first: lower `WORKER_MAX_REQUESTS` for the scope (config only; costs
-cookies and exit IP more often); rotate the **tab** inside the same CDP context every N requests
-(keeps cookies and exit IP; whether a new tab gets a fresh renderer needs checking); find what
-grows (`Runtime.getHeapUsage` / `Memory.getDOMCounters` per request).
+**Production, 2026-09-23** (same scope, v0.39.1, 2.5 GiB, `max_contexts = 2`, `WORKER_MAX_REQUESTS=100`,
+`WORKER_MAX_LIFETIME=30m`): OOMKills again 14:50–17:30 UTC, after KEDA scaled the scope from ~18
+pods to its floor of 3. Per pod: renderer count unchanged (~7), renderer PSS ~0.55 → ~1.7 GiB,
+largest single renderer up to 917 MiB. `worker` targets across the scope went from ~5–15 to
+56–72, and iframes from ~5 to 28. In the evening a context serves 45–60 requests per 30 min, against
+80–120 in the daytime, when the 100 cap binds and nothing is OOMKilled. So in the evening a tab loads
+*fewer* pages, yet its renderer is *larger*, which does not fit "linear per page".
+
+**Measured locally 2026-09-23** (Chrome 153 and Brave, macOS, headless, raw CDP with the calls the
+worker makes; the test page holds ~320 MB of JS heap, 3 dedicated workers and 2 cross-site iframes).
+Script: a scratch Node script, not kept in the repo.
+
+1. **Back/forward cache is on in headless, and CDP navigations feed it.** Four `Page.navigate`s
+   to same-site pages in one tab: `worker` targets 3 → 6 → 9 → 12 → 15. The largest renderer grew
+   532 → 1002 MB (Chrome) and 683 → 953 MB (Brave). Navigating back restored from the cache
+   (`Page.frameNavigated` type `BackForwardCacheRestore`). Each page left behind stays alive, workers
+   included. Only the live page shows up as a `page`/`iframe` target, but the cached pages'
+   dedicated workers do appear as `worker` targets. With `--disable-features=BackForwardCache`, `worker` targets stay at 3 and
+   navigating back is a normal load (`BackForwardCacheDisabled`). Chrome limits the cache by entry
+   count and age; those limits were **not** measured.
+   This is the prime candidate for the per-tab growth above, and possibly for the "renderers without
+   targets" sub-question below. **Not yet verified in production**: a real site can be ineligible
+   (for example an `unload` handler, `Cache-Control: no-store`, an open WebSocket).
+2. **`about:blank` does not free a page.** The heavy page went into the cache. Its 3 workers were still
+   alive 13 s later, and the renderer process survived (Chrome 379 → 200 MB, Brave 573 → 184 MB). With
+   bfcache disabled, the workers were gone at once and the renderer shrank.
+3. **Closing the tab does free it, and the context survives.** `Target.closeTarget` (what
+   `tab.close(false)` sends) took 1 ms even with a `beforeunload` handler, and did not open a dialog. The
+   heavy renderer exited and all targets of the context were gone. `Target.getBrowserContexts` still
+   listed the context. A new tab in that context sent the old cookie and read the old
+   `localStorage`. `createTarget` + attach + `Page.enable` took 86–118 ms. Not tested: a proxied context.
+   The proxy is a property of the CDP context, so it should carry over, but that is an inference.
+
+**Implemented 2026-09-23, both off by default, not released or deployed:**
+`WORKER_DISABLE_BACK_FORWARD_CACHE` (`ScopeConfig::disable_back_forward_cache`) and
+`WORKER_CLOSE_TAB_AFTER_REQUEST` (`ScopeConfig::close_tab_after_request`, `reusable` only). A
+downstream worker must set both fields, since it builds `ScopeConfig` itself. `about:blank` was
+rejected (it does not free the page). Lowering `WORKER_MAX_LIFETIME`/`WORKER_MAX_REQUESTS` remains the
+config-only fallback.
+
+**Verified locally** (base worker, Chrome, `reusable`, 1 context, both flags on, synthetic heavy
+page with 3 workers and 2 cross-site iframes): the browser gets one merged
+`--disable-features=TranslateUI,BlinkGenPropertyTrees,BackForwardCache`. After every request the
+idle browser holds no `worker` target and none of the page's iframes. Each later request logs
+`Creating tab in existing CDP context` for the same context, and the cookie set by the first page
+reached the fourth request. With both flags off, the same page left 3 workers and 2 iframes alive
+while idle. Also with flags off, the second request (a navigation from one test page to the next in
+the same tab) hit the wait-strategy hard timeout (13 s) and its context was discarded. That was one
+run on a page with a `beforeunload` handler, and the cause was not investigated.
+
+**Latent, not changed: `--enable-features` has the same last-switch-wins property.** The
+middlewares' `--enable-features=TabDiscarding` cancels headless_chrome's
+`--enable-features=NetworkService,NetworkServiceInProcess`, so today the network service runs as
+its own process (which is what the `network` process metrics show). Merging it would move the
+network service into the browser process. That changes memory accounting and crash blast radius, so
+it is a decision of its own, not a fix to slip in.
+
+**Production check** (existing metrics): after `WORKER_DISABLE_BACK_FORWARD_CACHE`, `browser_targets{type="worker"}` should
+fall to what the live pages hold, and `browser_process_max_pss_bytes{type="renderer"}` should stop
+climbing between context rotations. After tab closing, `worker`/`iframe` targets should also drop
+to ~0 on a pod with `active_contexts = 0`. If the flag changes nothing, explanation (1) remains:
+the evening traffic is heavier pages. Only the memory limit and fewer contexts per pod help there.
 
 ## Worker OOMKills: renderers set the floor, undisposed contexts set the slope
 
