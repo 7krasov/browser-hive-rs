@@ -598,8 +598,8 @@ rollout finished inside it). Only 3-5 were read; 1, 2 and 6 were not checked.
 ## A replaced browser pool leaves its Chrome running
 
 **Status**: confirmed in production 2026-09-16 as the OOMKill cause of a downstream `always_new`
-scope; fixed the same day (`Drop for BrowserPool`, v0.33.0) and deployed. The verification below has
-not been read on that scope yet. Why the transport closes is still open
+scope. The v0.33.0 fix killed the wrong process on Linux (see "Second fix" below); the subtree kill
+is implemented 2026-09-25, not released or deployed. Why the transport closes is still open
 
 `BrowserPool::start_lifecycle_monitor` spawns an endless task that holds clones of the pool's
 `Arc<Browser>`, its contexts and its CDP clients, and nothing stops it: `recreate_browser_pool`
@@ -638,10 +638,41 @@ and Brave with a real `BrowserPool` replaced under an `RwLock` while an extra `A
 was still held: the old main process became a zombie at once with no children left, and was reaped
 as soon as that clone was dropped.
 
+**Second fix, 2026-09-25: the v0.33.0 kill hit the wrapper, not the browser.** Production (same
+scope, 24 h): one pod logged 7 `Recreating browser pool` lines, each followed by `Killed browser
+process …` and no `Could not kill`, yet "Browser main processes per pod" went 5 → 9 → … → 33 in
+steps of **+4** and its memory rose in matching steps to 1.4 GiB, with `gpu`/`network`/`storage`/
+`zygote`/`renderer` PSS all stepping up. Contexts not in the pool, the largest single process and
+worker threads stayed flat. Measured in the worker image (Brave 144, Linux):
+`/usr/bin/brave-browser` → `/opt/brave.com/brave/brave-browser`, a bash script ending in
+`"$HERE/brave" "$@" || true` — **no `exec`**. headless_chrome's PID is the shell's; SIGKILL on it
+leaves the real Brave (main, 2 `cat`s from the wrapper's stdout/stderr redirection, zygotes, GPU,
+NetworkService, storage, renderers) running and reparented to PID 1 — observed unchanged 25 s later.
+SIGKILL on Brave's own main process instead took every child and both crashpad handlers down within
+5 s. The v0.33.0 verification ran on macOS, which has no wrapper. So every replacement since
+v0.33.0 still leaked a whole browser; only the wrapper (the fifth `browser`-type process) died.
+Confirmed in production the same day (`/proc` listing of that pod): 8 Brave main processes, each
+with its own `--user-data-dir` and `--remote-debugging-port`. Seven are orphans (`ppid=1`, i.e. the
+worker), each with one `cat`, two crashpad handlers, zygotes, GPU, NetworkService, storage and a
+renderer — all alive. Their PIDs are exactly the logged `Killed browser process N` values + 6: the
+kill hit the wrapper. Only the current browser still has its `/bin/bash /usr/bin/brave-browser`
+parent. So the replaced browsers were **not dead** — only their CDP transport was, which narrows
+"why the transport closes" (next item) to the connection, not a browser crash.
+Fix: `Drop for BrowserPool` now SIGKILLs the launched process's whole subtree, read from `/proc`
+before any signal (`kill_browser_process_tree`); the log line reads `Killed browser process N and M
+process(es) below it`, where M ≥ 1 on Brave. Regression test (ignored, needs Linux and a browser):
+`dropped_pool_kills_the_whole_browser_process_tree`. Verified 2026-09-25 by the downstream session on
+Linux + Brave (arm64 image, prod amd64 not tried): CDP sockets cut with the browser alive, 3
+replacements, each `Killed browser process N and 8 process(es) below it`, exactly one browser tree
+left, requests kept succeeding, the ignored test passed in the image. Side effect found there: the
+killed processes stayed as zombies (+9 per replacement), reparented to the worker as PID 1 — now
+reaped by `child_reaper` on every lifecycle tick (see CLAUDE.md); the reaper's own Linux test is
+`reaps_inherited_zombies_but_not_launched_children`.
+
 **To verify** (dashboard "Browser Hive - Browser Resources", the `always_new` scope,
-12-24 h):
+12-24 h, after the subtree kill is deployed):
 - "Browser main processes per pod" stays at 5 (one browser) — at most a brief 10 right after a
-  replacement. Before: steps of +5 up to 45.
+  replacement. Before v0.33.0: steps of +5 up to 45; v0.33.0–2026-09-25: steps of +4.
 - "Browser processes by type": `gpu`/`network`/`storage` equal the pod count.
 - "Memory per pod vs. container limit": no steps; "Container restarts and OOMKills per pod": none.
 - Loki: `{app="worker-<scope>"} |= "Killed browser process"` — one line per replacement, i.e. as

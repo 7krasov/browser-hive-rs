@@ -2,6 +2,7 @@ mod browser_cdp;
 mod browser_pool;
 mod browser_resources;
 mod cdp_call;
+mod child_reaper;
 mod diagnostics;
 mod launch_args;
 mod metrics;

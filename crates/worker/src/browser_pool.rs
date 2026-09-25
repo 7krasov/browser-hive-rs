@@ -440,7 +440,8 @@ impl Drop for SlotReservation {
 /// Both halves are needed. Aborting the monitor releases its clones, so the crate's own teardown
 /// (kill, reap, temporary profile removal) runs once the remaining short-lived clones held by
 /// in-flight requests are gone. The explicit kill does not wait for that and does not depend on
-/// every clone being found.
+/// every clone being found. It takes the launched process's whole subtree, because the launched
+/// process may be a wrapper script rather than the browser (see `kill_browser_process_tree`).
 impl Drop for BrowserPool {
     fn drop(&mut self) {
         if let Some(handle) = self.lifecycle_monitor.get_mut().ok().and_then(Option::take) {
@@ -448,33 +449,70 @@ impl Drop for BrowserPool {
         }
 
         if let Some(pid) = self.browser.get_process_id() {
-            kill_browser_process(pid);
+            kill_browser_process_tree(pid);
         }
     }
 }
 
-/// Send SIGKILL to a browser process this worker launched.
+/// SIGKILL the process this worker launched and every process below it.
 ///
-/// Safe against PID reuse: the process is our own child and is reaped only by headless_chrome's
-/// `Drop` (`Child::wait`), which cannot have run while this pool still held an `Arc<Browser>`. Until
-/// then an exited process stays a zombie that keeps its PID, so the PID still names that process.
-/// Chrome's child processes (renderers, GPU, NetworkService) exit when the main process is gone.
-fn kill_browser_process(pid: u32) {
-    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
-        return;
-    };
+/// The launched process is not necessarily the browser. On Linux `/usr/bin/brave-browser` is a
+/// bash wrapper that runs Brave *without* `exec` (`"$HERE/brave" "$@" || true`), so the PID
+/// headless_chrome reports is the shell's. Killing only that PID left the real browser — main
+/// process, zygotes, GPU, NetworkService, renderers — running for the pod's lifetime, reparented
+/// to the worker (production 2026-09-25: an `always_new` pod at 8 browsers and 1.4 GiB after 7
+/// replacements; measured in the worker image the same day). Killing Brave's main process does
+/// take its children down (they exit on their own once their IPC channel closes; the kernel does
+/// not do it), but the subtree is killed as a whole so that nothing depends on which process in
+/// it is the browser.
+///
+/// The subtree is read before anything is signalled: once the wrapper is gone its children are
+/// reparented and no longer found below it.
+///
+/// PID reuse: the launched process is our own child and is reaped only by headless_chrome's `Drop`
+/// (`Child::wait`), which cannot have run while this pool still held an `Arc<Browser>`, so its PID
+/// is stable. The descendants are not our children; one that exits between the `/proc` read and
+/// the signal could in principle hand its PID to a new process in that window of microseconds.
+fn kill_browser_process_tree(pid: u32) {
+    let descendants = crate::browser_resources::process_descendants(pid);
+    let failed = descendants
+        .iter()
+        .filter(|&&descendant| kill_process(descendant).is_err())
+        .count();
+    if failed > 0 {
+        warn!(
+            "Could not kill {} of {} process(es) below browser process {}",
+            failed,
+            descendants.len(),
+            pid
+        );
+    }
+    match kill_process(pid) {
+        Ok(()) => info!(
+            "Killed browser process {} and {} process(es) below it of the dropped browser pool",
+            pid,
+            descendants.len()
+        ),
+        Err(error) => warn!(
+            "Could not kill browser process {} of the dropped browser pool: {}",
+            pid, error
+        ),
+    }
+}
+
+/// SIGKILL one process. A process that is already gone (ESRCH) counts as killed.
+fn kill_process(pid: u32) -> std::io::Result<()> {
+    let pid_t = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     // SAFETY: kill(2) has no memory-safety preconditions.
     if unsafe { libc::kill(pid_t, libc::SIGKILL) } == 0 {
-        info!("Killed browser process {} of the dropped browser pool", pid);
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
     } else {
-        let error = std::io::Error::last_os_error();
-        // ESRCH: already gone (or already reaped) - the case the kill exists to make certain.
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            warn!(
-                "Could not kill browser process {} of the dropped browser pool: {}",
-                pid, error
-            );
-        }
+        Err(error)
     }
 }
 
@@ -683,6 +721,8 @@ impl BrowserPool {
 
         // Launch browser
         info!("Attempting to launch browser process...");
+        // Registered so that the worker's zombie sweep never reaps the process the crate owns.
+        let launch = crate::child_reaper::begin_launch();
         let browser = Browser::new(launch_options).map_err(|e| {
             tracing::error!(
                 "FATAL: Browser failed to launch. Error: {}. \
@@ -694,6 +734,7 @@ impl BrowserPool {
             );
             e
         })?;
+        launch.launched(browser.get_process_id());
         info!("Browser process launched successfully");
 
         // Only providers that route per context need the second CDP client, so no other scope
@@ -1056,6 +1097,9 @@ impl BrowserPool {
         let monitor = async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // Killed browsers of replaced pools leave zombies reparented to the worker.
+                let _ = tokio::task::spawn_blocking(crate::child_reaper::reap_orphan_zombies).await;
 
                 let mut contexts_guard = contexts.write().await;
 
@@ -1837,6 +1881,48 @@ mod tests {
             disable_back_forward_cache: false,
             close_tab_after_request: false,
         }
+    }
+
+    /// A dropped pool must leave no process of its browser behind, whatever the launched binary is.
+    ///
+    /// Launches a real browser, so it is ignored by default and meaningful on Linux only (`/proc`).
+    /// The case it exists for is Brave's Linux wrapper (`/usr/bin/brave-browser`), a bash script
+    /// that does not `exec`, so the launched PID is the shell's and the browser runs below it:
+    ///
+    /// ```text
+    /// WORKER_BROWSER_PATH=/usr/bin/brave-browser \
+    ///   cargo test -p browser-hive-worker -- --ignored dropped_pool_kills_the_whole_browser_process_tree
+    /// ```
+    #[tokio::test]
+    #[ignore = "launches a real browser; Linux only"]
+    async fn dropped_pool_kills_the_whole_browser_process_tree() {
+        let mut scope = scope_with_provider(
+            Box::new(crate::providers::NoProxyProvider),
+            ContextIsolation::Isolated,
+        );
+        scope.browser_path = std::env::var_os("WORKER_BROWSER_PATH").map(std::path::PathBuf::from);
+        scope.binary_params_middlewares =
+            vec![Box::new(browser_hive_common::DefaultBinaryParamsMiddleware)];
+
+        let pool = BrowserPool::new(scope).await.expect("browser must launch");
+        let launched = pool.browser.get_process_id().expect("launched process id");
+        let tree = crate::browser_resources::process_descendants(launched);
+        assert!(!tree.is_empty(), "the browser must have child processes");
+
+        drop(pool);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // A zombie has an empty command line and holds no memory; only live processes count.
+        let alive: Vec<u32> = tree
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty())
+            })
+            .collect();
+        assert!(
+            alive.is_empty(),
+            "processes of the dropped browser still running: {alive:?}"
+        );
     }
 
     /// Shared isolation runs every request in the browser's default context, which no CDP call

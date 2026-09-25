@@ -105,14 +105,7 @@ pub fn collect_processes() -> ProcessSnapshot {
 }
 
 fn collect_browser_processes() -> Option<HashMap<&'static str, ProcessGroup>> {
-    let parents: Vec<(u32, u32)> = std::fs::read_dir("/proc")
-        .ok()?
-        .filter_map(|entry| {
-            let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            Some((pid, parse_ppid(&stat)?))
-        })
-        .collect();
+    let parents = process_parents()?;
 
     let mut groups = HashMap::new();
     for pid in descendants(std::process::id(), &parents) {
@@ -137,12 +130,36 @@ fn collect_browser_processes() -> Option<HashMap<&'static str, ProcessGroup>> {
     Some(groups)
 }
 
+/// Every process in the container as `(pid, parent pid)`; `None` where there is no `/proc`.
+fn process_parents() -> Option<Vec<(u32, u32)>> {
+    let parents = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|entry| {
+            let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            Some((pid, parse_ppid(&stat)?))
+        })
+        .collect();
+    Some(parents)
+}
+
+/// Every process below `root`, `root` itself excluded; empty where there is no `/proc`.
+pub(crate) fn process_descendants(root: u32) -> Vec<u32> {
+    process_parents().map_or_else(Vec::new, |parents| descendants(root, &parents))
+}
+
 /// Parent pid from `/proc/<pid>/stat`. The command name in parentheses may itself contain spaces
 /// and parentheses, so fields are counted from the *last* `)`.
 fn parse_ppid(stat: &str) -> Option<u32> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    // After the name: state, then ppid.
-    rest.split_whitespace().nth(1)?.parse().ok()
+    parse_state_and_ppid(stat).map(|(_, ppid)| ppid)
+}
+
+/// Process state (`R`, `S`, `Z`, …) and parent pid from `/proc/<pid>/stat`, read after the last `)`
+/// for the same reason as [`parse_ppid`].
+pub(crate) fn parse_state_and_ppid(stat: &str) -> Option<(char, u32)> {
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    Some((state, fields.next()?.parse().ok()?))
 }
 
 /// Every pid below `root` in the process tree, `root` itself excluded.
