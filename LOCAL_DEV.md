@@ -195,6 +195,7 @@ Use `session_id` to reuse the same browser context in subsequent requests; `work
 - `5005` - Context creation failed (retry)
 - `5006` - Terminating: the pod is shutting down (retry)
 - `5007` - Proxy/tunnel failure (retry)
+- `5009` - Selector not found on a page that did not finish loading (retry; replaces 4042)
 
 Rule of thumb: **every `5xxx` is retryable**; in `4xxx` only `4002`, `4004` and `4041` are.
 

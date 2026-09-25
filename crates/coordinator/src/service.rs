@@ -1228,6 +1228,7 @@ mod tests {
             CoordCode::NetworkError as i32,
             CoordCode::ContextCreationFailed as i32,
             CoordCode::ProxyError as i32,
+            CoordCode::PageLoadIncomplete as i32,
             CoordCode::SessionNotFound as i32,
             WorkerCode::SessionBusy as i32,
             CoordCode::SelectorNotFound as i32,

@@ -5,6 +5,7 @@ mod cdp_call;
 mod diagnostics;
 mod launch_args;
 mod metrics;
+mod page_load;
 mod service;
 mod shutdown;
 mod third_party;

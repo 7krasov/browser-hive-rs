@@ -159,6 +159,7 @@ These indicate issues with the worker/browser infrastructure.
 | `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | CDP refused to create a browser context — a **real malfunction**, not a full pool (that is 5008, mapped to 5001) | ✅ Yes |
 | `ERROR_CODE_TERMINATING` | 5006 | Worker/Coordinator is shutting down gracefully | ✅ Yes - retry immediately or route to another instance |
 | `ERROR_CODE_PROXY_ERROR` | 5007 | The proxy path failed: a refused/failed `CONNECT`, an unreachable proxy, or a proxy auth problem. Says nothing about the target site | ✅ Yes - a retry draws a different exit IP |
+| `ERROR_CODE_PAGE_LOAD_INCOMPLETE` | 5009 | The wait selector was not found **and** the page never finished loading (a script/stylesheet failed, was blocked or stalled; the HTML was cut short). Replaces 4042 — see below | ✅ Yes - a retry goes through another context |
 | `ERROR_CODE_CAPACITY_EXHAUSTED` | 5008 | Every slot of the chosen worker was taken. **Internal only** — the coordinator retries it on another pod or maps it to 5001; a client never sees it | — |
 
 #### HTTP 403 and 429 are reported through `status_code`, not an error code
@@ -210,6 +211,68 @@ only trace that a page was served through two different exit IPs.
 ⚠️ **Metrics impact**: `browser_hive_worker_requests_failed` counts 5xxx codes, so cases that
 used to be silent 4042s now count as failures. An increase after deploying this is the metric
 becoming honest, not a regression.
+
+#### When 5009 is returned
+
+`SELECTOR_NOT_FOUND` (4042) is final for a client — the page loaded and the element is not on it,
+so a retry would find the same page. That is false when the page never finished loading: a script
+bundle stuck on a dead connection or refused by a CDN leaves an unfilled template, and a retry
+through another context usually renders it. 5009 separates the two.
+
+**Only a 4042 is ever replaced**, and the markers are judged only at that point: every other
+outcome (success, 4041, 4043, 4050, 5007) ignores them. The worker's `Network` listener, already
+enabled for the response observer, merely records the loads while the page is loading
+(`worker/src/page_load.rs`); no CDP call is added. `PROXY_ERROR` (5007) takes precedence, being the
+more specific cause.
+
+Any one marker is enough:
+
+| # | Marker | Resource types | Hosts |
+|---|---|---|---|
+| C1 | failed with a transport error (`ERR_TIMED_OUT`, `ERR_CONNECTION_TIMED_OUT/RESET/CLOSED/ABORTED`, `ERR_EMPTY_RESPONSE`, `ERR_HTTP2_*`, `ERR_QUIC_PROTOCOL_ERROR`, `ERR_INCOMPLETE_CHUNKED_ENCODING`, `ERR_CONTENT_LENGTH_MISMATCH`) | Script, Stylesheet | any |
+| | | XHR, Fetch | same site as the requested page only |
+| C2 | blocked by CORS (`corsErrorStatus` set) or `ERR_BLOCKED_BY_ORB` / `ERR_BLOCKED_BY_RESPONSE` — what a CDN block page served in place of an asset becomes | as C1 | as C1 |
+| C3 | answered HTTP 403 or 429 | as C1 | as C1 |
+| C4 | still pending ≥ 10 s (`STALLED_AFTER`) when the request gives up | Script, Stylesheet | any |
+| C5 | the main document itself still loading (the HTML was cut short) | Document | — |
+
+Deliberately **not** markers:
+- HTTP 404 and 5xx — a 404 is usually the site's own permanent bug; 5xx was left out by decision;
+- JS exceptions and console errors, which most sites throw constantly;
+- images, fonts, media, beacons and other types, which cannot hide a DOM element;
+- `ERR_ABORTED` (the page cancelled the load itself) and `blockedReason: inspector` (our own
+  block lists);
+- pending XHR/fetch — long-polling looks exactly like a stall;
+- "network never went idle" or `readyState` alone — trackers and chat widgets keep both busy.
+
+Why those choices:
+- **Scripts and stylesheets count from any host** because bundles are often served from a CDN on
+  another domain; XHR/fetch only same-site because third-party ones are mostly analytics, which fail
+  all the time.
+- **10 s for C4** is not measured. The verdict comes ≥ ~40 s after navigation and rendering scripts
+  are requested early, so a stalled one is far older; the bound only spares scripts requested in the
+  last seconds (lazy widgets) and slow-but-alive loads through a slow proxy (a main document was seen
+  taking 10 s). The age of every pending load is in the message, so tune it from logs. A CPU-starved
+  pod (1 CPU, 2 contexts) mostly delays when a script is *requested*, not how long its load takes,
+  which the network service carries.
+
+`error_message` keeps the 4042 text and appends the markers, oldest first, at most five:
+`Wait selector '…' was not found within timeout — page load incomplete: Script pending 28s
+https://cdn.example.net/app.js; Stylesheet HTTP 403 https://static.example.com/a.css (+2 more)`.
+Query strings are dropped from the URLs.
+
+Accepted risks (decided 2026-09-25):
+- a site with a permanently broken script turns each of its 4042s into a 5009, which the client
+  retries for nothing;
+- a third-party script (a tag manager, say) failing with a transport error yields 5009 even if the
+  page did not need it;
+- loads inside a cross-site iframe are invisible to the page's session, so content rendered there
+  stays 4042.
+
+⚠️ `WORKER_DIAGNOSTICS_ERROR_CODES` filters on the **final** code: a scope set to `4042,4041` stops
+emitting diagnostics for the requests that become 5009 — add `5009` to keep them. The metric
+`browser_hive_worker_requests_failed` counts 5009 (it is 5xxx), so it rises by what used to be
+silent 4042s.
 
 ### Unknown Errors (9xxx)
 
@@ -674,6 +737,7 @@ split above exists to restore.
 | `CONTEXT_CREATION_FAILED` (5005) | short | a real CDP refusal; if it repeats on one scope, look at the worker logs |
 | `TERMINATING` (5006) | **none, retry at once** | the coordinator already tried up to 3 pods; reaching the client means < 10 s of the deadline was left |
 | `PROXY_ERROR` (5007) | none on the first retry, then back off | a retry draws a different exit IP; repeated failures mean a whole provider zone is down |
+| `PAGE_LOAD_INCOMPLETE` (5009) | short | the page did not finish loading; a retry gets another context. The same URL failing this way every time points at the site (see "When 5009 is returned") |
 
 **4xxx — retryable only here**:
 

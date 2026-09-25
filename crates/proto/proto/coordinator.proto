@@ -22,6 +22,10 @@ enum ErrorCode {
   ERROR_CODE_CONTEXT_CREATION_FAILED = 5005; // Failed to create browser context (CDP refused) - a real malfunction
   ERROR_CODE_TERMINATING = 5006;             // Worker/Coordinator is terminating (graceful shutdown), retry later
   ERROR_CODE_PROXY_ERROR = 5007;             // Proxy/tunnel failure (dead peer, refused CONNECT) - retryable
+  // The selector was not found, but the page never finished loading: a script/stylesheet or
+  // same-site XHR failed, was blocked or stalled, or the HTML was cut short. Replaces
+  // SELECTOR_NOT_FOUND (4042) only - retryable, unlike 4042.
+  ERROR_CODE_PAGE_LOAD_INCOMPLETE = 5009;
 
   ERROR_CODE_INVALID_URL = 4001;            // Invalid URL provided
   ERROR_CODE_SESSION_NOT_FOUND = 4002;      // Session ID not found

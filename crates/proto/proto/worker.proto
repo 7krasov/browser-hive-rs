@@ -25,6 +25,10 @@ enum ErrorCode {
   // another pod or maps it to ERROR_CODE_NO_WORKERS_AVAILABLE (5001), which is why this code
   // has no counterpart in coordinator.proto and never reaches a client.
   ERROR_CODE_CAPACITY_EXHAUSTED = 5008;
+  // The selector was not found, but the page never finished loading: a script/stylesheet or
+  // same-site XHR failed, was blocked or stalled, or the HTML was cut short. Replaces
+  // SELECTOR_NOT_FOUND (4042) only - retryable, unlike 4042.
+  ERROR_CODE_PAGE_LOAD_INCOMPLETE = 5009;
 
   ERROR_CODE_INVALID_URL = 4001;             // Invalid URL provided
   ERROR_CODE_SESSION_NOT_FOUND = 4002;       // Session ID not found

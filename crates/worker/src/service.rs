@@ -145,6 +145,29 @@ impl ProxyFailures {
     }
 }
 
+/// The error message for a `SELECTOR_NOT_FOUND` whose page shows markers of an incomplete load
+/// (see `page_load.rs`), or `None` when it looks fully loaded and the 4042 stands.
+fn page_load_incomplete(
+    tracker: &std::sync::Mutex<crate::page_load::PageLoadTracker>,
+    selector_message: &str,
+) -> Option<String> {
+    let (listed, total) = tracker.lock().ok()?.verdict();
+    if total == 0 {
+        return None;
+    }
+    let more = if total > listed.len() {
+        format!(" (+{} more)", total - listed.len())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} — page load incomplete: {}{}",
+        selector_message,
+        listed.join("; "),
+        more
+    ))
+}
+
 /// Detect a redirect that landed on a **different registrable domain** (eTLD+1) than the one
 /// requested. Returns `Some(final_registrable_domain)` for an off-domain redirect, or `None`
 /// when it is the same site (e.g. `www.example.com` → `shop.example.com`) or when either
@@ -1474,6 +1497,11 @@ impl WorkerService {
         let third_party_loads = Arc::new(std::sync::Mutex::new(
             self.metrics.third_party.request_loads(requested_site),
         ));
+        // Evidence that the page never finished loading, read only if the request ends as
+        // SELECTOR_NOT_FOUND (see `page_load.rs`).
+        let page_load = Arc::new(std::sync::Mutex::new(
+            crate::page_load::PageLoadTracker::new(&req.url),
+        ));
         let _header_capture_guard: Option<EventListenerGuard> = {
             use headless_chrome::protocol::cdp::types::Event;
             use headless_chrome::protocol::cdp::Network;
@@ -1512,6 +1540,7 @@ impl WorkerService {
                     let blocked_counter = blocked_url_counter.clone();
                     let loads = third_party_loads.clone();
                     let blocked_types = self.blocked_resource_types.clone();
+                    let page_load = page_load.clone();
                     let listener: Arc<
                         dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync,
                     > = Arc::new(move |event: &Event| {
@@ -1523,10 +1552,23 @@ impl WorkerService {
                                     matches!(ev.params.Type, Some(Network::ResourceType::Document)),
                                 );
                             }
+                            if let Ok(mut page_load) = page_load.lock() {
+                                page_load.will_be_sent(
+                                    &ev.params.request_id,
+                                    &ev.params.request.url,
+                                    ev.params.Type.as_ref(),
+                                    matches!(ev.params.Type, Some(Network::ResourceType::Document))
+                                        && ev.params.frame_id.as_deref()
+                                            == Some(main_frame_id.as_str()),
+                                );
+                            }
                         }
                         if let Event::NetworkLoadingFinished(ev) = event {
                             if let Ok(mut loads) = loads.lock() {
                                 loads.finished(&ev.params.request_id);
+                            }
+                            if let Ok(mut page_load) = page_load.lock() {
+                                page_load.finished(&ev.params.request_id);
                             }
                         }
                         if let Event::NetworkLoadingFailed(ev) = event {
@@ -1561,8 +1603,21 @@ impl WorkerService {
                                 }
                                 loads.failed(&ev.params.request_id, blocked_by_list);
                             }
+                            if let Ok(mut page_load) = page_load.lock() {
+                                page_load.failed(
+                                    &ev.params.request_id,
+                                    &ev.params.error_text,
+                                    ev.params.canceled.unwrap_or(false),
+                                    ev.params.blocked_reason.as_ref(),
+                                    ev.params.cors_error_status.is_some(),
+                                );
+                            }
                         }
                         if let Event::NetworkResponseReceived(ev) = event {
+                            if let Ok(mut page_load) = page_load.lock() {
+                                page_load
+                                    .response(&ev.params.request_id, ev.params.response.status);
+                            }
                             // Only the top-level document response (main frame == target id).
                             if matches!(ev.params.Type, Network::ResourceType::Document)
                                 && ev.params.frame_id.as_deref() == Some(main_frame_id.as_str())
@@ -2192,6 +2247,19 @@ impl WorkerService {
                 ),
                 ErrorCode::ProxyError,
             )
+        } else {
+            (error_message, error_code)
+        };
+
+        // A selector missing from a page that never finished loading says nothing about the site:
+        // a retry through another context usually renders it. Only SELECTOR_NOT_FOUND is
+        // reconsidered, and only here — every other outcome drops the tracker unread. Runs after
+        // the proxy check, so PROXY_ERROR (the more specific cause) wins.
+        let (error_message, error_code) = if error_code == ErrorCode::SelectorNotFound {
+            match page_load_incomplete(&page_load, &error_message) {
+                Some(message) => (message, ErrorCode::PageLoadIncomplete),
+                None => (error_message, error_code),
+            }
         } else {
             (error_message, error_code)
         };

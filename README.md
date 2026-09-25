@@ -275,6 +275,7 @@ Every response includes:
 | `ERROR_CODE_CONTEXT_CREATION_FAILED` | 5005 | The browser could not create a context | Retry |
 | `ERROR_CODE_TERMINATING` | 5006 | The pod is shutting down (the coordinator already retried) | Retry |
 | `ERROR_CODE_PROXY_ERROR` | 5007 | Proxy/tunnel failure | Retry |
+| `ERROR_CODE_PAGE_LOAD_INCOMPLETE` | 5009 | Selector not found on a page that never finished loading (replaces 4042) | Retry |
 
 **The rule**: every `5xxx` code is retryable; in the `4xxx` range only `4002` (retry without the
 session), `4004` (retry the same session) and `4041` are. A 403 or 429 arrives as `success = true`

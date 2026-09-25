@@ -100,7 +100,7 @@ fn registrable_domain(host: &str) -> &str {
 }
 
 /// Whether two hosts belong to different sites, i.e. their registrable domains differ.
-fn is_cross_site(page_host: &str, other_host: &str) -> bool {
+pub fn is_cross_site(page_host: &str, other_host: &str) -> bool {
     registrable_domain(page_host) != registrable_domain(other_host)
 }
 
