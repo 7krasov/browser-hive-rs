@@ -316,12 +316,14 @@ struct ContextBusyGuard {
 }
 
 impl ContextBusyGuard {
-    /// Adopt a context that was already marked busy at creation time (AlwaysNew mode).
+    /// Adopt a context the pool already marked busy when it handed it out.
     ///
-    /// AlwaysNew contexts are pre-marked busy inside `create_always_new_context` while the
-    /// pool write lock is held, so that leak reclamation can never collect a context that
-    /// was handed out but has not started processing yet. The flag is already set here —
-    /// this guard only takes over clearing it on drop.
+    /// Every acquisition path claims its context under the pool lock: a new context is
+    /// pre-marked busy before it becomes visible (so AlwaysNew leak reclamation can never
+    /// collect a context that was handed out but has not started processing yet), and an
+    /// existing one is claimed by compare-and-swap during selection (so two Reusable requests
+    /// can never both take it). The flag is already set here — this guard only takes over
+    /// clearing it on drop.
     fn adopt(context: &Arc<BrowserContext>) -> Self {
         Self {
             is_busy: context.metadata.is_busy.clone(),
@@ -953,20 +955,23 @@ impl WorkerService {
         }
     }
 
+    /// `claimed`: the context came from `acquire_context`, which hands it out already marked
+    /// busy, so the guard adopts the flag. `false` only for a session continuation, whose
+    /// context is looked up by id and claimed here.
     async fn scrape_page_internal(
         &self,
         req: &ScrapePageRequest,
         context: Arc<BrowserContext>,
+        claimed: bool,
         ray_id: &str,
     ) -> Result<ScrapePageResponse, Status> {
         let start_time = Instant::now();
 
-        // Set context as busy (RAII guard will clear on drop).
-        // In AlwaysNew mode the context was already marked busy at creation (see
-        // BrowserPool::create_always_new_context), so the guard adopts the flag instead of
-        // setting it — otherwise the compare-and-swap would fail on a perfectly valid context.
-        let is_always_new = self.config.scope.session_mode == SessionMode::AlwaysNew;
-        let busy_guard_result = if is_always_new {
+        // Set context as busy (RAII guard will clear on drop). A context from the pool's
+        // acquisition methods is already busy - claimed there, under the pool lock, so that two
+        // requests can never select the same one - and the guard adopts the flag instead of
+        // setting it; the compare-and-swap would fail on a perfectly valid context.
+        let busy_guard_result = if claimed {
             Ok(ContextBusyGuard::adopt(&context))
         } else {
             ContextBusyGuard::new(&context)
@@ -2479,7 +2484,13 @@ impl WorkerServiceTrait for WorkerService {
             // down with `SESSION_BUSY`, which in this mode is an honest statement about the
             // client's own traffic.
             info!("Looking for existing context: {}", req.context_id);
-            match browser_pool_guard.find_context_by_id(&req.context_id).await {
+            let found = match browser_pool_guard.find_context_by_id(&req.context_id).await {
+                // A session whose context has used up max_lifetime/max_requests ends here rather
+                // than at the monitor's next idle tick, which a busy session never reaches.
+                Some(ctx) if browser_pool_guard.end_session_if_used_up(&ctx).await => None,
+                found => found,
+            };
+            match found {
                 Some(ctx) => ctx,
                 None => {
                     let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -2536,7 +2547,9 @@ impl WorkerServiceTrait for WorkerService {
         // Execute scraping
         // NOTE: In AlwaysNew mode, context is destroyed inside scrape_page_internal
         // immediately after getting content (before diagnostics) for faster slot release
-        let mut result = self.scrape_page_internal(&req, context, &ray_id).await;
+        let mut result = self
+            .scrape_page_internal(&req, context, !should_use_existing_context, &ray_id)
+            .await;
 
         // The browser process died mid-request and the pool was replaced, so the context that
         // attempt held belonged to a dead process: retry the whole thing once against the new
@@ -2572,7 +2585,7 @@ impl WorkerServiceTrait for WorkerService {
                     always_new_guard =
                         self.always_new_guard_for(is_always_new, &fresh_context, &ray_id);
                     result = self
-                        .scrape_page_internal(&req, fresh_context, &ray_id)
+                        .scrape_page_internal(&req, fresh_context, true, &ray_id)
                         .await;
                 }
                 Err(response) => {

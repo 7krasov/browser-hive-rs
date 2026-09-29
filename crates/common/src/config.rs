@@ -469,6 +469,29 @@ impl Default for ContextLifecycleConfig {
     }
 }
 
+impl ContextLifecycleConfig {
+    /// Whether a context of this age and request count must not be handed another request.
+    ///
+    /// The two thresholds that bound a context's *use*, as opposed to its idleness: they are
+    /// checked when a context is selected for a request, not only by the lifecycle monitor, which
+    /// sees a context only when it happens to be idle at a tick — under sustained load that is
+    /// never, and the context's age was unbounded. Idle time and cache size are deliberately not
+    /// here: a context selected for a request is by definition no longer idle, and the cache size
+    /// is never measured.
+    ///
+    /// `requests >= max_requests`: the context has served its quota, so it serves exactly
+    /// `max_requests` requests.
+    pub fn is_used_up(&self, age: Duration, requests: u64) -> bool {
+        let too_old = age > self.max_lifetime;
+        let too_many = requests >= self.max_requests;
+        match self.rotation_strategy {
+            RotationStrategy::TimeBasedOnly => too_old,
+            RotationStrategy::RequestBasedOnly => too_many,
+            RotationStrategy::Hybrid => too_old || too_many,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RotationStrategy {
     TimeBasedOnly,
@@ -840,6 +863,44 @@ fn host_matches(host: &str, domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lifecycle(strategy: RotationStrategy) -> ContextLifecycleConfig {
+        ContextLifecycleConfig {
+            max_lifetime: Duration::from_secs(60),
+            max_requests: 10,
+            rotation_strategy: strategy,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_context_is_used_up_at_exactly_max_requests() {
+        let config = lifecycle(RotationStrategy::Hybrid);
+        let young = Duration::from_secs(1);
+        assert!(!config.is_used_up(young, 9));
+        assert!(config.is_used_up(young, 10));
+    }
+
+    #[test]
+    fn a_context_is_used_up_past_max_lifetime() {
+        let config = lifecycle(RotationStrategy::Hybrid);
+        assert!(!config.is_used_up(Duration::from_secs(60), 0));
+        assert!(config.is_used_up(Duration::from_secs(61), 0));
+    }
+
+    #[test]
+    fn used_up_follows_the_rotation_strategy() {
+        let old = Duration::from_secs(61);
+        let young = Duration::from_secs(1);
+
+        let time_only = lifecycle(RotationStrategy::TimeBasedOnly);
+        assert!(time_only.is_used_up(old, 0));
+        assert!(!time_only.is_used_up(young, 1_000));
+
+        let requests_only = lifecycle(RotationStrategy::RequestBasedOnly);
+        assert!(requests_only.is_used_up(young, 10));
+        assert!(!requests_only.is_used_up(old, 0));
+    }
 
     #[test]
     fn test_host_matches_on_label_boundary() {

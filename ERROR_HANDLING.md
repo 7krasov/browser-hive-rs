@@ -334,7 +334,9 @@ Session expired or worker unavailable. Please retry without session_id
 Context not found or expired: <context_id>
 ```
   the worker was reached and no longer has that context (`worker/src/service.rs`). A client
-  talking to the coordinator normally sees one of the first two
+  talking to the coordinator normally sees one of the first two. The same message ends a
+  `dedicated` session whose context has used up `max_lifetime` or `max_requests`: the worker
+  removes the context when the session's next request arrives, instead of letting it serve on
 
 **SESSION_BUSY**:
 ```

@@ -88,47 +88,129 @@ fn reclaim_leaked_always_new_contexts(
     leaked
 }
 
-/// Choose the idle context with the lowest request count, or `None` if all are busy.
+/// Whether a context has used up its lifetime or its request quota and must not take another
+/// request. See `ContextLifecycleConfig::is_used_up`.
+fn is_used_up(context: &BrowserContext, lifecycle: &ContextLifecycleConfig) -> bool {
+    lifecycle.is_used_up(
+        context.metadata.created_at.elapsed(),
+        context.metadata.total_requests.load(Ordering::SeqCst),
+    )
+}
+
+/// Mark a context busy if it is idle. The only way a request takes an existing context, so two
+/// requests (or a request and the lifecycle monitor) can never both win the same one.
+fn try_claim(context: &BrowserContext) -> bool {
+    context
+        .metadata
+        .is_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// Idle, not used up, and not quarantined for `origin`, least-used first.
 ///
-/// Free function rather than a method so both lookups — the optimistic one under the read lock
-/// and the double-check under the write lock — select identically. Ties keep the earlier
-/// context, which only matters for a pool that has just started and where every count is 0.
+/// Ties keep the earlier context (a stable sort), which only matters for a pool that has just
+/// started and where every count is 0.
 ///
 /// `origin` is the registrable domain the request is for. A context this origin has recently
 /// refused (403/429) is skipped **for that origin only** — it stays fully eligible for every
 /// other site, because a block belongs to the pair (exit IP, origin), not to the context. Pass
 /// `None` to ignore quarantines (the caller has no origin, or the feature is off).
-fn select_least_used_idle(
-    contexts: &[Arc<BrowserContext>],
+fn least_used_candidates<'a>(
+    contexts: &'a [Arc<BrowserContext>],
     origin: Option<&str>,
-) -> Option<Arc<BrowserContext>> {
-    contexts
+    lifecycle: &ContextLifecycleConfig,
+) -> Vec<&'a Arc<BrowserContext>> {
+    let mut candidates: Vec<_> = contexts
         .iter()
         .filter(|c| !c.metadata.is_busy.load(Ordering::SeqCst))
+        .filter(|c| !is_used_up(c, lifecycle))
         .filter(|c| match origin {
             Some(origin) => c.metadata.quarantined_until(origin).is_none(),
             None => true,
         })
-        .min_by_key(|c| c.metadata.total_requests.load(Ordering::SeqCst))
+        .collect();
+    candidates.sort_by_key(|c| c.metadata.total_requests.load(Ordering::SeqCst));
+    candidates
+}
+
+/// The idle context with the lowest request count, without claiming it (a read-only query).
+fn select_least_used_idle(
+    contexts: &[Arc<BrowserContext>],
+    origin: Option<&str>,
+    lifecycle: &ContextLifecycleConfig,
+) -> Option<Arc<BrowserContext>> {
+    least_used_candidates(contexts, origin, lifecycle)
+        .first()
+        .map(|c| Arc::clone(c))
+}
+
+/// Claim the idle context with the lowest request count, or `None` if none is eligible.
+///
+/// The context is returned **already marked busy**. Selection used to return it idle and leave
+/// the claim to the request handler, so two concurrent requests could select the same context
+/// and the loser was answered `SESSION_BUSY` in a mode that has no sessions. A candidate lost to
+/// a concurrent claim is skipped for the next one.
+///
+/// Free function rather than a method so both lookups — the optimistic one under the read lock
+/// and the double-check under the write lock — select identically.
+fn claim_least_used_idle(
+    contexts: &[Arc<BrowserContext>],
+    origin: Option<&str>,
+    lifecycle: &ContextLifecycleConfig,
+) -> Option<Arc<BrowserContext>> {
+    least_used_candidates(contexts, origin, lifecycle)
+        .into_iter()
+        .find(|c| try_claim(c))
         .cloned()
 }
 
-/// Of the idle contexts quarantined for `origin`, the one whose quarantine ends soonest.
+/// Of the idle contexts quarantined for `origin`, claim the one whose quarantine ends soonest.
 ///
 /// The last resort when the pool is at `max_contexts` and every idle context is quarantined for
 /// this origin. Serving the request from a refused context is a poor outcome, but it is the
 /// outcome the caller already gets today, whereas failing the request would be a new one — the
 /// client is answered with the origin's own status either way and decides what it means.
-fn select_soonest_unquarantined(
+/// Used-up contexts are not candidates: the caller replaces one of those first.
+fn claim_soonest_unquarantined(
     contexts: &[Arc<BrowserContext>],
     origin: &str,
+    lifecycle: &ContextLifecycleConfig,
 ) -> Option<(Arc<BrowserContext>, Instant)> {
-    contexts
+    let mut candidates: Vec<_> = contexts
         .iter()
         .filter(|c| !c.metadata.is_busy.load(Ordering::SeqCst))
+        .filter(|c| !is_used_up(c, lifecycle))
         .filter_map(|c| c.metadata.quarantined_until(origin).map(|until| (c, until)))
-        .min_by_key(|(_, until)| *until)
+        .collect();
+    candidates.sort_by_key(|(_, until)| *until);
+    candidates
+        .into_iter()
+        .find(|(c, _)| try_claim(c))
         .map(|(c, until)| (c.clone(), until))
+}
+
+/// Claim one idle, used-up context and remove it from the pool, so its slot can go to a fresh
+/// one. The oldest goes first.
+///
+/// Called under the pool's write lock when the pool is at `max_contexts` and nothing eligible is
+/// idle. Leaving the used-up context to the lifecycle monitor would refuse the request for up to
+/// a tick although the slot is, in effect, free. The claim keeps a request that selected the
+/// context a moment earlier from taking it; the caller must release the returned context once
+/// the lock is dropped — removing it from the `Vec` frees nothing in Chrome.
+fn take_used_up_idle(
+    contexts: &mut Vec<Arc<BrowserContext>>,
+    lifecycle: &ContextLifecycleConfig,
+) -> Option<Arc<BrowserContext>> {
+    let mut candidates: Vec<_> = contexts
+        .iter()
+        .filter(|c| !c.metadata.is_busy.load(Ordering::SeqCst) && is_used_up(c, lifecycle))
+        .cloned()
+        .collect();
+    candidates.sort_by_key(|c| c.metadata.created_at);
+    let taken = candidates.into_iter().find(|c| try_claim(c))?;
+    contexts.retain(|c| !Arc::ptr_eq(c, &taken));
+    Some(taken)
 }
 
 /// The browser-level handle a removed context is disposed through: the disposal client and the
@@ -1180,11 +1262,7 @@ impl BrowserPool {
                 let mut claimed = Vec::new();
                 for context in contexts_guard.iter() {
                     if Self::should_recycle_context(context, &lifecycle_config).await
-                        && context
-                            .metadata
-                            .is_busy
-                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
+                        && try_claim(context)
                     {
                         claimed.push(context.clone());
                     }
@@ -1300,23 +1378,18 @@ impl BrowserPool {
         context: &BrowserContext,
         config: &ContextLifecycleConfig,
     ) -> bool {
+        if is_used_up(context, config) {
+            return true;
+        }
         match config.rotation_strategy {
-            RotationStrategy::TimeBasedOnly => {
-                context.metadata.created_at.elapsed() > config.max_lifetime
-            }
-            RotationStrategy::RequestBasedOnly => {
-                context.metadata.total_requests.load(Ordering::SeqCst) > config.max_requests
-            }
+            RotationStrategy::TimeBasedOnly | RotationStrategy::RequestBasedOnly => false,
             RotationStrategy::Hybrid => {
-                let age_exceeded = context.metadata.created_at.elapsed() > config.max_lifetime;
-                let requests_exceeded =
-                    context.metadata.total_requests.load(Ordering::SeqCst) > config.max_requests;
                 let idle_too_long =
                     context.metadata.last_used_at.lock().await.elapsed() > config.max_idle_time;
                 let cache_too_large = context.metadata.cache_size_mb.load(Ordering::SeqCst)
                     > config.max_cache_size_mb;
 
-                age_exceeded || requests_exceeded || idle_too_long || cache_too_large
+                idle_too_long || cache_too_large
             }
         }
     }
@@ -1331,6 +1404,40 @@ impl BrowserPool {
             .cloned()
     }
 
+    /// End a session whose context has used up its lifetime or request quota (Dedicated mode).
+    ///
+    /// Returns `true` when the context was removed from the pool, in which case the request must
+    /// be answered as if the session did not exist (`SESSION_NOT_FOUND`), so the client starts a
+    /// new one. The lifecycle monitor removes such a context too, but only when it is idle at a
+    /// tick — a session kept busy by its client never was, so its age was unbounded.
+    ///
+    /// `false` when the context is not used up, is gone already, or is busy: a busy session is
+    /// its own previous request still running, which the caller answers `SESSION_BUSY` as
+    /// before; the next request after it ends the session.
+    pub async fn end_session_if_used_up(&self, context: &Arc<BrowserContext>) -> bool {
+        if !is_used_up(context, &self.lifecycle_config) {
+            return false;
+        }
+        {
+            let mut contexts = self.contexts.write().await;
+            let Some(idx) = contexts.iter().position(|c| Arc::ptr_eq(c, context)) else {
+                return false;
+            };
+            if !try_claim(context) {
+                return false;
+            }
+            contexts.remove(idx);
+        }
+        info!(
+            "Ended dedicated session {} - context used up (age: {:?}, requests: {})",
+            context.metadata.id,
+            context.metadata.created_at.elapsed(),
+            context.metadata.total_requests.load(Ordering::SeqCst)
+        );
+        release_context(context, self.context_disposer.as_ref()).await;
+        true
+    }
+
     /// Pick the idle context that has served the fewest requests.
     ///
     /// "Least busy" used to mean "the first one that is not busy", which is a different thing:
@@ -1339,17 +1446,27 @@ impl BrowserPool {
     /// requests on the first exit IP — the opposite of why a pool of addresses is bought.
     pub async fn find_least_busy_context(&self) -> Option<Arc<BrowserContext>> {
         let contexts = self.contexts.read().await;
-        select_least_used_idle(&contexts, None)
+        select_least_used_idle(&contexts, None, &self.lifecycle_config)
     }
 
     /// Get or create a new context on-demand.
     ///
     /// This method is used in on-demand mode to create contexts when needed.
     /// It will:
-    /// 1. Try to find an idle existing context that this origin has not just refused
+    /// 1. Try to find an idle existing context that is not used up (`max_lifetime`,
+    ///    `max_requests`) and that this origin has not just refused
     /// 2. If none found and under max_contexts limit, create a new one
-    /// 3. If at max_contexts limit, fall back to a quarantined idle context, or return None
-    ///    (resource exhausted) when every context is busy
+    /// 3. If at max_contexts limit, replace an idle used-up context with a new one
+    /// 4. Otherwise fall back to a quarantined idle context, or return None (resource
+    ///    exhausted) when every context is busy
+    ///
+    /// The returned context is **already marked busy**; the caller adopts the flag
+    /// (`ContextBusyGuard::adopt`) and must not try to set it again.
+    ///
+    /// Step 3 is what bounds a context's age by `max_lifetime` plus one request. The lifecycle
+    /// monitor replaces a used-up context only if it is idle at a tick, so under sustained load
+    /// it never did, and a context skipped in step 1 but left in the pool would refuse requests
+    /// until the next tick although its slot is, in effect, free.
     ///
     /// # Parameters
     /// * `proxy_params` - Proxy parameters (country_code, etc.) for context creation
@@ -1365,11 +1482,12 @@ impl BrowserPool {
         // If request has proxy routing overrides (e.g. country_code), we must create
         // a dedicated context because these params affect the proxy connection identity
         // (exit IP, geo) and can't be changed on an existing context.
+        let lifecycle = &self.lifecycle_config;
         if !proxy_params.requires_dedicated_context() {
             // No routing overrides - try to reuse an idle context this origin has not refused
             let reusable = {
                 let contexts = self.contexts.read().await;
-                select_least_used_idle(&contexts, origin)
+                claim_least_used_idle(&contexts, origin, lifecycle)
             };
             if let Some(context) = reusable {
                 info!(
@@ -1390,11 +1508,11 @@ impl BrowserPool {
         }
 
         // No idle context available (or dedicated context required) - try to create a new one
-        let contexts = self.contexts.write().await;
+        let mut contexts = self.contexts.write().await;
 
         if !proxy_params.requires_dedicated_context() {
-            // Double-check after acquiring write lock (another task might have created one)
-            if let Some(context) = select_least_used_idle(&contexts, origin) {
+            // Double-check after acquiring write lock (another task might have released one)
+            if let Some(context) = claim_least_used_idle(&contexts, origin, lifecycle) {
                 return Ok(Some(context));
             }
         }
@@ -1416,7 +1534,31 @@ impl BrowserPool {
             let reservation = SlotReservation::take(&self.pending_creations);
             drop(contexts);
             return self
-                .build_reserved_context(reservation, proxy_params, false)
+                .build_reserved_context(reservation, proxy_params)
+                .await
+                .map(Some);
+        }
+
+        // At maximum capacity, but an idle context that is used up holds a slot it can no longer
+        // serve from: hand the slot to a fresh context. Removal and reservation happen in one
+        // critical section, so `len + pending` stays at the limit and no other request can take
+        // the slot in between; the old context is released and the new one built with the lock
+        // dropped, as on every other creation path.
+        if let Some(used_up) = take_used_up_idle(&mut contexts, lifecycle) {
+            info!(
+                "Replacing used-up context {} (age: {:?}, requests: {}) on demand ({}/{})",
+                used_up.metadata.id,
+                used_up.metadata.created_at.elapsed(),
+                used_up.metadata.total_requests.load(Ordering::SeqCst),
+                occupied,
+                self.scope_config.max_contexts
+            );
+            let reservation = SlotReservation::take(&self.pending_creations);
+            drop(contexts);
+            release_context(&used_up, self.context_disposer.as_ref()).await;
+            self.total_contexts_recycled.fetch_add(1, Ordering::SeqCst);
+            return self
+                .build_reserved_context(reservation, proxy_params)
                 .await
                 .map(Some);
         }
@@ -1426,7 +1568,9 @@ impl BrowserPool {
         // the pool has nothing better to offer, and the alternative — refusing the request — would
         // report a capacity problem the scope does not have.
         if let Some(origin) = origin.filter(|_| !proxy_params.requires_dedicated_context()) {
-            if let Some((context, until)) = select_soonest_unquarantined(&contexts, origin) {
+            if let Some((context, until)) =
+                claim_soonest_unquarantined(&contexts, origin, lifecycle)
+            {
                 warn!(
                     "All {} contexts are quarantined for {} - reusing context {} anyway \
                      (quarantine ends in {:?}); the pool is at max_contexts, so no fresh exit IP \
@@ -1459,18 +1603,17 @@ impl BrowserPool {
     /// with it. The reservation keeps the slot counted meanwhile and is released under the same
     /// lock that pushes the context, so `len + pending` never dips in between.
     ///
-    /// `busy` pre-marks the context before it becomes visible (AlwaysNew, see
-    /// `create_always_new_context`).
+    /// The context is marked busy before it becomes visible: it is created for the request that
+    /// reserved the slot, and an idle-looking context in the pool could be claimed by another
+    /// request (Reusable) or collected as a leak (AlwaysNew, see `create_always_new_context`).
+    /// The caller adopts the flag.
     async fn build_reserved_context(
         &self,
         reservation: SlotReservation,
         proxy_params: &ProxyParams,
-        busy: bool,
     ) -> Result<Arc<BrowserContext>> {
         let context = self.create_new_context(proxy_params).await?;
-        if busy {
-            context.metadata.is_busy.store(true, Ordering::SeqCst);
-        }
+        context.metadata.is_busy.store(true, Ordering::SeqCst);
         let context = Arc::new(context);
 
         let mut contexts = self.contexts.write().await;
@@ -1489,6 +1632,8 @@ impl BrowserPool {
     /// The capacity check is therefore a check on **concurrent sessions**. `Ok(None)` means every
     /// session slot is taken — including by sessions that are merely idle between requests, which
     /// is why the idle timeout has to be short.
+    ///
+    /// The returned context is already marked busy; the caller adopts the flag.
     pub async fn create_dedicated_context(
         &self,
         proxy_params: &ProxyParams,
@@ -1513,7 +1658,7 @@ impl BrowserPool {
 
         let reservation = SlotReservation::take(&self.pending_creations);
         drop(contexts);
-        self.build_reserved_context(reservation, proxy_params, false)
+        self.build_reserved_context(reservation, proxy_params)
             .await
             .map(Some)
     }
@@ -1575,7 +1720,7 @@ impl BrowserPool {
         // setting it.
         match reservation {
             Some(reservation) => self
-                .build_reserved_context(reservation, proxy_params, true)
+                .build_reserved_context(reservation, proxy_params)
                 .await
                 .map(Some),
             None => Ok(None),
@@ -1772,6 +1917,11 @@ mod tests {
     /// Build a context without touching a browser: an AlwaysNew pool slot is fully described
     /// by its metadata, so `tab`/`cdp_context_id`/`proxy_host` may stay empty for reclamation
     /// tests.
+    /// The default thresholds: 10,000 requests, 6 hours.
+    fn lifecycle() -> ContextLifecycleConfig {
+        ContextLifecycleConfig::default()
+    }
+
     fn make_context(busy: bool) -> Arc<BrowserContext> {
         let metadata = BrowserContextMetadata::new();
         metadata.is_busy.store(busy, Ordering::SeqCst);
@@ -2000,7 +2150,8 @@ mod tests {
         // `heavily_used` comes first, which is exactly what the old implementation returned.
         let contexts = vec![heavily_used, barely_used.clone()];
 
-        let selected = select_least_used_idle(&contexts, None).expect("one context is idle");
+        let selected =
+            select_least_used_idle(&contexts, None, &lifecycle()).expect("one context is idle");
         assert_eq!(selected.metadata.id, barely_used.metadata.id);
     }
 
@@ -2016,10 +2167,11 @@ mod tests {
 
         let contexts = vec![busy_and_fresh, idle_and_worn.clone()];
 
-        let selected = select_least_used_idle(&contexts, None).expect("one context is idle");
+        let selected =
+            select_least_used_idle(&contexts, None, &lifecycle()).expect("one context is idle");
         assert_eq!(selected.metadata.id, idle_and_worn.metadata.id);
 
-        assert!(select_least_used_idle(&[make_context(true)], None).is_none());
+        assert!(select_least_used_idle(&[make_context(true)], None, &lifecycle()).is_none());
     }
 
     /// A context the origin has just refused must not be the one this origin gets next: with one
@@ -2037,8 +2189,8 @@ mod tests {
         let contexts = vec![blocked.clone(), fresh.clone()];
 
         // `blocked` has the lower request count and would win on capacity alone.
-        let selected =
-            select_least_used_idle(&contexts, Some("example.com")).expect("one context is idle");
+        let selected = select_least_used_idle(&contexts, Some("example.com"), &lifecycle())
+            .expect("one context is idle");
         assert_eq!(selected.metadata.id, fresh.metadata.id);
     }
 
@@ -2053,8 +2205,8 @@ mod tests {
 
         let contexts = vec![blocked.clone()];
 
-        assert!(select_least_used_idle(&contexts, Some("example.com")).is_none());
-        let selected = select_least_used_idle(&contexts, Some("example.org"))
+        assert!(select_least_used_idle(&contexts, Some("example.com"), &lifecycle()).is_none());
+        let selected = select_least_used_idle(&contexts, Some("example.org"), &lifecycle())
             .expect("another origin is unaffected");
         assert_eq!(selected.metadata.id, blocked.metadata.id);
     }
@@ -2068,7 +2220,7 @@ mod tests {
             .metadata
             .quarantine_origin("example.com", Duration::ZERO);
 
-        assert!(select_least_used_idle(&[context], Some("example.com")).is_some());
+        assert!(select_least_used_idle(&[context], Some("example.com"), &lifecycle()).is_some());
     }
 
     /// The last resort when the pool is at `max_contexts` and every idle context is quarantined:
@@ -2089,7 +2241,7 @@ mod tests {
 
         let contexts = vec![long, short.clone(), busy];
 
-        let (selected, _) = select_soonest_unquarantined(&contexts, "example.com")
+        let (selected, _) = claim_soonest_unquarantined(&contexts, "example.com", &lifecycle())
             .expect("a quarantined idle context is available");
         assert_eq!(
             selected.metadata.id, short.metadata.id,
@@ -2097,9 +2249,102 @@ mod tests {
         );
 
         assert!(
-            select_soonest_unquarantined(&contexts, "example.org").is_none(),
+            claim_soonest_unquarantined(&contexts, "example.org", &lifecycle()).is_none(),
             "no fallback is needed for an origin nothing is quarantined for"
         );
+    }
+
+    /// A context that has served its quota is never handed another request, however idle it is:
+    /// only the lifecycle monitor used to enforce the quota, and only at an idle tick.
+    #[test]
+    fn skips_used_up_contexts() {
+        let used_up = make_context(false);
+        used_up
+            .metadata
+            .total_requests
+            .store(10_000, Ordering::SeqCst);
+        let worn = make_context(false);
+        worn.metadata.total_requests.store(9_999, Ordering::SeqCst);
+
+        let selected = select_least_used_idle(&[used_up.clone(), worn.clone()], None, &lifecycle())
+            .expect("one context has quota left");
+        assert_eq!(selected.metadata.id, worn.metadata.id);
+        assert!(select_least_used_idle(&[used_up], None, &lifecycle()).is_none());
+    }
+
+    /// Selection claims: a second request never gets the context the first one selected.
+    #[test]
+    fn claiming_marks_the_context_busy_and_moves_on_to_the_next() {
+        let first = make_context(false);
+        let second = make_context(false);
+        second.metadata.total_requests.store(1, Ordering::SeqCst);
+        let contexts = vec![first.clone(), second.clone()];
+
+        let claimed = claim_least_used_idle(&contexts, None, &lifecycle()).expect("idle context");
+        assert_eq!(claimed.metadata.id, first.metadata.id);
+        assert!(first.metadata.is_busy.load(Ordering::SeqCst));
+
+        let claimed = claim_least_used_idle(&contexts, None, &lifecycle()).expect("idle context");
+        assert_eq!(claimed.metadata.id, second.metadata.id);
+
+        assert!(claim_least_used_idle(&contexts, None, &lifecycle()).is_none());
+    }
+
+    /// At capacity, the slot of an idle used-up context goes to a fresh one: the oldest such
+    /// context is claimed and removed, busy ones are left alone.
+    #[test]
+    fn takes_the_oldest_idle_used_up_context() {
+        let used_up = || {
+            let context = make_context(false);
+            context
+                .metadata
+                .total_requests
+                .store(10_000, Ordering::SeqCst);
+            context
+        };
+        // Created in this order, so `created_at` orders them the same way.
+        let oldest = used_up();
+        let younger = used_up();
+        let busy = used_up();
+        busy.metadata.is_busy.store(true, Ordering::SeqCst);
+        let mut contexts = vec![
+            busy.clone(),
+            younger.clone(),
+            oldest.clone(),
+            make_context(false),
+        ];
+
+        let taken = take_used_up_idle(&mut contexts, &lifecycle()).expect("an idle used-up one");
+        assert_eq!(taken.metadata.id, oldest.metadata.id);
+        assert!(
+            taken.metadata.is_busy.load(Ordering::SeqCst),
+            "claimed before removal"
+        );
+        assert_eq!(contexts.len(), 3);
+
+        let taken = take_used_up_idle(&mut contexts, &lifecycle()).expect("the younger one");
+        assert_eq!(taken.metadata.id, younger.metadata.id);
+        assert!(
+            take_used_up_idle(&mut contexts, &lifecycle()).is_none(),
+            "a busy used-up context is still serving its request"
+        );
+        assert!(contexts.iter().any(|c| Arc::ptr_eq(c, &busy)));
+    }
+
+    /// The quarantine fallback never hands out a used-up context: replacing it gives the request
+    /// a fresh exit IP instead of a refused one.
+    #[test]
+    fn quarantine_fallback_skips_used_up_contexts() {
+        let used_up = make_context(false);
+        used_up
+            .metadata
+            .total_requests
+            .store(10_000, Ordering::SeqCst);
+        used_up
+            .metadata
+            .quarantine_origin("example.com", Duration::from_secs(30));
+
+        assert!(claim_soonest_unquarantined(&[used_up], "example.com", &lifecycle()).is_none());
     }
 
     #[test]

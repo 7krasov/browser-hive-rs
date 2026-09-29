@@ -241,7 +241,8 @@ There is nothing to validate; see the measurement approach above.
 ## Lifecycle thresholds
 
 Driven by `ContextLifecycleConfig` (`common/src/config.rs`), evaluated in
-`BrowserPool::should_recycle_context`:
+`BrowserPool::should_recycle_context` (the monitor) and, for `max_lifetime`/`max_requests`, also at
+selection (below):
 
 | Field | Measured from | Default |
 |---|---|---|
@@ -268,6 +269,38 @@ problem is the corresponding item in TODO.md.
 
 What expiry *does* differs by mode: `reusable` **replaces** the context (the slot count is
 unchanged), `dedicated` and `always_new` **remove** it.
+
+**`max_lifetime` and `max_requests` are also enforced when a context is selected**, not only by
+the lifecycle monitor (`ContextLifecycleConfig::is_used_up`). The monitor ticks every 60 s and
+replaces or removes a context only if it is idle at that moment, so under sustained load — every
+context busy at every tick — a context's age and request count had no bound at all. Now a context
+that is used up is never handed another request, which bounds its age by `max_lifetime` plus one
+request (the worker's own hard timeouts keep that at about two minutes), and `max_requests` is the
+exact number of requests it serves (`>=`; the monitor used `>`, one more). Idle time is not
+checked at selection — a context being selected is no longer idle.
+
+- `reusable`: selection skips used-up contexts. When the pool is at `max_contexts` and nothing
+  else is idle, one idle used-up context (the oldest) is removed and its slot reserved for a fresh
+  one in the same critical section, then the old one is released and the new one built with the
+  lock dropped — the same path as any on-demand creation. The request pays that creation (about a
+  second; up to the 30 s CDP bound if Chrome stalls), and a failed build answers
+  `CONTEXT_CREATION_FAILED` (5005, retryable) where the stale context used to serve it. It never
+  refuses a request for capacity: an idle used-up context is a free slot. The same replacement
+  covers requests carrying a `country_code`, which previously got no slot at all while such a
+  context held it. The quarantine fallback never hands out a used-up context.
+- `dedicated`: the session's next request removes the context and is answered
+  `SESSION_NOT_FOUND` (4002), so the client starts a new session — what the monitor already did,
+  but only for sessions that happened to be idle at a tick. A session still busy with its previous
+  request gets `SESSION_BUSY` as before, and the request after it ends the session.
+- `always_new`: nothing to enforce, a context serves one request.
+
+**Selection claims the context.** An existing context is marked busy by compare-and-swap while it
+is selected, and a new one is pushed into the pool already busy; the request handler adopts the
+flag. Before, selection returned the context idle and the handler claimed it later, so two
+concurrent `reusable` requests — or a request and the monitor — could pick the same context and the
+loser was answered `SESSION_BUSY` in a mode that has no sessions. Now the loser moves on to the next
+candidate. Only a `dedicated` session continuation still claims in the handler, where a collision
+is the client's own concurrent request.
 
 ---
 
