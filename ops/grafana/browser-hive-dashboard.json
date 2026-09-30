@@ -42,7 +42,7 @@
       {
         "name": "max_contexts",
         "label": "WORKER_MAX_CONTEXTS",
-        "description": "Per-worker capacity (contexts = concurrent requests per pod) of the selected scope. Only meaningful with a SINGLE scope selected \u2014 it feeds the 'Recommended maxReplicas' panel (peak load / this value). Set it to the scope's WORKER_MAX_CONTEXTS config value.",
+        "description": "Per-worker capacity (contexts = concurrent requests per pod). Feeds the 'Pods at peak' and 'Recommended maxReplicas' columns of 'Capacity per scope' (peak load / this value). One value for all scopes: set it to WORKER_MAX_CONTEXTS, and filter to one scope at a time if scopes differ.",
         "type": "textbox",
         "query": "2",
         "current": {
@@ -102,218 +102,243 @@
       ]
     },
     {
-      "type": "stat",
-      "title": "Peak busy contexts (selected range)",
-      "description": "Max concurrent busy contexts over the dashboard time range, per scope.",
+      "type": "table",
+      "title": "Capacity per scope",
+      "description": "One row per scope, sorted by name. Workers now = scraped worker instances (in K8s: pods). Utilization now = busy / total slots (>80% yellow, >95% red). Peak busy contexts = max concurrent busy contexts over the selected range; Pods at peak = that peak / WORKER_MAX_CONTEXTS (the dashboard variable - one value for all scopes); Recommended maxReplicas = ceil(pods at peak * 1.25). The peak is clipped by the capacity that existed: a scope with requests lost to capacity (coordinator no_slots|no_workers rejections over the range) needed more than its peak shows, so its recommendation is a lower bound.",
       "gridPos": {
-        "h": 8,
+        "h": 12,
         "w": 24,
         "x": 0,
         "y": 9
       },
       "datasource": "${datasource}",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value_and_name"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "${datasource}",
-          "expr": "max_over_time( sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"})[$__range:] )",
-          "legendFormat": "{{scope}}",
-          "instant": true
-        }
-      ]
-    },
-    {
-      "type": "stat",
-      "title": "Recommended maxReplicas (+25% headroom)",
-      "description": "ceil( peak_busy_contexts / WORKER_MAX_CONTEXTS * 1.25 ). Set the WORKER_MAX_CONTEXTS variable to this scope's value.",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 17
-      },
-      "datasource": "${datasource}",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value_and_name"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "${datasource}",
-          "expr": "ceil( max_over_time( sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"})[$__range:] ) / $max_contexts * 1.25 )",
-          "legendFormat": "{{scope}}",
-          "instant": true
-        }
-      ]
-    },
-    {
-      "type": "stat",
-      "title": "Running workers per scope",
-      "description": "One series per scraped worker instance (in K8s: pod), so the count = current replicas.",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 25
-      },
-      "datasource": "${datasource}",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "purple",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value_and_name"
-      },
       "targets": [
         {
           "refId": "A",
           "datasource": "${datasource}",
           "expr": "count by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"})",
-          "legendFormat": "{{scope}}",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": "${datasource}",
+          "expr": "sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"}) / sum by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"})",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": "${datasource}",
+          "expr": "max_over_time( sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"})[$__range:] )",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "datasource": "${datasource}",
+          "expr": "max_over_time( sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"})[$__range:] ) / $max_contexts",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "datasource": "${datasource}",
+          "expr": "ceil( max_over_time( sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"})[$__range:] ) / $max_contexts * 1.25 )",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "F",
+          "datasource": "${datasource}",
+          "expr": "round( sum by (scope) (increase(browser_hive_coordinator_requests_rejected_total{scope=~\"$scope\", reason=~\"no_slots|no_workers\"}[$__range])) ) or on (scope) (0 * group by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"}))",
+          "format": "table",
           "instant": true
         }
-      ]
-    },
-    {
-      "type": "stat",
-      "title": "Utilization now",
-      "description": "sum(active_contexts) / sum(total_slots). >90% = near capacity.",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 33
-      },
-      "datasource": "${datasource}",
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "scope": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "Value #E": 5,
+              "Value #F": 6
+            },
+            "renameByName": {
+              "scope": "Scope",
+              "Value #A": "Workers now",
+              "Value #B": "Utilization now",
+              "Value #C": "Peak busy contexts",
+              "Value #D": "Pods at peak",
+              "Value #E": "Recommended maxReplicas",
+              "Value #F": "Lost to capacity (range)"
+            }
+          }
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "color": {
-            "mode": "thresholds"
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Scope"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 380
+              }
+            ]
           },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Utilization now"
+            },
+            "properties": [
               {
-                "color": "green",
-                "value": null
+                "id": "unit",
+                "value": "percentunit"
               },
               {
-                "color": "yellow",
-                "value": 0.8
+                "id": "decimals",
+                "value": 0
               },
               {
-                "color": "red",
-                "value": 0.95
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.8
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.95
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pods at peak"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Recommended maxReplicas"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Lost to capacity (range)"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1
+                    },
+                    {
+                      "color": "red",
+                      "value": 100
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
               }
             ]
           }
-        },
-        "overrides": []
+        ]
       },
       "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
         },
-        "colorMode": "background",
-        "graphMode": "none",
-        "textMode": "value_and_name"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "${datasource}",
-          "expr": "sum by (scope) (browser_hive_worker_active_contexts{scope=~\"$scope\"}) / sum by (scope) (browser_hive_worker_total_slots{scope=~\"$scope\"})",
-          "legendFormat": "{{scope}}",
-          "instant": true
-        }
-      ]
+        "sortBy": [
+          {
+            "displayName": "Scope",
+            "desc": false
+          }
+        ]
+      }
     },
     {
       "type": "timeseries",
@@ -323,7 +348,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 21
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -384,7 +409,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 21
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -430,7 +455,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 49
+        "y": 29
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -494,7 +519,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 49
+        "y": 29
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -552,7 +577,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 57
+        "y": 37
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -598,7 +623,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 45
       },
       "panels": []
     },
@@ -610,7 +635,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 66
+        "y": 46
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -656,7 +681,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 66
+        "y": 46
       },
       "datasource": "${datasource}",
       "fieldConfig": {
@@ -713,63 +738,6 @@
       ]
     },
     {
-      "type": "stat",
-      "title": "Requests lost to capacity (selected range)",
-      "description": "Absolute number of requests refused for lack of capacity over the dashboard time range. This is the cost of the current replica settings, in requests.",
-      "gridPos": {
-        "h": 6,
-        "w": 24,
-        "x": 0,
-        "y": 74
-      },
-      "datasource": "${datasource}",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 100
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "value_and_name",
-        "colorMode": "value",
-        "graphMode": "none"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "${datasource}",
-          "instant": true,
-          "expr": "sum by (scope) (increase(browser_hive_coordinator_requests_rejected_total{scope=~\"$scope\", reason=~\"no_slots|no_workers\"}[$__range]))",
-          "legendFormat": "{{scope}}"
-        }
-      ]
-    },
-    {
       "type": "timeseries",
       "title": "Coordinator view: free slots and healthy workers per scope",
       "description": "What routing actually decides on: the coordinator's discovery cache (refreshed every 10s in K8s mode), not the workers' own gauges. Free slots at zero while rejections rise = genuine saturation. Healthy workers dropping to zero while pods are running = discovery or health-check problem, and the rejections are not a capacity issue.",
@@ -777,7 +745,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 80
+        "y": 54
       },
       "datasource": "${datasource}",
       "fieldConfig": {

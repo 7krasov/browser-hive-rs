@@ -193,8 +193,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Memory per pod vs. container limit",
-      "description": "Per pod: browser PSS + worker RSS (our gauges), the container working set (cAdvisor - usage minus inactive page cache, the figure Kubernetes reports as container memory), and the memory limit (dashed, kube-state-metrics). A line climbing to the dashed one is the next OOMKill. The working set is the max over container instances, not their sum: for a few minutes after a restart cAdvisor still exports the dead container next to the new one, and summing the two drew spikes far above the limit. For those minutes the line shows the dead container's last value. The last two need cAdvisor and kube-state-metrics scraped by the same Prometheus (kube-prometheus-stack does both); if they are missing only the first line is drawn.",
+      "title": "Memory per pod vs. container request and limit",
+      "description": "Per pod: browser PSS + worker RSS (our gauges), the container working set (cAdvisor - usage minus inactive page cache, the figure Kubernetes reports as container memory), the memory request (dotted) and the memory limit (dashed), both from kube-state-metrics. A line climbing to the dashed one is the next OOMKill; a pod staying above the dotted one uses memory the scheduler did not reserve for it and is among the first evicted under node memory pressure. The working set is the max over container instances, not their sum: for a few minutes after a restart cAdvisor still exports the dead container next to the new one, and summing the two drew spikes far above the limit. For those minutes the line shows the dead container's last value. The last three need cAdvisor and kube-state-metrics scraped by the same Prometheus (kube-prometheus-stack does both); if they are missing only the first line is drawn.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -227,6 +227,24 @@
                     10,
                     10
                   ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* - request$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot"
                 }
               },
               {
@@ -269,6 +287,12 @@
           "datasource": "${datasource}",
           "expr": "sum by (pod) (kube_pod_container_resource_limits{resource=\"memory\"}) and on (pod) group by (pod) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
           "legendFormat": "{{pod}} - limit"
+        },
+        {
+          "refId": "D",
+          "datasource": "${datasource}",
+          "expr": "sum by (pod) (kube_pod_container_resource_requests{resource=\"memory\"}) and on (pod) group by (pod) (browser_hive_worker_total_slots{scope=~\"$scope\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} - request"
         }
       ]
     },

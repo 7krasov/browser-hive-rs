@@ -13,14 +13,19 @@ observed daily peak.
 
 - **Scope** - multi-select, populated from `label_values(browser_hive_worker_total_slots, scope)`. Defaults to `All`.
 - **WORKER_MAX_CONTEXTS** - the per-worker context count for the selected scope (default `2`).
-  Used only by the "Recommended maxReplicas" stat. If scopes run different values, filter
-  to one scope at a time and set this to match.
+  Used only by the "Pods at peak" and "Recommended maxReplicas" columns of **Capacity per
+  scope**. If scopes run different values, filter to one scope at a time and set this to match.
 
 ### Reading it
 
 - **Concurrent busy contexts** - the load curve. Its peak over the range drives sizing.
-- **Recommended maxReplicas** - `ceil(peak_busy / WORKER_MAX_CONTEXTS * 1.25)` over the
-  selected time range.
+- **Capacity per scope** - one row per scope, sorted by name: workers now, utilization now,
+  peak busy **contexts**, pods at peak (peak / `WORKER_MAX_CONTEXTS`), recommended
+  maxReplicas = `ceil(pods at peak * 1.25)`, and requests lost to capacity over the range
+  (absolute `no_slots` + `no_workers` rejections: the cost of the current replica settings). A
+  table rather than stat tiles because tiles share one row, shrink with every scope added and
+  reorder as values change. A scope with requests lost to capacity was clipped: its real peak
+  was higher, so its recommendation is a lower bound.
 - **Utilization %** - sustained ~100% means capacity is capped and the busy-contexts curve
   is clipped; true demand is higher than shown. Add workers or check the rejection signal.
 - **Avg in-flight (Little's Law)** - sampling-immune concurrency from the duration
@@ -29,7 +34,8 @@ observed daily peak.
 
 ### Refused demand row (coordinator metrics)
 
-The four panels in this row come from `browser_hive_coordinator_*` and require the
+The three panels in this row, and the "Lost to capacity" column of **Capacity per scope**,
+come from `browser_hive_coordinator_*` and require the
 coordinator to be scraped as well - see METRICS.md. They answer the one question the worker
 metrics structurally cannot: **how much demand was turned away**. There is no queue in
 Browser Hive, so a request refused with `NO_WORKERS_AVAILABLE` (5001) never reaches a worker
@@ -41,8 +47,6 @@ fleet rejecting half its traffic look identical from the worker side.
   no amount of scaling will change them.
 - **Capacity rejection rate %** - the actionable ratio. Sustained above zero = the scope is
   under-provisioned.
-- **Requests lost to capacity** - the same thing in absolute requests over the range: the
-  cost of the current replica settings.
 - **Coordinator view: free slots and healthy workers** - the discovery cache routing
   actually decides on. Free slots pinned at zero with rejections rising is genuine
   saturation; healthy workers collapsing while pods run is a discovery/health problem
@@ -109,9 +113,9 @@ resources" section of METRICS.md.
 
 - **Browser memory by process type** - where a pod's memory goes. PSS, so the stack adds up.
 - **Container restarts and OOMKills per pod** - when a pod died and whether memory killed it.
-- **Memory per pod vs. container limit** - browser PSS plus worker RSS, the container working
-  set, and the memory limit as a dashed line. A line climbing to the dashed one is the next
-  OOMKill.
+- **Memory per pod vs. container request and limit** - browser PSS plus worker RSS, the container working
+  set, the memory request (dotted) and the limit (dashed). A line climbing to the dashed one is
+  the next OOMKill; a pod living above the dotted one is first in line for node-pressure eviction.
 - **Largest single process** together with **Browser processes by type** - one bloated
   renderer (high max, few processes) vs. many small ones (low max, many processes).
 - **Requests per context per 30 min** - pages a slot loaded, averaged over the scope. Compare it
