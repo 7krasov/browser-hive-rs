@@ -137,6 +137,20 @@ The same browser context (with cookies) will be used! If you receive `ERROR_CODE
 
 Browser Hive supports flexible wait strategies to handle dynamic content:
 
+### Wait parameters: `wait` and the deprecated flat fields
+
+Wait parameters go in the nested `wait` object (`WaitOptions`): `strategy`, `timeout_ms`,
+`wait_selector`, `skip_selector`. New wait parameters are added there only. The flat fields
+`wait_strategy`, `wait_timeout_ms`, `wait_selector` and `skip_selector` are deprecated but still
+honoured, **per field**: a field set in `wait` wins — even `0` or `""`, since every `wait` field
+is proto3 `optional` — and a field left unset in `wait` falls back to its flat counterpart. A
+request without `wait` behaves exactly as before.
+
+```json
+{ "scope_name": "local_dev", "url": "https://example.com",
+  "wait": { "wait_selector": "#content", "timeout_ms": 15000 } }
+```
+
 ### Available Strategies
 
 - **`network_idle`** (default) - Two phases. **Phase 1** waits for Chromium's `networkAlmostIdle`
@@ -163,12 +177,11 @@ grpcurl -plaintext \
   -d '{
   "scope_name": "local_dev",
   "url": "https://example.com",
-  "wait_selector": "#login-button",
-  "wait_timeout_ms": 15000
+  "wait": { "wait_selector": "#login-button", "timeout_ms": 15000 }
 }' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
 ```
 
-If the selector is not found within `wait_timeout_ms`, the request returns:
+If the selector is not found within `timeout_ms`, the request returns:
 - `success: false`
 - `error_code: ERROR_CODE_SELECTOR_NOT_FOUND` (4042)
 - `content`: Full page HTML (still available for inspection)
@@ -184,7 +197,7 @@ grpcurl -plaintext \
   -d '{
   "scope_name": "local_dev",
   "url": "https://example.com",
-  "skip_selector": ".captcha-challenge"
+  "wait": { "skip_selector": ".captcha-challenge" }
 }' localhost:50051 scraper.coordinator.ScraperCoordinator/ScrapePage
 ```
 

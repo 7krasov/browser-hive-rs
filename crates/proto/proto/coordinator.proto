@@ -41,6 +41,22 @@ enum ErrorCode {
   ERROR_CODE_UNKNOWN = 9999;                // Unknown error
 }
 
+// Wait parameters. Every field is `optional`, so a value set here — even `0` or "" — is
+// told apart from one left unset: a set field overrides its flat counterpart in
+// ScrapePageRequest (`wait_strategy`, `wait_timeout_ms`, `wait_selector`,
+// `skip_selector`), an unset one falls back to it. New wait parameters
+// are added here only, never as flat fields.
+message WaitOptions {
+  // Same meaning as the flat `wait_strategy`
+  optional string strategy = 1;
+  // Same meaning as the flat `wait_timeout_ms`
+  optional uint32 timeout_ms = 2;
+  // Same meaning as the flat `wait_selector`
+  optional string wait_selector = 3;
+  // Same meaning as the flat `skip_selector`
+  optional string skip_selector = 4;
+}
+
 message ScrapePageRequest {
   string scope_name = 1;
   string url = 2; //url for content to download
@@ -51,21 +67,21 @@ message ScrapePageRequest {
 
   // Wait strategy for page loading (e.g., "network_idle", "timeout")
   // If not specified, uses default strategy ("network_idle")
-  string wait_strategy = 5;
+  string wait_strategy = 5 [deprecated = true]; // use wait.strategy
 
   // Timeout in milliseconds for wait strategy
   // Max allowed: MAX_WAIT_TIMEOUT_MS - values above will be capped
   // Default if not specified: DEFAULT_WAIT_TIMEOUT_MS
   // See common/src/wait_strategy.rs for constant values
-  uint32 wait_timeout_ms = 6;
+  uint32 wait_timeout_ms = 6 [deprecated = true]; // use wait.timeout_ms
 
   // CSS selector to wait for (uses "selector" wait strategy automatically if specified)
   // If this element appears, scraping succeeds
-  string wait_selector = 7;
+  string wait_selector = 7 [deprecated = true]; // use wait.wait_selector
 
   // CSS selector that indicates content should be skipped
   // If this element appears, returns ERROR_CODE_SKIP_SELECTOR_FOUND but still returns content
-  string skip_selector = 8;
+  string skip_selector = 8 [deprecated = true]; // use wait.skip_selector
 
   // Request tracing ID for log correlation
   // If not provided, will be auto-generated with "ray_" prefix
@@ -75,6 +91,9 @@ message ScrapePageRequest {
   // Examples: "US", "DE", "GB", "UA"
   // If not specified, proxy provider uses its default behavior
   string country_code = 10;
+
+  // Wait parameters; each field set here overrides its flat counterpart above
+  WaitOptions wait = 11;
 }
 
 message ScrapePageResponse {

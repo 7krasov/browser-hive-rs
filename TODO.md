@@ -2,6 +2,39 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## Wait out anti-bot challenges instead of exiting on their 403
+
+A site behind a JS challenge answers the first request with 403 (with a vendor header marking
+it as a challenge), its script runs for a few seconds (~4.5 s measured in a desktop browser)
+and then **navigates the main frame** to a new document with the real content (a form POST to
+the original URL). `network_idle` exits on the 403 at once, so a cold context never gets past
+the challenge; a warm one (challenge cookie present) is not challenged at all. Simply dropping
+the early exit would not work either: `networkAlmostIdle` fires in the middle of the challenge.
+
+Prerequisite in place (unreleased): wait parameters are carried in `WaitOptions` (see
+CLAUDE.md, "Wait parameters live in `WaitOptions`"); the challenge window is added there.
+
+Plan:
+
+1. **Challenge waiting.** Decided:
+   - A challenge is recognised by a `ChallengeDetector` trait (`common`), not by a status list,
+     applied to **every** main document. The base ships only a generic header matcher built
+     from data (no env, no vendor name); which headers count is the downstream worker's
+     decision. `ScopeConfig::challenge_detectors` is empty by default — that is the per-scope
+     switch; the per-request switch is `WaitOptions.challenge_timeout_ms > 0`. Both off → the
+     current code path, unchanged.
+   - Passed = a **new** main document the detectors do not flag; a new challenge document keeps
+     waiting in the same window; window expired → return what is there (quarantine as now).
+     After passing, the strategy's normal rules apply (idle / timeout / `wait_selector`).
+   - The window is spent **inside** the wait budget, never on top of it.
+   - The worker hands the strategy a probe onto the response observer (a new-document counter),
+     so `common` does not depend on the worker and no JS is evaluated during the challenge.
+   - 429 is not a challenge signal (IP rate limiting).
+   - Visibility: span fields `challenge`, `challenge_ms`; counter
+     `browser_hive_worker_page_requests_total{scope, page_site, challenge=none|passed|failed|skipped}`
+     with the third-party metrics' series cap.
+   - Verified on headful production scopes after release, not beforehand.
+
 ## Tune the block quarantine cooldown from real block durations
 
 **Status**: open, waiting for production numbers (raised 2026-09-02)

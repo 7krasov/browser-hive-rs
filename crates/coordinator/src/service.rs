@@ -633,11 +633,13 @@ impl ScraperCoordinator for CoordinatorService {
             }));
         }
 
+        // `WaitOptions` merged over the deprecated flat fields, once for every attempt.
+        let wait = req.resolved_wait();
         debug!(
             "Received scraping request for scope: {}, URL: {}, wait_timeout_ms: {}, wait_selector: {:?}, skip_selector: {:?}",
-            req.scope_name, req.url, req.wait_timeout_ms,
-            if req.wait_selector.is_empty() { None } else { Some(&req.wait_selector) },
-            if req.skip_selector.is_empty() { None } else { Some(&req.skip_selector) }
+            req.scope_name, req.url, wait.timeout_ms,
+            if wait.wait_selector.is_empty() { None } else { Some(&wait.wait_selector) },
+            if wait.skip_selector.is_empty() { None } else { Some(&wait.skip_selector) }
         );
 
         let workers_guard = self.worker_discovery.get_workers();
@@ -922,16 +924,21 @@ impl ScraperCoordinator for CoordinatorService {
                     let remaining_time = request_deadline.saturating_duration_since(now);
                     let timeout_seconds = remaining_time.as_secs().max(1) as u32; // At least 1 second
 
+                    // The resolved values go into both the flat fields and `wait`: a worker
+                    // that predates `WaitOptions` reads the former, a current one the latter,
+                    // so coordinator and workers can be rolled out in either order.
+                    #[allow(deprecated)]
                     let worker_request = browser_hive_proto::worker::ScrapePageRequest {
                         url: req.url.clone(),
                         timeout_seconds,
                         context_id: context_id.clone(),
-                        wait_strategy: req.wait_strategy.clone(),
-                        wait_timeout_ms: req.wait_timeout_ms,
-                        wait_selector: req.wait_selector.clone(),
-                        skip_selector: req.skip_selector.clone(),
+                        wait_strategy: wait.strategy.clone(),
+                        wait_timeout_ms: wait.timeout_ms,
+                        wait_selector: wait.wait_selector.clone(),
+                        skip_selector: wait.skip_selector.clone(),
                         ray_id: ray_id.clone(),
                         country_code: req.country_code.clone(),
+                        wait: Some((&wait).into()),
                     };
 
                     debug!(
@@ -939,9 +946,9 @@ impl ScraperCoordinator for CoordinatorService {
                         attempt,
                         last_worker_id,
                         timeout_seconds,
-                        worker_request.wait_timeout_ms,
-                        if worker_request.wait_selector.is_empty() { None } else { Some(&worker_request.wait_selector) },
-                        if worker_request.skip_selector.is_empty() { None } else { Some(&worker_request.skip_selector) }
+                        wait.timeout_ms,
+                        if wait.wait_selector.is_empty() { None } else { Some(&wait.wait_selector) },
+                        if wait.skip_selector.is_empty() { None } else { Some(&wait.skip_selector) }
                     );
 
                     // Set timeout for the gRPC request

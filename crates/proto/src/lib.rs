@@ -5,3 +5,6 @@ pub mod coordinator {
 pub mod worker {
     tonic::include_proto!("scraper.worker");
 }
+
+mod wait;
+pub use wait::ResolvedWait;

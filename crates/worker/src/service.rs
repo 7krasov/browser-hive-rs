@@ -1769,41 +1769,44 @@ impl WorkerService {
         // Uncomment to check proxy exit IP (adds ~1sec overhead per request)
         // check_proxy_exit_ip(&tab);
 
+        // `WaitOptions` merged over the deprecated flat fields
+        let wait = req.resolved_wait();
+
         // Validate and get effective timeout
-        let wait_timeout = if req.wait_timeout_ms > 0 {
-            validate_timeout(req.wait_timeout_ms).map_err(|e| {
+        let wait_timeout = if wait.timeout_ms > 0 {
+            validate_timeout(wait.timeout_ms).map_err(|e| {
                 Status::invalid_argument(format!(
                     "Invalid wait_timeout_ms: {}. Maximum allowed: {} ms",
                     e, MAX_WAIT_TIMEOUT_MS
                 ))
             })?
         } else {
-            effective_timeout(req.wait_timeout_ms)
+            effective_timeout(wait.timeout_ms)
         };
 
         // Get wait strategy
-        let strategy = if req.wait_strategy.is_empty() {
+        let strategy = if wait.strategy.is_empty() {
             self.wait_strategy_registry.default_strategy()
         } else {
             self.wait_strategy_registry
-                .get(&req.wait_strategy)
+                .get(&wait.strategy)
                 .ok_or_else(|| {
                     Status::invalid_argument(format!(
                         "Unknown wait_strategy: '{}'. Available: {:?}",
-                        req.wait_strategy,
+                        wait.strategy,
                         self.wait_strategy_registry.list_strategies()
                     ))
                 })?
         };
 
         // Prepare selectors for wait strategy (owned strings for spawn_blocking)
-        let wait_selector_owned = if !req.wait_selector.is_empty() {
-            Some(req.wait_selector.clone())
+        let wait_selector_owned = if !wait.wait_selector.is_empty() {
+            Some(wait.wait_selector.clone())
         } else {
             None
         };
-        let skip_selector_owned = if !req.skip_selector.is_empty() {
-            Some(req.skip_selector.clone())
+        let skip_selector_owned = if !wait.skip_selector.is_empty() {
+            Some(wait.skip_selector.clone())
         } else {
             None
         };
@@ -2211,14 +2214,14 @@ impl WorkerService {
                 Ok(WaitResult::Success) => (true, String::new(), ErrorCode::None),
                 Ok(WaitResult::SkipSelectorFound) => (
                     false,
-                    format!("Skip selector '{}' was found", req.skip_selector),
+                    format!("Skip selector '{}' was found", wait.skip_selector),
                     ErrorCode::SkipSelectorFound,
                 ),
                 Ok(WaitResult::WaitSelectorNotFound) => (
                     false,
                     format!(
                         "Wait selector '{}' was not found within timeout",
-                        req.wait_selector
+                        wait.wait_selector
                     ),
                     ErrorCode::SelectorNotFound,
                 ),
@@ -2375,11 +2378,12 @@ impl WorkerServiceTrait for WorkerService {
             proxy_host = tracing::field::Empty,
             blocked_requests = tracing::field::Empty,
         );
-        if !req.wait_selector.is_empty() {
-            span.record("wait_selector", req.wait_selector.as_str());
+        let wait = req.resolved_wait();
+        if !wait.wait_selector.is_empty() {
+            span.record("wait_selector", wait.wait_selector.as_str());
         }
-        if !req.skip_selector.is_empty() {
-            span.record("skip_selector", req.skip_selector.as_str());
+        if !wait.skip_selector.is_empty() {
+            span.record("skip_selector", wait.skip_selector.as_str());
         }
         if !req.country_code.is_empty() {
             span.record("country_code", req.country_code.as_str());
