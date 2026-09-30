@@ -151,6 +151,24 @@ request without `wait` behaves exactly as before.
   "wait": { "wait_selector": "#content", "timeout_ms": 15000 } }
 ```
 
+### Anti-bot challenges: `wait.challenge_timeout_ms`
+
+Some sites answer a first visit with a JavaScript challenge page (usually HTTP 403) that navigates
+to the real page after a few seconds. By default that challenge page is returned at once. In a
+scope configured to recognise challenges (`ScopeConfig::challenge_detectors`, set by the deployment
+— none in the base worker), a request can wait for the challenge to pass:
+
+```json
+{ "scope_name": "prod_scope", "url": "https://example.com/api/items",
+  "wait": { "challenge_timeout_ms": 10000 } }
+```
+
+The window is taken **from** the wait budget (capped at the effective `timeout_ms`), not added to
+it, and is only spent while a challenge is actually on the page: a page that is not a challenge
+continues immediately. After the challenge passes, the strategy and selectors apply to the new page
+as usual; if it does not pass in time, the challenge page is returned with its own `status_code`.
+Unset or `0` = do not wait. In other scopes the field has no effect.
+
 ### Available Strategies
 
 - **`network_idle`** (default) - Two phases. **Phase 1** waits for Chromium's `networkAlmostIdle`

@@ -194,6 +194,33 @@ pub trait WaitStrategy: Send + Sync {
         cancellation_token: &CancellationToken,
     ) -> Result<WaitResult>;
 
+    /// [`Self::wait`] on a budget of which `spent` is already used up — by waiting out an
+    /// anti-bot challenge (see `challenge.rs`), which is spent inside the request's wait budget,
+    /// not on top of it.
+    ///
+    /// The default shortens `timeout_ms` by `spent`, which is exact for a strategy whose whole
+    /// budget is `effective_timeout(timeout_ms)`. A strategy that derives its budget otherwise
+    /// (`network_idle` with a `wait_selector`) overrides it.
+    fn wait_after(
+        &self,
+        spent: Duration,
+        tab: &Arc<Tab>,
+        timeout_ms: u32,
+        wait_selector: Option<&str>,
+        skip_selector: Option<&str>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<WaitResult> {
+        let spent_ms = u32::try_from(spent.as_millis()).unwrap_or(u32::MAX);
+        let rest = if spent.is_zero() {
+            timeout_ms
+        } else {
+            effective_timeout(timeout_ms)
+                .saturating_sub(spent_ms)
+                .max(1)
+        };
+        self.wait(tab, rest, wait_selector, skip_selector, cancellation_token)
+    }
+
     /// Get the name of this strategy (for logging and identification)
     fn name(&self) -> &str;
 }
@@ -250,9 +277,55 @@ impl WaitStrategy for NetworkIdleStrategy {
         skip_selector: Option<&str>,
         cancellation_token: &CancellationToken,
     ) -> Result<WaitResult> {
+        self.run(
+            Duration::ZERO,
+            tab,
+            timeout_ms,
+            wait_selector,
+            skip_selector,
+            cancellation_token,
+        )
+    }
+
+    fn wait_after(
+        &self,
+        spent: Duration,
+        tab: &Arc<Tab>,
+        timeout_ms: u32,
+        wait_selector: Option<&str>,
+        skip_selector: Option<&str>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<WaitResult> {
+        self.run(
+            spent,
+            tab,
+            timeout_ms,
+            wait_selector,
+            skip_selector,
+            cancellation_token,
+        )
+    }
+
+    fn name(&self) -> &str {
+        "network_idle"
+    }
+}
+
+impl NetworkIdleStrategy {
+    /// The strategy with its clock started `spent` ago, so every phase's deadline — the total
+    /// budget and the selector search bounded by it — already accounts for the time spent.
+    fn run(
+        &self,
+        spent: Duration,
+        tab: &Arc<Tab>,
+        timeout_ms: u32,
+        wait_selector: Option<&str>,
+        skip_selector: Option<&str>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<WaitResult> {
         use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
-        let start = std::time::Instant::now();
+        let start = started_ago(spent);
         let poll_interval = std::time::Duration::from_millis(500);
 
         // Determine total timeout based on whether wait_selector is present
@@ -641,10 +714,12 @@ impl WaitStrategy for NetworkIdleStrategy {
         // No wait_selector - return success after network idle
         Ok(WaitResult::Success)
     }
+}
 
-    fn name(&self) -> &str {
-        "network_idle"
-    }
+/// An instant `spent` in the past (now, if the clock cannot go back that far).
+fn started_ago(spent: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_sub(spent).unwrap_or(now)
 }
 
 /// Timeout strategy - waits for a fixed duration
@@ -683,10 +758,55 @@ impl WaitStrategy for TimeoutStrategy {
         skip_selector: Option<&str>,
         cancellation_token: &CancellationToken,
     ) -> Result<WaitResult> {
+        self.run(
+            Duration::ZERO,
+            tab,
+            timeout_ms,
+            wait_selector,
+            skip_selector,
+            cancellation_token,
+        )
+    }
+
+    fn wait_after(
+        &self,
+        spent: Duration,
+        tab: &Arc<Tab>,
+        timeout_ms: u32,
+        wait_selector: Option<&str>,
+        skip_selector: Option<&str>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<WaitResult> {
+        self.run(
+            spent,
+            tab,
+            timeout_ms,
+            wait_selector,
+            skip_selector,
+            cancellation_token,
+        )
+    }
+
+    fn name(&self) -> &str {
+        "timeout"
+    }
+}
+
+impl TimeoutStrategy {
+    /// The strategy with its timeout clock started `spent` ago.
+    fn run(
+        &self,
+        spent: Duration,
+        tab: &Arc<Tab>,
+        timeout_ms: u32,
+        wait_selector: Option<&str>,
+        skip_selector: Option<&str>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<WaitResult> {
         // First wait for initial navigation to complete
         tab.wait_until_navigated()?;
 
-        let start = std::time::Instant::now();
+        let start = started_ago(spent);
         let poll_interval = Duration::from_millis(500);
 
         // Use effective_timeout: 0 → DEFAULT_WAIT_TIMEOUT_MS, X → min(X, MAX_WAIT_TIMEOUT_MS)
@@ -761,10 +881,6 @@ impl WaitStrategy for TimeoutStrategy {
             // Sleep before next poll
             sleep(poll_interval);
         }
-    }
-
-    fn name(&self) -> &str {
-        "timeout"
     }
 }
 

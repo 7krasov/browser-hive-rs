@@ -116,6 +116,20 @@ sum by (resource_type) (increase(browser_hive_worker_requests_blocked_by_type_to
 count by (request_host) (sum by (page_site, request_host) (increase(browser_hive_worker_third_party_requests_total{scope="<scope>"}[1d])) > 0)
 ```
 
+### Anti-bot challenge outcomes
+
+`browser_hive_worker_page_requests_total{scope, page_site, challenge}` — one increment per scrape request whose navigation got a page, **only in scopes with challenge detectors** (`ScopeConfig::challenge_detectors`; see CLAUDE.md, "Anti-bot challenges"). `challenge` is `none` (not a challenge), `passed`, `failed` (the window ran out) or `skipped` (a challenge on a request that asked for no window). `page_site` is the requested host, under the same `WORKER_THIRD_PARTY_METRICS_MAX_SERIES` cap as the third-party metrics — past it `page_site` becomes `other` but the outcome is kept. Its ceiling is `sites × 4`. Requests that end before a response is built (hard timeout, shutdown) are not counted.
+
+```promql
+# Share of requests challenged, per site
+sum by (page_site) (increase(browser_hive_worker_page_requests_total{scope="<scope>", challenge!="none"}[1d]))
+  / sum by (page_site) (increase(browser_hive_worker_page_requests_total{scope="<scope>"}[1d]))
+
+# Challenge pass rate, per site
+sum by (page_site) (increase(browser_hive_worker_page_requests_total{scope="<scope>", challenge="passed"}[1d]))
+  / sum by (page_site) (increase(browser_hive_worker_page_requests_total{scope="<scope>", challenge=~"passed|failed"}[1d]))
+```
+
 **Capacity model**: each worker runs `WORKER_MAX_CONTEXTS` CDP browser contexts (default: 3), one tab per context, and each context processes exactly one request at a time. So the concurrency unit is a **context**, not a worker pod:
 
 ```

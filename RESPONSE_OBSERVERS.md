@@ -23,8 +23,9 @@ scraper uses. "Response observers" is the name for that data path.
 
 Location: `worker/src/service.rs`, in `scrape_page_internal`, set up immediately before
 navigation and read just before building the response. The captured fields live in a small
-`MainDocumentResponse { status, headers }` struct (deliberately a struct, not a trait — see
-"Planned direction" below).
+`MainDocument { status, headers, url }` struct (`common/src/challenge.rs`; deliberately a struct,
+not a trait — see "Planned direction" below), held in `ObservedDocuments` together with a sequence
+number and a `loaded` flag that challenge waiting reads (CLAUDE.md, "Anti-bot challenges").
 
 1. **Enable the CDP `Network` domain** on the tab (`Network.enable`).
 2. **Register an event listener** (`tab.add_event_listener`) for `Network.responseReceived`.
@@ -36,7 +37,8 @@ navigation and read just before building the response. The captured fields live 
    via `requestWillBeSent.redirectResponse` (which this observer does **not** listen to), so
    `responseReceived` only fires for the **final** document — no ordering ambiguity, its
    `status` and `headers` are the final page's.
-5. **Store** `{ status, headers }` into a shared `Arc<Mutex<Option<MainDocumentResponse>>>`.
+5. **Store** `{ status, headers, url }` into a shared `Arc<Mutex<ObservedDocuments>>`, bumping its
+   sequence number; `loadingFinished`/`loadingFailed` of that request marks it loaded.
 6. **After navigation + wait**, drain the holder into `ScrapePageResponse.status_code` and
    `ScrapePageResponse.response_headers`.
 7. **Clean up** via `EventListenerGuard` (RAII): the listener is removed on drop on **every**

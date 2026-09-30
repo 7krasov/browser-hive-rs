@@ -2,38 +2,31 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
-## Wait out anti-bot challenges instead of exiting on their 403
+## Verify challenge waiting on production
 
-A site behind a JS challenge answers the first request with 403 (with a vendor header marking
-it as a challenge), its script runs for a few seconds (~4.5 s measured in a desktop browser)
-and then **navigates the main frame** to a new document with the real content (a form POST to
-the original URL). `network_idle` exits on the 403 at once, so a cold context never gets past
-the challenge; a warm one (challenge cookie present) is not challenged at all. Simply dropping
-the early exit would not work either: `networkAlmostIdle` fires in the middle of the challenge.
+**Status**: open — implemented (CLAUDE.md, "Anti-bot challenges"), not yet seen on a real challenge
 
-Prerequisite in place (unreleased): wait parameters are carried in `WaitOptions` (see
-CLAUDE.md, "Wait parameters live in `WaitOptions`"); the challenge window is added there.
+Verified by unit tests only (detector, the wait's state machine, tracker reset, metric cap); the
+decision was to verify on headful production scopes after release, not beforehand. To check:
+- `span_challenge="passed"` lines with a `status_code` 200 and real content; `challenge_ms` close to
+  the ~4.5 s a desktop browser needs;
+- `failed` outcomes: is the window too short, or does the challenge never pass in our browser
+  (then more waiting will not help and the window only costs budget);
+- after a pass, no false 5009 and no quarantine of the context;
+- the challenge iframe's document is not taken for the main document (excluded by the observer's
+  frame filter by construction — confirm no `passed` whose final URL is the challenge host).
 
-Plan:
+## Hard timeout shorter than `network_idle`'s budget when `wait_selector` is set
 
-1. **Challenge waiting.** Decided:
-   - A challenge is recognised by a `ChallengeDetector` trait (`common`), not by a status list,
-     applied to **every** main document. The base ships only a generic header matcher built
-     from data (no env, no vendor name); which headers count is the downstream worker's
-     decision. `ScopeConfig::challenge_detectors` is empty by default — that is the per-scope
-     switch; the per-request switch is `WaitOptions.challenge_timeout_ms > 0`. Both off → the
-     current code path, unchanged.
-   - Passed = a **new** main document the detectors do not flag; a new challenge document keeps
-     waiting in the same window; window expired → return what is there (quarantine as now).
-     After passing, the strategy's normal rules apply (idle / timeout / `wait_selector`).
-   - The window is spent **inside** the wait budget, never on top of it.
-   - The worker hands the strategy a probe onto the response observer (a new-document counter),
-     so `common` does not depend on the worker and no JS is evaluated during the challenge.
-   - 429 is not a challenge signal (IP rate limiting).
-   - Visibility: span fields `challenge`, `challenge_ms`; counter
-     `browser_hive_worker_page_requests_total{scope, page_site, challenge=none|passed|failed|skipped}`
-     with the third-party metrics' series cap.
-   - Verified on headful production scopes after release, not beforehand.
+**Status**: open, not scheduled (noticed 2026-09-30, pre-existing)
+
+With a `wait_selector`, `network_idle`'s total budget is always `DEFAULT_WAIT_TIMEOUT_MS` (40 s) and
+`timeout_ms` bounds only the selector search. The worker's hard timeout, however, is
+`wait_timeout + WAIT_STRATEGY_TIMEOUT_MARGIN_SECS` (`worker/src/service.rs`), where `wait_timeout`
+is the request's `timeout_ms`. So with `wait_selector` + `timeout_ms=5000` the hard timeout is 15 s
+while the strategy may legitimately run 40 s: a page that takes more than ~15 s to reach idle ends
+as `TIMEOUT_BROWSER` and its context is **discarded** as stuck. The fix is to derive the hard
+timeout from the strategy's real total budget; not done yet.
 
 ## Tune the block quarantine cooldown from real block durations
 

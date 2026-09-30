@@ -121,6 +121,8 @@ pub struct PageLoadTracker {
     loads: HashMap<String, Load>,
     /// Request id of the main document while it is still loading.
     main_document: Option<String>,
+    /// Request id of the latest main document, loaded or not.
+    last_document: Option<String>,
 }
 
 impl PageLoadTracker {
@@ -129,6 +131,7 @@ impl PageLoadTracker {
             page_host: host_of(requested_url).unwrap_or_default(),
             loads: HashMap::new(),
             main_document: None,
+            last_document: None,
         }
     }
 
@@ -142,6 +145,18 @@ impl PageLoadTracker {
         is_main_document: bool,
     ) {
         if is_main_document {
+            // A second main document replaced the page (a passed anti-bot challenge, a script
+            // navigation): the loads of the page it replaced say nothing about the one that is
+            // judged — a challenge page's own 403 sub-resources would otherwise read as markers.
+            // A redirect keeps its request id and clears nothing.
+            if self
+                .last_document
+                .as_deref()
+                .is_some_and(|last| last != request_id)
+            {
+                self.loads.clear();
+            }
+            self.last_document = Some(request_id.to_string());
             self.main_document = Some(request_id.to_string());
             return;
         }
@@ -505,6 +520,27 @@ mod tests {
         fail(&mut t, "1", "net::ERR_EMPTY_RESPONSE");
         t.will_be_sent("doc", PAGE, Some(&ResourceType::Document), true);
         assert_eq!(markers(&t)[0], "main document still loading");
+    }
+
+    #[test]
+    fn a_new_main_document_forgets_the_loads_of_the_page_it_replaced() {
+        let mut t = tracker();
+        t.will_be_sent("doc1", PAGE, Some(&ResourceType::Document), true);
+        send(
+            &mut t,
+            "1",
+            "https://www.example.com/c.js",
+            ResourceType::Script,
+        );
+        t.response("1", 403);
+        t.finished("doc1");
+        // A redirect of the same document keeps what was recorded.
+        t.will_be_sent("doc1", PAGE, Some(&ResourceType::Document), true);
+        t.finished("doc1");
+        assert_eq!(markers(&t).len(), 1);
+        t.will_be_sent("doc2", PAGE, Some(&ResourceType::Document), true);
+        t.finished("doc2");
+        assert!(markers(&t).is_empty());
     }
 
     #[test]

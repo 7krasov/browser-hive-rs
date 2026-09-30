@@ -16,6 +16,8 @@ pub struct ResolvedWait {
     pub timeout_ms: u32,
     pub wait_selector: String,
     pub skip_selector: String,
+    /// No flat counterpart: unset means `0`, i.e. no challenge waiting.
+    pub challenge_timeout_ms: u32,
 }
 
 fn pick<T: Clone>(set: Option<&T>, flat: &T) -> T {
@@ -41,6 +43,7 @@ macro_rules! impl_wait_resolution {
                         w.and_then(|w| w.skip_selector.as_ref()),
                         &self.skip_selector,
                     ),
+                    challenge_timeout_ms: w.and_then(|w| w.challenge_timeout_ms).unwrap_or(0),
                 }
             }
         }
@@ -58,6 +61,7 @@ impl From<&ResolvedWait> for worker::WaitOptions {
             timeout_ms: Some(r.timeout_ms),
             wait_selector: Some(r.wait_selector.clone()),
             skip_selector: Some(r.skip_selector.clone()),
+            challenge_timeout_ms: Some(r.challenge_timeout_ms),
         }
     }
 }
@@ -84,6 +88,7 @@ mod tests {
             timeout_ms: 5000,
             wait_selector: ".content".into(),
             skip_selector: ".captcha".into(),
+            challenge_timeout_ms: 0,
         }
     }
 
@@ -107,7 +112,7 @@ mod tests {
 
     #[test]
     fn each_set_field_overrides_only_its_own_flat_counterpart() {
-        let cases: [(WaitOptions, fn(&mut ResolvedWait)); 4] = [
+        let cases: [(WaitOptions, fn(&mut ResolvedWait)); 5] = [
             (
                 WaitOptions {
                     strategy: Some("network_idle".into()),
@@ -136,6 +141,13 @@ mod tests {
                 },
                 |r| r.skip_selector = "#y".into(),
             ),
+            (
+                WaitOptions {
+                    challenge_timeout_ms: Some(8000),
+                    ..Default::default()
+                },
+                |r| r.challenge_timeout_ms = 8000,
+            ),
         ];
         for (options, apply) in cases {
             let mut expected = flat_resolved();
@@ -156,6 +168,7 @@ mod tests {
                 timeout_ms: Some(0),
                 wait_selector: Some(String::new()),
                 skip_selector: Some(String::new()),
+                challenge_timeout_ms: Some(0),
             }),
             ..flat()
         };

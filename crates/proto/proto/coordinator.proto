@@ -55,6 +55,11 @@ message WaitOptions {
   optional string wait_selector = 3;
   // Same meaning as the flat `skip_selector`
   optional string skip_selector = 4;
+  // How long to wait for an anti-bot challenge page to pass, in ms, spent inside the wait budget
+  // (capped at the effective wait timeout). 0/unset = do not wait: the challenge page is returned
+  // as before. Has an effect only in scopes configured to recognise challenges; there the page
+  // that finally comes back is what `status_code` and `content` describe.
+  optional uint32 challenge_timeout_ms = 5;
 }
 
 message ScrapePageRequest {

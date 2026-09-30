@@ -4,8 +4,9 @@ use crate::diagnostics::DiagnosticsLimiter;
 use crate::metrics::Metrics;
 use anyhow::Result;
 use browser_hive_common::{
-    effective_timeout, utils, validate_timeout, ProxyParams, SessionMode, WaitResult,
-    WaitStrategyRegistry, WorkerConfig, MAX_WAIT_TIMEOUT_MS,
+    effective_timeout, utils, validate_timeout, ChallengeOutcome, DocumentSnapshot, MainDocument,
+    MainDocumentProbe, ProxyParams, SessionMode, WaitResult, WaitStrategyRegistry, WorkerConfig,
+    MAX_WAIT_TIMEOUT_MS,
 };
 use std::time::Duration;
 
@@ -59,21 +60,43 @@ impl Drop for EventListenerGuard {
     }
 }
 
-/// Wire-level facts of the main navigation captured by the response observer from the
-/// top-level document `Network.responseReceived` event. See RESPONSE_OBSERVERS.md.
+/// Main-frame documents of one request, captured by the response observer from the top-level
+/// document `Network.responseReceived` event. See RESPONSE_OBSERVERS.md.
 ///
-/// This is a small struct rather than a `ResponseObserver` trait on purpose: two fixed
-/// fields (status + headers) do not justify an abstraction. Extract a trait only when
-/// signals become pluggable/per-scope or numerous (exit-IP, redirect chain, protocol…).
+/// The latest response wins (the final document after redirects, or the one a passed challenge
+/// navigated to), which is what `status_code` / `response_headers` report. `seq` and `loaded` exist
+/// for challenge waiting (`challenge.rs`): a new document is told apart from the first one by its
+/// number, and is waited on only once its body has arrived, when it has replaced the previous one.
 #[derive(Default)]
-struct MainDocumentResponse {
-    /// HTTP status of the final main-document response (0 if unknown/uncaptured).
-    status: u32,
-    /// Response headers of the final main-document response.
-    headers: std::collections::HashMap<String, String>,
-    /// URL of the final main-document response (empty if uncaptured). Used to detect
-    /// off-domain redirects — this is the authoritative landing URL from the network layer.
-    url: String,
+struct ObservedDocuments {
+    latest: Option<MainDocument>,
+    /// CDP request id of `latest`, to match its `loadingFinished`/`loadingFailed`.
+    request_id: String,
+    seq: u64,
+    loaded: bool,
+}
+
+/// The challenge wait's read-only view of [`ObservedDocuments`].
+struct ObservedDocumentProbe(Arc<std::sync::Mutex<ObservedDocuments>>);
+
+impl MainDocumentProbe for ObservedDocumentProbe {
+    fn latest(&self) -> Option<DocumentSnapshot> {
+        let docs = self.0.lock().ok()?;
+        docs.latest.as_ref().map(|doc| DocumentSnapshot {
+            seq: docs.seq,
+            loaded: docs.loaded,
+            doc: doc.clone(),
+        })
+    }
+}
+
+/// Marks the latest main document loaded once its body finished (or failed) to arrive.
+fn mark_document_loaded(docs: &std::sync::Mutex<ObservedDocuments>, request_id: &str) {
+    if let Ok(mut docs) = docs.lock() {
+        if docs.latest.is_some() && docs.request_id == request_id {
+            docs.loaded = true;
+        }
+    }
 }
 
 /// How many distinct kinds of proxy failure are kept per request before only the count grows.
@@ -778,6 +801,43 @@ impl WorkerService {
     /// deciding it is usually shared across both. The same unit the off-domain redirect check
     /// uses, for the same reason.
     ///
+    /// The request's challenge outcome, on the span (`challenge`, and `challenge_ms` when one was
+    /// waited on) and in `page_requests_total` — only in scopes that recognise challenges, and
+    /// only for requests whose navigation got a page. `waited` is the challenge phase's result;
+    /// without one (the request asked for no window) the final document is classified as it
+    /// stands, and a challenge nobody waited on is `skipped`.
+    fn record_challenge(
+        &self,
+        url: &str,
+        final_document: &MainDocument,
+        navigated: bool,
+        waited: Option<(ChallengeOutcome, Duration)>,
+    ) {
+        let detectors = &self.config.scope.challenge_detectors;
+        if detectors.is_empty() || !navigated {
+            return;
+        }
+        let span = tracing::Span::current();
+        let outcome = match waited {
+            Some((outcome, spent)) => {
+                if outcome != ChallengeOutcome::None {
+                    span.record("challenge_ms", spent.as_millis() as u64);
+                }
+                outcome
+            }
+            None if browser_hive_common::challenge::is_challenge(detectors, final_document) => {
+                ChallengeOutcome::Skipped
+            }
+            None => ChallengeOutcome::None,
+        };
+        span.record("challenge", outcome.as_str());
+        let site = crate::third_party::host_of(url)
+            .unwrap_or_else(|| crate::third_party::UNKNOWN_SITE.to_string());
+        self.metrics
+            .third_party
+            .page_request(&site, outcome.as_str());
+    }
+
     /// `None` — no quarantine bookkeeping at all — when the scope has the feature off, when the
     /// mode cannot act on it (only `reusable` chooses between contexts), or when the URL has no
     /// registrable domain (an IP literal, a non-HTTP scheme). Erring toward `None` keeps the
@@ -1486,8 +1546,8 @@ impl WorkerService {
         // inspector`. A mistyped pattern blocks nothing and looks exactly like a page that
         // carries no trackers, so without this count there is no way to tell from production
         // whether a list is in force.
-        let main_response_holder: Arc<std::sync::Mutex<Option<MainDocumentResponse>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let main_response_holder: Arc<std::sync::Mutex<ObservedDocuments>> =
+            Arc::new(std::sync::Mutex::new(ObservedDocuments::default()));
         let proxy_failure_holder: Arc<std::sync::Mutex<ProxyFailures>> =
             Arc::new(std::sync::Mutex::new(ProxyFailures::default()));
         let blocked_url_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1569,6 +1629,7 @@ impl WorkerService {
                             }
                         }
                         if let Event::NetworkLoadingFinished(ev) = event {
+                            mark_document_loaded(&holder, &ev.params.request_id);
                             if let Ok(mut loads) = loads.lock() {
                                 loads.finished(&ev.params.request_id);
                             }
@@ -1577,6 +1638,7 @@ impl WorkerService {
                             }
                         }
                         if let Event::NetworkLoadingFailed(ev) = event {
+                            mark_document_loaded(&holder, &ev.params.request_id);
                             if is_proxy_error(&ev.params.error_text) {
                                 proxy_holder.lock().unwrap().record(format!(
                                     "{:?} {}",
@@ -1641,11 +1703,15 @@ impl WorkerService {
                                     _ => std::collections::HashMap::new(),
                                 };
                                 // Last matching response wins (final URL after redirects).
-                                *holder.lock().unwrap() = Some(MainDocumentResponse {
-                                    status: ev.params.response.status,
+                                let mut docs = holder.lock().unwrap();
+                                docs.latest = Some(MainDocument::new(
+                                    ev.params.response.status,
                                     headers,
-                                    url: ev.params.response.url.clone(),
-                                });
+                                    ev.params.response.url.clone(),
+                                ));
+                                docs.request_id = ev.params.request_id.clone();
+                                docs.seq += 1;
+                                docs.loaded = false;
                             }
                         }
                     });
@@ -1815,6 +1881,19 @@ impl WorkerService {
         let wait_selector = wait_selector_owned.as_deref();
         let skip_selector = skip_selector_owned.as_deref();
 
+        // Challenge window: only in a scope that recognises challenges, only when the request
+        // asks for one, and never past the wait budget it is spent from. Zero = the challenge
+        // phase does not run and the strategy starts exactly as it always did.
+        let challenge_detectors = self.config.scope.challenge_detectors.clone();
+        let challenge_window = if challenge_detectors.is_empty() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(wait.challenge_timeout_ms.min(wait_timeout) as u64)
+        };
+        // The outcome of the challenge phase and the time it took, set by the blocking task.
+        let challenge_waited: Arc<std::sync::Mutex<Option<(ChallengeOutcome, Duration)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         // Save strategy name before moving strategy into closure
         let strategy_name = strategy.name().to_string();
 
@@ -1825,11 +1904,12 @@ impl WorkerService {
 
         // Log selector configuration
         info!(
-            "Wait strategy config: strategy={},  wait_timeout={}ms, wait_selector={:?}, skip_selector={:?}",
+            "Wait strategy config: strategy={},  wait_timeout={}ms, wait_selector={:?}, skip_selector={:?}, challenge_window={:?}",
             strategy_name,
             wait_timeout,
             wait_selector,
-            skip_selector
+            skip_selector,
+            challenge_window
         );
 
         // Wait for page to load using selected strategy with selector checking
@@ -1850,11 +1930,33 @@ impl WorkerService {
             // (ray_id, url, context_id, wait_strategy, wait_timeout_ms, …) from the span.
             let wait_span = tracing::Span::current();
 
+            let probe = ObservedDocumentProbe(main_response_holder.clone());
+            let challenge_cell = challenge_waited.clone();
+
             let wait_handle = tokio::task::spawn_blocking(move || {
                 let _span_guard = wait_span.enter();
                 let wait_sel_ref = wait_selector_for_closure.as_deref();
                 let skip_sel_ref = skip_selector_for_closure.as_deref();
-                strategy_clone.wait(
+                // A challenge is waited out before the strategy runs, so the strategy — selectors
+                // included — sees the page that replaced it; the time is taken from its budget.
+                let spent = if challenge_window.is_zero() {
+                    Duration::ZERO
+                } else {
+                    let started = std::time::Instant::now();
+                    let outcome = browser_hive_common::challenge::wait_out_challenge(
+                        &probe,
+                        &challenge_detectors,
+                        challenge_window,
+                        &cancellation_token,
+                    )?;
+                    let spent = started.elapsed();
+                    if let Ok(mut cell) = challenge_cell.lock() {
+                        *cell = Some((outcome, spent));
+                    }
+                    spent
+                };
+                strategy_clone.wait_after(
+                    spent,
                     &tab_clone,
                     wait_timeout,
                     wait_sel_ref,
@@ -2066,15 +2168,24 @@ impl WorkerService {
         // DO NOT close tab - keep it for session reuse!
 
         // Drain the captured main-document response (status + headers + final URL).
-        let MainDocumentResponse {
+        let final_document = main_response_holder
+            .lock()
+            .unwrap()
+            .latest
+            .take()
+            .unwrap_or_default();
+        self.record_challenge(
+            &req.url,
+            &final_document,
+            navigation_result.is_ok(),
+            challenge_waited.lock().ok().and_then(|w| *w),
+        );
+        let MainDocument {
             status: observed_status,
             headers: response_headers,
             url: observed_url,
-        } = main_response_holder
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or_default();
+            ..
+        } = final_document;
 
         // HTTP status code: prefer the authoritative value from the CDP response observer.
         // Fall back to the Performance API only when the observer captured nothing — the
@@ -2377,6 +2488,8 @@ impl WorkerServiceTrait for WorkerService {
             context_id = tracing::field::Empty,
             proxy_host = tracing::field::Empty,
             blocked_requests = tracing::field::Empty,
+            challenge = tracing::field::Empty,
+            challenge_ms = tracing::field::Empty,
         );
         let wait = req.resolved_wait();
         if !wait.wait_selector.is_empty() {

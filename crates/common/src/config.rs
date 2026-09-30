@@ -110,6 +110,13 @@ pub struct ScopeConfig {
     /// `sessionStorage` of the previous page. The close is detached, never awaited.
     /// Only `reusable` acts on it; [`ScopeConfig::validate`] warns elsewhere.
     pub close_tab_after_request: bool,
+
+    /// Recognise anti-bot challenge pages, so a request that asks for it (`WaitOptions.
+    /// challenge_timeout_ms`) can wait for the challenge to pass instead of returning its page.
+    /// Empty = no challenge is ever recognised, and the request path is exactly what it is without
+    /// the feature. Which responses mean "challenge" is a property of the sites a deployment
+    /// scrapes, so the base configures none; see `challenge.rs`.
+    pub challenge_detectors: Vec<std::sync::Arc<dyn crate::challenge::ChallengeDetector>>,
 }
 
 /// Controls how browser contexts share state within a Chrome process
@@ -274,6 +281,14 @@ impl std::fmt::Debug for ScopeConfig {
                 &self.disable_back_forward_cache,
             )
             .field("close_tab_after_request", &self.close_tab_after_request)
+            .field(
+                "challenge_detectors",
+                &self
+                    .challenge_detectors
+                    .iter()
+                    .map(|d| d.name())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -1022,6 +1037,7 @@ mod tests {
             block_quarantine: Duration::ZERO,
             disable_back_forward_cache: false,
             close_tab_after_request: false,
+            challenge_detectors: vec![],
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod browser_middleware;
+pub mod challenge;
 pub mod config;
 pub mod logging;
 pub mod proxy;
@@ -12,6 +13,10 @@ pub use browser_middleware::{
     BlockedResourceType, BlockedResourceTypesMiddleware, BlockedUrlsMiddleware,
     BraveBinaryParamsMiddleware, BrowserBinaryParamsMiddleware, DefaultBinaryParamsMiddleware,
     DefaultTabInitMiddleware, TabInitMiddleware,
+};
+pub use challenge::{
+    ChallengeDetector, ChallengeOutcome, DocumentSnapshot, HeaderChallengeDetector, MainDocument,
+    MainDocumentProbe,
 };
 pub use config::*;
 pub use logging::init_logging;

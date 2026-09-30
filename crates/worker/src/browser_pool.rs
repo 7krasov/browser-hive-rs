@@ -2030,6 +2030,7 @@ mod tests {
             block_quarantine: Duration::ZERO,
             disable_back_forward_cache: false,
             close_tab_after_request: false,
+            challenge_detectors: vec![],
         }
     }
 

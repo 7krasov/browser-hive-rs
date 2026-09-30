@@ -177,6 +177,12 @@ soon as the status is seen, instead of spending the rest of its budget polling f
 that cannot appear — measured at 38.8 s of a 40 s budget before the change. The `timeout`
 strategy still burns its full budget by design.
 
+**Anti-bot challenges** are the exception a scope can opt into: when its challenge detectors flag
+the page and the request sets `wait.challenge_timeout_ms`, the worker waits for the challenge's
+own navigation to the real document first (inside the wait budget). The response then describes
+the page that finally came back — `200` and the content if the challenge passed, the challenge's
+own status (usually 403) if the window ran out. Still no error code either way.
+
 #### When 5007 is returned
 
 Detection is keyed on Chromium's error taxonomy (`ERR_TUNNEL_CONNECTION_FAILED`,

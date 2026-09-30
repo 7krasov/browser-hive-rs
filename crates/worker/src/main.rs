@@ -203,6 +203,8 @@ fn load_config_from_env(
         block_quarantine,
         disable_back_forward_cache,
         close_tab_after_request,
+        // Which responses are challenges is the deployment's call; the base recognises none.
+        challenge_detectors: vec![],
     };
 
     Ok(WorkerConfig {

@@ -110,6 +110,9 @@ struct CappedCounter {
     counter: IntCounterVec,
     admitted: Mutex<HashSet<(String, String)>>,
     cap: usize,
+    /// Keep the second label past the cap instead of folding it into `other`: set for a label
+    /// from a small closed set (an outcome), whose breakdown matters more than the site's.
+    keep_second_on_overflow: bool,
 }
 
 impl CappedCounter {
@@ -127,6 +130,7 @@ impl CappedCounter {
             counter,
             admitted: Mutex::new(HashSet::new()),
             cap,
+            keep_second_on_overflow: false,
         })
     }
 
@@ -141,7 +145,15 @@ impl CappedCounter {
         let labels = if admitted {
             [scope, page_site, host]
         } else {
-            [scope, OVERFLOW, OVERFLOW]
+            [
+                scope,
+                OVERFLOW,
+                if self.keep_second_on_overflow {
+                    host
+                } else {
+                    OVERFLOW
+                },
+            ]
         };
         self.counter.with_label_values(&labels).inc();
     }
@@ -153,6 +165,9 @@ pub struct ThirdPartyMetrics {
     requests: CappedCounter,
     blocked: CappedCounter,
     blocked_by_type: CappedCounter,
+    /// Scrape requests per requested site by what happened to an anti-bot challenge. Not a
+    /// third-party signal, but keyed on the same `page_site` and bounded by the same cap.
+    page_requests: CappedCounter,
 }
 
 impl ThirdPartyMetrics {
@@ -187,7 +202,24 @@ impl ThirdPartyMetrics {
                 "resource_type",
                 max_series,
             )?,
+            page_requests: CappedCounter {
+                keep_second_on_overflow: true,
+                ..CappedCounter::register(
+                    registry,
+                    "browser_hive_worker_page_requests_total",
+                    "Scrape requests per requested site, by anti-bot challenge outcome \
+                     (none, passed, failed, skipped); only in scopes that recognise challenges",
+                    "challenge",
+                    max_series,
+                )?
+            },
         })
+    }
+
+    /// Counts one scrape request to `page_site` with its challenge outcome (`none`, `passed`,
+    /// `failed`, `skipped`).
+    pub fn page_request(&self, page_site: &str, challenge: &str) {
+        self.page_requests.inc(&self.scope, page_site, challenge);
     }
 
     /// Per-request state for counting the loads of one page, attributed to `page_site`.
@@ -440,6 +472,15 @@ mod tests {
         assert_eq!(value(&m.iframes, "a.com", "x.net"), 2);
         assert_eq!(value(&m.iframes, "a.com", "y.net"), 1);
         assert_eq!(value(&m.iframes, OVERFLOW, OVERFLOW), 1);
+    }
+
+    #[test]
+    fn page_requests_keep_the_challenge_outcome_past_the_cap() {
+        let m = metrics(1);
+        m.page_request("a.com", "passed");
+        m.page_request("b.com", "failed");
+        assert_eq!(value(&m.page_requests, "a.com", "passed"), 1);
+        assert_eq!(value(&m.page_requests, OVERFLOW, "failed"), 1);
     }
 
     #[test]
