@@ -169,9 +169,12 @@ pub fn wait_out_challenge(
 ) -> Result<ChallengeOutcome> {
     let start = Instant::now();
     let mut first: Option<u64> = None;
+    // The last document seen, for the `failed` log line: whether the challenge ever navigated.
+    let mut last: Option<(u64, u32, bool)> = None;
     loop {
         check_cancellation(cancellation_token, "challenge")?;
         if let Some(snapshot) = probe.latest() {
+            last = Some((snapshot.seq, snapshot.doc.status, snapshot.loaded));
             match first {
                 None => {
                     if !is_challenge(detectors, &snapshot.doc) {
@@ -203,8 +206,17 @@ pub fn wait_out_challenge(
         if start.elapsed() >= window {
             return Ok(match first {
                 None => ChallengeOutcome::None,
-                Some(_) => {
-                    tracing::info!("Challenge not passed within {:?}", window);
+                Some(first_seq) => {
+                    // 0 later documents: the challenge never submitted (the browser did not pass
+                    // its client-side checks); later ones still flagged: the vendor rejected it.
+                    let (seq, status, loaded) = last.unwrap_or((first_seq, 0, false));
+                    tracing::info!(
+                        "Challenge not passed within {:?}: {} later document(s), last HTTP {} loaded={}",
+                        window,
+                        seq.saturating_sub(first_seq),
+                        status,
+                        loaded
+                    );
                     ChallengeOutcome::Failed
                 }
             });

@@ -4,7 +4,19 @@ Open items that need investigation or a decision. Remove an item once it is reso
 
 ## Verify challenge waiting on production
 
-**Status**: open — implemented (CLAUDE.md, "Anti-bot challenges"), not yet seen on a real challenge
+**Status**: open — released v0.44.0; first production results 2026-10-02: no `passed` yet
+
+First results (one site, headless and headful scopes): the mechanism works — challenge detected,
+window spent inside the budget, the challenge iframe loaded, nothing of the vendor's blocked — but
+nothing passed. The challenge page names its own type in its inline config:
+- **datacenter IPs** get the *interactive* type (a click is required): no window can pass it, and
+  some datacenter IPs get a hard block instead (no challenge header, correctly not waited on);
+- a **residential IP** got the *managed* type (the vendor decides without a click) and still
+  failed within 10 s — the browser itself is judged, so this is the case to debug.
+Next: the same request through a residential + headful scope (headless signals vs the rest), once
+with a 25 s window; v0.44.1 logs how many later documents arrived in the `failed` line (0 = the
+challenge never submitted, i.e. failed client-side checks).
+
 
 Verified by unit tests only (detector, the wait's state machine, tracker reset, metric cap); the
 decision was to verify on headful production scopes after release, not beforehand. To check:

@@ -2488,6 +2488,7 @@ impl WorkerServiceTrait for WorkerService {
             context_id = tracing::field::Empty,
             proxy_host = tracing::field::Empty,
             blocked_requests = tracing::field::Empty,
+            challenge_timeout_ms = tracing::field::Empty,
             challenge = tracing::field::Empty,
             challenge_ms = tracing::field::Empty,
         );
@@ -2500,6 +2501,10 @@ impl WorkerServiceTrait for WorkerService {
         }
         if !req.country_code.is_empty() {
             span.record("country_code", req.country_code.as_str());
+        }
+        // As the client sent it; the window actually used is in the "Wait strategy config" line.
+        if wait.challenge_timeout_ms > 0 {
+            span.record("challenge_timeout_ms", wait.challenge_timeout_ms);
         }
 
         async move {
