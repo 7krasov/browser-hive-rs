@@ -311,6 +311,42 @@ fn pick_most_free(
     tied.get(index).copied()
 }
 
+/// One line per pod of a scope, for the log of a capacity rejection: free slots as routing sees
+/// them, the cached figure under that estimate, and whether the pod was eligible at all.
+///
+/// Sorted by pod name so two lines from the same moment can be compared at a glance.
+fn describe_scope_capacity(
+    scope_workers: &[WorkerEndpoint],
+    healthy_workers: &HashSet<String>,
+    free_slots: impl Fn(&WorkerEndpoint) -> usize,
+) -> String {
+    let mut pods: Vec<&WorkerEndpoint> = scope_workers.iter().collect();
+    pods.sort_by(|a, b| a.pod_name.cmp(&b.pod_name));
+    pods.iter()
+        .map(|w| {
+            let health = if healthy_workers.contains(&w.pod_name) {
+                "healthy"
+            } else {
+                "unhealthy"
+            };
+            let terminating = if w.is_terminating {
+                ", terminating"
+            } else {
+                ""
+            };
+            format!(
+                "{} free={} cached={} ({}{})",
+                w.pod_name,
+                free_slots(w),
+                w.stats.available_slots,
+                health,
+                terminating
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Fetch fresh stats from a worker to verify slot availability
 /// Returns None if the call fails (timeout, connection error, etc.)
 ///
@@ -837,9 +873,28 @@ impl ScraperCoordinator for CoordinatorService {
                         );
                         // Continue with the request
                     }
-                    _ => {
+                    fresh_slots => {
                         // Fresh stats confirm no slots, or fetch failed - reject.
                         // This is the capacity signal: demand that existed and was refused.
+                        //
+                        // Logged, because this is the one rejection the client sees that leaves
+                        // no other trace: the request never reaches a worker, and the metric
+                        // carries no url or ray_id. The pod breakdown is read again here rather
+                        // than kept from the routing decision, so it costs nothing on the
+                        // request path; it may differ slightly from what routing saw.
+                        let healthy_guard = self.healthy_workers.read().await;
+                        let pods = describe_scope_capacity(scope_workers, &healthy_guard, |w| {
+                            self.in_flight.free_slots(w)
+                        });
+                        drop(healthy_guard);
+                        let fresh = match fresh_slots {
+                            Some(slots) => format!("fresh stats: {slots} free"),
+                            None => "fresh stats unavailable".to_string(),
+                        };
+                        warn!(
+                            "No available slots in scope {}, request rejected: selected {} ({}); pods: {}",
+                            req.scope_name, best_worker.pod_name, fresh, pods
+                        );
                         request_metrics.reject(RejectReason::NoSlots);
                         let execution_time_ms = start_time.elapsed().as_millis() as u64;
                         return Ok(Response::new(ScrapePageResponse {
@@ -1368,6 +1423,22 @@ mod tests {
             .collect();
 
         assert_eq!(picked, vec!["worker-1", "worker-2", "worker-3"]);
+    }
+
+    /// The rejection log names every pod in a stable order, with both the routed and the cached
+    /// figure, so a cache that disagrees with in-flight accounting is visible in one line.
+    #[test]
+    fn capacity_description_lists_every_pod_sorted() {
+        let mut terminating = make_worker("worker-a", 0);
+        terminating.is_terminating = true;
+        let workers = vec![make_worker("worker-b", 1), terminating];
+        let healthy: HashSet<String> = ["worker-b".to_string()].into_iter().collect();
+
+        let line = describe_scope_capacity(&workers, &healthy, |_| 0);
+        assert_eq!(
+            line,
+            "worker-a free=0 cached=0 (unhealthy, terminating), worker-b free=0 cached=1 (healthy)"
+        );
     }
 
     // ==================== select_best_worker Tests ====================
