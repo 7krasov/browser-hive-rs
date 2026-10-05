@@ -13,9 +13,13 @@ nothing passed. The challenge page names its own type in its inline config:
   some datacenter IPs get a hard block instead (no challenge header, correctly not waited on);
 - a **residential IP** got the *managed* type (the vendor decides without a click) and still
   failed within 10 s — the browser itself is judged, so this is the case to debug.
-Next: the same request through a residential + headful scope (headless signals vs the rest), once
-with a 25 s window; v0.44.1 logs how many later documents arrived in the `failed` line (0 = the
-challenge never submitted, i.e. failed client-side checks).
+Residential + headful (2026-10-02, v0.44.1): *managed* again, `0 later document(s)` with both a
+10 s and a 20 s window — not the window and not headless alone: the challenge never submits, i.e.
+the browser fails the vendor's client-side checks. What every scope shares: Brave on Linux, no GPU
+(software GL), minimal fonts, CDP attached (`Page`/`Network`/`Fetch` for proxy auth — `Runtime` is
+*not* enabled, checked in the pinned headless_chrome). Only 2 exit IPs were tried (pool of 2, both
+quarantined and reused). Finding which signal fails is a fingerprinting investigation, not a
+challenge-waiting bug; until then a window on such a site only costs its length per request.
 
 
 Verified by unit tests only (detector, the wait's state machine, tracker reset, metric cap); the
