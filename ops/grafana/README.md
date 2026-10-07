@@ -132,15 +132,6 @@ resources" section of METRICS.md.
 - **Worker RSS / threads** - growth with uptime is a leak in the worker process itself.
 - **CPU per pod vs. container request and limit** - usage climbing on an almost idle pod is the
   browser burning CPU on its own; usage pinned at the limit is throttling.
-- **Third-party hosts row** - top 100 tables over the dashboard range, for choosing block list
-  patterns: iframes, loads that went out, and loads the list blocked. Each comes by host (summed
-  over sites) and by site and host. A host still high in the loads table is not matched by any
-  pattern; a row with `page_site="other"` means a worker reached its cap on label combinations.
-  Loads inside a cross-site iframe are not counted, and the list does not block iframes. The last
-  two panels show loads dropped by resource type (`WORKER_BLOCKED_RESOURCE_TYPES`), over time and
-  by site; they stay empty on a scope that blocks no type. See the "Third-party hosts and iframes"
-  section of METRICS.md.
-
 Gaps mean a source could not be read: a worker version without these gauges, a non-Linux
 host (process gauges), or a target probe that failed or ran past its 3 s budget.
 
@@ -172,5 +163,27 @@ If those series are missing, the panels show only the Browser Hive lines, or not
 check, run each metric name above in Grafana Explore. Cloud-provider system metrics (for
 example GKE's `kubernetes.io/container/memory/limit_bytes` in Cloud Monitoring) live in a
 different backend and cannot be combined with these PromQL queries.
+
+## `browser-hive-pages-dashboard.json` - Pages
+
+What the scraped pages did: anti-bot challenges and the third-party hosts they load. Variables
+are the same as in Browser Resources (Scope, Pod).
+
+### Reading it
+
+- **Challenges row** - three top tables per scope and requested site: **Failed** (the window ran
+  out, the client got the challenge page), **Skipped** (a challenge on a request with no
+  `challenge_timeout_ms`) and **Passed**. They come from
+  `browser_hive_worker_page_requests_total` and stay empty on scopes without challenge
+  detectors. Why a challenge failed is in the worker's `failed` log line (see CLAUDE.md,
+  "Anti-bot challenges").
+- **Third-party hosts row** - top 100 tables over the dashboard range, for choosing block list
+  patterns: iframes, loads that went out, and loads the list blocked. Each comes by host (summed
+  over sites) and by site and host. A host still high in the loads table is not matched by any
+  pattern; a row with `page_site="other"` means a worker reached its cap on label combinations.
+  Loads inside a cross-site iframe are not counted, and the list does not block iframes. The last
+  two panels show loads dropped by resource type (`WORKER_BLOCKED_RESOURCE_TYPES`), over time and
+  by site; they stay empty on a scope that blocks no type. See the "Third-party hosts and iframes"
+  section of METRICS.md.
 
 See [../../METRICS.md](../../METRICS.md) for metric semantics, sizing math, and KEDA guidance.
