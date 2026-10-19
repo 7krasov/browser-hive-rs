@@ -82,6 +82,67 @@ struct SelectorCheckResult {
     selector_search_error: Option<String>,
 }
 
+/// Verdict for a wait that ran out of budget: `wait_selector` decides it if present
+/// (one last check), otherwise there is nothing left to wait for.
+fn final_selector_verdict(
+    wait_selector: Option<&str>,
+    check: impl FnOnce(&str) -> Result<bool>,
+) -> Result<WaitResult> {
+    let Some(selector) = wait_selector else {
+        return Ok(WaitResult::Success);
+    };
+    if check(selector)? {
+        tracing::info!("Wait selector '{}' found on final check", selector);
+        return Ok(WaitResult::Success);
+    }
+    Ok(WaitResult::WaitSelectorNotFound)
+}
+
+/// Phase 1.5 script: resolves on the 'load' event, after `max_wait`, or - when a
+/// `wait_selector` is given - as soon as it matches (polled every 100 ms). Without the
+/// last one, a page whose 'load' never fires (a stuck image or tracker) held the request
+/// here for the whole remaining budget while the selector was already in the DOM.
+fn document_ready_script(max_wait: Duration, wait_selector: Option<&str>) -> String {
+    let selector = wait_selector
+        .and_then(|s| serde_json::to_string(s).ok())
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        r#"
+        (async function() {{
+            const selector = {selector};
+            const found = () => {{
+                try {{ return selector !== null && document.querySelector(selector) !== null; }}
+                catch (e) {{ return false; }}
+            }};
+            const result = await new Promise((resolve) => {{
+                if (document.readyState === 'complete') {{
+                    resolve({{ state: 'already-complete', timeMs: 0 }});
+                    return;
+                }}
+                if (found()) {{
+                    resolve({{ state: 'selector-found', timeMs: 0 }});
+                    return;
+                }}
+                const startTime = Date.now();
+                let poll = null;
+                const finish = (state) => {{
+                    clearTimeout(timeout);
+                    if (poll !== null) clearInterval(poll);
+                    resolve({{ state, timeMs: Date.now() - startTime }});
+                }};
+                const timeout = setTimeout(() => finish('timeout-interactive'), {max_ms});
+                window.addEventListener('load', () => finish('load-complete'), {{ once: true }});
+                if (selector !== null) {{
+                    poll = setInterval(() => {{ if (found()) finish('selector-found'); }}, 100);
+                }}
+            }});
+            return JSON.stringify(result);
+        }})()
+        "#,
+        max_ms = max_wait.as_millis()
+    )
+}
+
 /// Helper function to check if a CSS selector exists in the page
 ///
 /// Returns true if at least one element matching the selector is found.
@@ -453,39 +514,7 @@ impl NetworkIdleStrategy {
                 remaining_total
             );
         } else {
-            // Use event-based approach instead of polling
-            let wait_script = format!(
-                r#"
-                (async function() {{
-                    const result = await new Promise((resolve) => {{
-                        if (document.readyState === 'complete') {{
-                            resolve({{ state: 'already-complete', timeMs: 0 }});
-                        }} else {{
-                            const startTime = Date.now();
-                            const timeout = setTimeout(() => {{
-                                const elapsed = Date.now() - startTime;
-                                resolve({{
-                                    state: 'timeout-interactive',
-                                    timeMs: elapsed
-                                }});
-                            }}, {});
-
-                            window.addEventListener('load', () => {{
-                                clearTimeout(timeout);
-                                const elapsed = Date.now() - startTime;
-                                resolve({{
-                                    state: 'load-complete',
-                                    timeMs: elapsed
-                                }});
-                            }}, {{ once: true }});
-                        }}
-                    }});
-
-                    return JSON.stringify(result);
-                }})()
-                "#,
-                max_ready_wait.as_millis()
-            );
+            let wait_script = document_ready_script(max_ready_wait, wait_selector);
 
             match tab.evaluate(&wait_script, true) {
                 // await=true to wait for Promise resolution
@@ -510,6 +539,14 @@ impl NetworkIdleStrategy {
                                         "load-complete" => {
                                             tracing::debug!(
                                                 "Document 'load' event fired after {}ms in Phase 1.5",
+                                                load_result.time_ms
+                                            );
+                                        }
+                                        // Phase 2 confirms it on its first poll, after the
+                                        // skip_selector re-check below.
+                                        "selector-found" => {
+                                            tracing::debug!(
+                                                "Wait selector appeared after {}ms in Phase 1.5 - not waiting for 'load'",
                                                 load_result.time_ms
                                             );
                                         }
@@ -592,15 +629,14 @@ impl NetworkIdleStrategy {
             }
         }
 
-        // After Phase 1.5, check if we exceeded total timeout
+        // After Phase 1.5, check if we exceeded total timeout. A page whose 'load' never
+        // fires spends the whole remaining budget in Phase 1.5, and the selector may well
+        // be in the DOM by then - so this path gets the same final check as every other.
         if start.elapsed() >= total_timeout {
-            tracing::warn!("Total timeout exceeded after Phase 1.5 - skipping selector search");
-            // If wait_selector was specified, this is a failure; otherwise success
-            return if wait_selector.is_some() {
-                Ok(WaitResult::WaitSelectorNotFound)
-            } else {
-                Ok(WaitResult::Success)
-            };
+            tracing::warn!("Total timeout exceeded after Phase 1.5 - final selector check");
+            return final_selector_verdict(wait_selector, |selector| {
+                check_selector_exists(tab, selector)
+            });
         }
 
         // A small error page reaches network idle almost immediately, so Phase 1's
@@ -1008,5 +1044,35 @@ mod tests {
                 "HTTP {status} must not trigger an early exit"
             );
         }
+    }
+
+    /// The budget ran out after Phase 1.5 (a 'load' that never fired) while the
+    /// selector was in the DOM: this used to be WaitSelectorNotFound without a look.
+    #[test]
+    fn exhausted_budget_still_checks_the_selector() {
+        let verdict = final_selector_verdict(Some("h1.title"), |_| Ok(true)).unwrap();
+        assert_eq!(verdict, WaitResult::Success);
+
+        let verdict = final_selector_verdict(Some("h1.title"), |_| Ok(false)).unwrap();
+        assert_eq!(verdict, WaitResult::WaitSelectorNotFound);
+    }
+
+    #[test]
+    fn exhausted_budget_without_selector_is_success() {
+        let verdict = final_selector_verdict(None, |_| panic!("nothing to check")).unwrap();
+        assert_eq!(verdict, WaitResult::Success);
+    }
+
+    #[test]
+    fn ready_script_embeds_the_selector_as_a_js_string() {
+        let script = document_ready_script(Duration::from_millis(1234), Some(r#"a[href="x"]'"#));
+        assert!(script.contains(r#"const selector = "a[href=\"x\"]'";"#));
+        assert!(script.contains("1234"));
+    }
+
+    #[test]
+    fn ready_script_without_selector_does_not_poll() {
+        let script = document_ready_script(Duration::from_millis(500), None);
+        assert!(script.contains("const selector = null;"));
     }
 }
