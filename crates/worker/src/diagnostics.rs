@@ -13,6 +13,7 @@
 //! | `console.*` output, uncaught exceptions with stack | `Runtime.consoleAPICalled`, `Runtime.exceptionThrown` | `Runtime.enable` — **opt-in**, see [`DiagnosticsConfig::capture_console`] |
 //! | Final page state (readyState, node counts, title) | one `Runtime.evaluate` | one round-trip, bounded by [`PAGE_STATE_BUDGET`] |
 //! | Headless-detection markers (`navigator.*`) | one `Runtime.evaluate` | same |
+//! | XHR/fetch requests (pending ones included) and the main-frame lifecycle timeline | `Network.*`, `Page.lifecycleEvent` | none — see [`crate::page_activity`] |
 //!
 //! The two snapshots are taken only when the request may be logged
 //! ([`DiagnosticsSession::wants_snapshots`]), so with an error-code filter a normal request pays
@@ -42,6 +43,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::cdp_call;
+use crate::page_activity::PageActivity;
 use crate::service::EventListenerGuard;
 
 /// Time budget for the final page-state snapshot.
@@ -78,6 +80,8 @@ struct DiagnosticsBuffer {
     page_state: Option<String>,
     /// Headless-detection markers (JSON), taken together with the page state.
     headless_markers: Option<String>,
+    /// XHR/fetch requests and the lifecycle timeline, reported whatever their outcome.
+    activity: PageActivity,
 }
 
 /// Which bucket a captured entry belongs to.
@@ -340,6 +344,13 @@ impl Drop for DiagnosticsSession {
         if let Some(markers) = &buffer.headless_markers {
             info!("Diagnostics/headless markers: {}", markers);
         }
+        info!(
+            "Diagnostics/timeline: {}",
+            buffer.activity.timeline_report()
+        );
+        if let Some(report) = buffer.activity.data_requests_report(Instant::now()) {
+            info!("Diagnostics/data requests: {}", report);
+        }
     }
 }
 
@@ -396,6 +407,7 @@ pub async fn start_capture(
     let max_entries = config.max_entries;
     let capture_console = config.capture_console;
     let listener_buffer = buffer.clone();
+    let main_frame_id = tab.get_target_id().clone();
 
     let listener: Arc<dyn headless_chrome::browser::tab::EventListener<Event> + Send + Sync> =
         Arc::new(move |event: &Event| {
@@ -441,9 +453,43 @@ pub async fn start_capture(
                         buf.request_urls
                             .insert(ev.params.request_id.clone(), ev.params.request.url.clone());
                     }
+                    buf.activity.will_be_sent(
+                        &ev.params.request_id,
+                        &ev.params.request.method,
+                        &ev.params.request.url,
+                        ev.params.Type.as_ref(),
+                        Instant::now(),
+                    );
+                }
+
+                Event::NetworkResponseReceived(ev) => {
+                    buf.activity
+                        .response(&ev.params.request_id, ev.params.response.status);
+                }
+
+                Event::NetworkLoadingFinished(ev) => {
+                    buf.activity.finished(
+                        &ev.params.request_id,
+                        ev.params.encoded_data_length,
+                        Instant::now(),
+                    );
+                }
+
+                // Lifecycle events of subframes would read as the page's own.
+                Event::PageLifecycleEvent(ev) if ev.params.frame_id == main_frame_id => {
+                    buf.activity.lifecycle(&ev.params.name, Instant::now());
                 }
 
                 Event::NetworkLoadingFailed(ev) => {
+                    buf.activity.failed(
+                        &ev.params.request_id,
+                        &ev.params.error_text,
+                        matches!(
+                            ev.params.blocked_reason,
+                            Some(Network::BlockedReason::Inspector)
+                        ),
+                        Instant::now(),
+                    );
                     // Loads we dropped ourselves via `Network.setBlockedURLs`
                     // (`BlockedUrlsMiddleware`) or `Fetch.failRequest`
                     // (`BlockedResourceTypesMiddleware`) are not diagnostics. They arrive with

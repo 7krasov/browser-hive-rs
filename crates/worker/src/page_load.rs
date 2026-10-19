@@ -306,7 +306,7 @@ impl PageLoadTracker {
 }
 
 /// A URL short enough for an error message: without its query and fragment, then truncated.
-fn short_url(url: &str) -> String {
+pub(crate) fn short_url(url: &str) -> String {
     let base = url.split(['?', '#']).next().unwrap_or(url);
     if base.chars().count() <= MAX_URL_CHARS {
         base.to_string()

@@ -6,6 +6,7 @@ mod child_reaper;
 mod diagnostics;
 mod launch_args;
 mod metrics;
+mod page_activity;
 mod page_load;
 mod service;
 mod shutdown;
