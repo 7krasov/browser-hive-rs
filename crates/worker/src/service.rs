@@ -99,6 +99,25 @@ fn mark_document_loaded(docs: &std::sync::Mutex<ObservedDocuments>, request_id: 
     }
 }
 
+/// CDP request id of the main document when it is JSON (see `MainDocument::is_json`).
+fn json_document_request_id(docs: &std::sync::Mutex<ObservedDocuments>) -> Option<String> {
+    let docs = docs.lock().ok()?;
+    docs.latest
+        .as_ref()
+        .is_some_and(MainDocument::is_json)
+        .then(|| docs.request_id.clone())
+}
+
+/// The raw body of a response, read from the inspector cache (`Network.getResponseBody`).
+fn response_body(tab: &headless_chrome::Tab, request_id: String) -> Result<String> {
+    let body =
+        tab.call_method(headless_chrome::protocol::cdp::Network::GetResponseBody { request_id })?;
+    if body.base_64_encoded {
+        anyhow::bail!("the body is base64-encoded");
+    }
+    Ok(body.body)
+}
+
 /// How many distinct kinds of proxy failure are kept per request before only the count grows.
 const MAX_PROXY_FAILURE_KINDS: usize = 8;
 
@@ -1955,6 +1974,17 @@ impl WorkerService {
                     }
                     spent
                 };
+                // A JSON document has nothing to render and no element to find: once its body has
+                // arrived the strategy, selectors included, is skipped.
+                let json_budget = Duration::from_millis(wait_timeout as u64).saturating_sub(spent);
+                if browser_hive_common::challenge::wait_for_json_body(
+                    &probe,
+                    json_budget,
+                    &cancellation_token,
+                )? {
+                    info!("JSON document - wait strategy and selectors skipped");
+                    return Ok(WaitResult::Success);
+                }
                 strategy_clone.wait_after(
                     spent,
                     &tab_clone,
@@ -2041,9 +2071,28 @@ impl WorkerService {
         // Try to get content even if wait strategy failed
         // NOTE: If we can't get content, return response with empty content and BROWSER_ERROR
         // Wrap in spawn_blocking + select for cancellation support + hard timeout
+        //
+        // A JSON main document is returned as its raw body: the browser shows it as a `<pre>`
+        // wrapper whose `outerHTML` escapes `<` and `&`. The body can be gone from the inspector
+        // cache (measured: 11 MB read, 22 MB evicted), in which case `outerHTML` is returned.
+        let json_request_id = if navigation_result.is_ok() {
+            json_document_request_id(&main_response_holder)
+        } else {
+            None
+        };
         let tab_clone = tab.clone();
         let tab_for_abort = tab.clone(); // Keep reference for forced close on timeout
-        let get_content_handle = tokio::task::spawn_blocking(move || tab_clone.get_content());
+        let content_span = tracing::Span::current();
+        let get_content_handle = tokio::task::spawn_blocking(move || {
+            let _span_guard = content_span.enter();
+            if let Some(request_id) = json_request_id {
+                match response_body(&tab_clone, request_id) {
+                    Ok(body) => return Ok(body),
+                    Err(e) => warn!("JSON body unavailable, returning outerHTML: {:#}", e),
+                }
+            }
+            tab_clone.get_content()
+        });
 
         let content = tokio::select! {
             _ = self.cancellation_token.cancelled() => {

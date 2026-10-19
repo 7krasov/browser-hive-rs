@@ -106,6 +106,8 @@ message ScrapePageRequest {
 message ScrapePageResponse {
   bool success = 1;
   uint32 status_code = 2;
+  // The page as rendered (`outerHTML`), or the raw response body when the main document is
+  // `application/json` (falls back to `outerHTML` if the browser no longer holds the body).
   string content = 3;
   string error_message = 4;
   ErrorCode error_code = 5;

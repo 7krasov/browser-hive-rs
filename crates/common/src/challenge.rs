@@ -54,6 +54,17 @@ impl MainDocument {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// Whether the document is JSON (`Content-Type: application/json`, parameters and case
+    /// ignored). Such a document has no DOM to render or search: selectors are skipped and its raw
+    /// body is returned instead of the browser's HTML wrapper around it.
+    pub fn is_json(&self) -> bool {
+        self.header("content-type").is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        })
+    }
 }
 
 /// Decides whether a main-frame document is an anti-bot challenge that its own JavaScript may
@@ -225,6 +236,35 @@ pub fn wait_out_challenge(
     }
 }
 
+/// When the latest main document is JSON, waits until its body has arrived (at most `budget`) and
+/// returns `true`: there is nothing left to wait for, since a JSON document runs no script and
+/// holds no element a selector could find. Returns `false` at once for any other document, and
+/// when none has been observed. Blocking, like [`wait_out_challenge`]; call it after that, so a
+/// challenge that navigates to JSON is judged by the document that replaced it.
+pub fn wait_for_json_body(
+    probe: &dyn MainDocumentProbe,
+    budget: Duration,
+    cancellation_token: &CancellationToken,
+) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        check_cancellation(cancellation_token, "json body")?;
+        match probe.latest() {
+            Some(snapshot) if snapshot.doc.is_json() => {
+                if snapshot.loaded {
+                    return Ok(true);
+                }
+                if start.elapsed() >= budget {
+                    tracing::warn!("JSON body still loading after {:?}", budget);
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(false),
+        }
+        std::thread::sleep(CHALLENGE_POLL_INTERVAL.min(budget.saturating_sub(start.elapsed())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +326,44 @@ mod tests {
 
     fn challenge() -> MainDocument {
         doc(403, &[("x-challenge", "challenge")])
+    }
+
+    #[test]
+    fn json_is_recognised_by_media_type_only() {
+        assert!(doc(200, &[("content-type", "application/json")]).is_json());
+        assert!(doc(200, &[("Content-Type", "Application/JSON; charset=utf-8")]).is_json());
+        assert!(!doc(200, &[("content-type", "text/html; charset=utf-8")]).is_json());
+        assert!(!doc(200, &[("content-type", "application/problem+json")]).is_json());
+        assert!(!doc(200, &[]).is_json());
+    }
+
+    fn json_ready(steps: Vec<Option<DocumentSnapshot>>, budget_ms: u64) -> bool {
+        wait_for_json_body(
+            &Script::new(steps),
+            Duration::from_millis(budget_ms),
+            &CancellationToken::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn json_body_is_waited_for_until_loaded() {
+        let json = doc(200, &[("content-type", "application/json")]);
+        assert!(json_ready(
+            vec![snap(1, false, json.clone()), snap(1, true, json.clone())],
+            5_000
+        ));
+        // Still loading when the budget runs out: nothing else to wait for either.
+        assert!(json_ready(vec![snap(1, false, json)], 150));
+    }
+
+    #[test]
+    fn json_wait_returns_at_once_for_other_documents() {
+        assert!(!json_ready(
+            vec![snap(1, false, doc(200, &[("content-type", "text/html")]))],
+            5_000
+        ));
+        assert!(!json_ready(vec![None], 5_000));
     }
 
     #[test]
