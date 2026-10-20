@@ -1,10 +1,13 @@
-//! What a page did while it loaded: its XHR/fetch requests and its lifecycle timeline.
+//! What a page did while it loaded: its XHR/fetch requests, the loads still pending when the
+//! request ended, and its lifecycle timeline.
 //!
 //! Part of browser diagnostics. Failure-only signals cannot explain a page whose content is
 //! rendered by JavaScript from an API response that never came: nothing failed, so nothing was
 //! captured, and the returned HTML shows a loading spinner where the content should be. What
 //! explains it is the API request itself — still pending, slow, or answered with a tiny body —
-//! and when the `load` event fired, since such pages often start their API calls only then.
+//! and when the `load` event fired, since such pages often start their API calls only then. When
+//! `load` never fires, the loads still pending at the end (of any type: an image or an iframe
+//! holds `load` back as surely as a script) are what explains it.
 //!
 //! Everything here comes from events the `Network` and `Page` domains already deliver (the
 //! response observer enables `Network`; headless_chrome enables `Page` lifecycle events), so it
@@ -21,6 +24,14 @@ use crate::page_load::short_url;
 /// XHR/fetch requests recorded per request; later ones are only counted. A page that polls can
 /// issue hundreds, and the report must stay one readable line.
 const MAX_DATA_REQUESTS: usize = 40;
+
+/// Loads of other types tracked while pending. Every load of the page passes through here, so
+/// the bound is generous; a load past it is only counted.
+const MAX_PENDING_LOADS: usize = 512;
+
+/// Pending loads listed in the report, oldest first: the oldest is the likeliest to be what
+/// holds `load` back.
+const MAX_PENDING_LISTED: usize = 15;
 
 /// Main-frame lifecycle events reported in the timeline, in the order they normally occur.
 const TIMELINE_EVENTS: [&str; 4] = [
@@ -48,11 +59,23 @@ struct DataRequest {
     state: State,
 }
 
-/// The XHR/fetch requests and main-frame lifecycle events of one scrape request.
+/// A load of a type other than XHR/fetch, kept only while it is pending.
+#[derive(Debug)]
+struct PendingLoad {
+    type_label: String,
+    url: String,
+    /// Offset from the start of capture.
+    started: Duration,
+}
+
+/// The XHR/fetch requests, other pending loads and main-frame lifecycle events of one scrape
+/// request.
 pub struct PageActivity {
     started: Instant,
     requests: HashMap<String, DataRequest>,
     untracked: usize,
+    pending: HashMap<String, PendingLoad>,
+    pending_untracked: usize,
     /// Offset of the latest occurrence of each [`TIMELINE_EVENTS`] entry.
     timeline: [Option<Duration>; TIMELINE_EVENTS.len()],
 }
@@ -71,6 +94,8 @@ impl PageActivity {
             started,
             requests: HashMap::new(),
             untracked: 0,
+            pending: HashMap::new(),
+            pending_untracked: 0,
             timeline: [None; TIMELINE_EVENTS.len()],
         }
     }
@@ -88,7 +113,7 @@ impl PageActivity {
         let type_label = match resource_type {
             Some(ResourceType::Xhr) => "XHR",
             Some(ResourceType::Fetch) => "Fetch",
-            _ => return,
+            other => return self.other_will_be_sent(request_id, url, other, now),
         };
         if let Some(request) = self.requests.get_mut(request_id) {
             request.url = url.to_string();
@@ -111,6 +136,35 @@ impl PageActivity {
         );
     }
 
+    fn other_will_be_sent(
+        &mut self,
+        request_id: &str,
+        url: &str,
+        resource_type: Option<&ResourceType>,
+        now: Instant,
+    ) {
+        if let Some(load) = self.pending.get_mut(request_id) {
+            load.url = url.to_string();
+            return;
+        }
+        if self.pending.len() >= MAX_PENDING_LOADS {
+            self.pending_untracked += 1;
+            return;
+        }
+        let type_label = match resource_type {
+            Some(resource_type) => format!("{:?}", resource_type),
+            None => "Other".to_string(),
+        };
+        self.pending.insert(
+            request_id.to_string(),
+            PendingLoad {
+                type_label,
+                url: url.to_string(),
+                started: self.offset(now),
+            },
+        );
+    }
+
     /// `Network.responseReceived`.
     pub fn response(&mut self, request_id: &str, status: u32) {
         if let Some(request) = self.requests.get_mut(request_id) {
@@ -120,6 +174,7 @@ impl PageActivity {
 
     /// `Network.loadingFinished`. `bytes` is the encoded (on-the-wire) body size.
     pub fn finished(&mut self, request_id: &str, bytes: f64, now: Instant) {
+        self.pending.remove(request_id);
         let offset = self.offset(now);
         if let Some(request) = self.requests.get_mut(request_id) {
             request.state = State::Finished {
@@ -138,6 +193,8 @@ impl PageActivity {
         blocked_by_us: bool,
         now: Instant,
     ) {
+        // A failed load is no longer pending; the failure itself is reported by diagnostics.
+        self.pending.remove(request_id);
         if blocked_by_us {
             self.requests.remove(request_id);
             return;
@@ -187,6 +244,41 @@ impl PageActivity {
                 String::new()
             },
             entries
+        ))
+    }
+
+    /// One line listing the loads other than XHR/fetch still pending at `now`, oldest first, or
+    /// `None` when nothing was.
+    pub fn pending_loads_report(&self, now: Instant) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let now = self.offset(now);
+        let mut loads: Vec<&PendingLoad> = self.pending.values().collect();
+        loads.sort_by_key(|load| load.started);
+        let listed: Vec<String> = loads
+            .iter()
+            .take(MAX_PENDING_LISTED)
+            .map(|load| {
+                format!(
+                    "{} {} +{} → pending {}",
+                    load.type_label,
+                    short_url(&load.url),
+                    secs(load.started),
+                    secs(now.saturating_sub(load.started))
+                )
+            })
+            .collect();
+        let untracked = if self.pending_untracked > 0 {
+            format!(", {} more not tracked", self.pending_untracked)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{} pending{}: {:?}",
+            loads.len(),
+            untracked,
+            listed
         ))
     }
 
@@ -357,6 +449,67 @@ mod tests {
             "{}",
             report
         );
+    }
+
+    #[test]
+    fn lists_loads_still_pending_oldest_first() {
+        let start = Instant::now();
+        let mut activity = PageActivity::new(start);
+        let image = Some(&ResourceType::Image);
+        activity.will_be_sent(
+            "img",
+            "GET",
+            "https://cdn.example.net/a.jpg?w=1",
+            image,
+            at(start, 3_000),
+        );
+        activity.will_be_sent(
+            "doc",
+            "GET",
+            "https://widget.example.org/frame",
+            Some(&ResourceType::Document),
+            at(start, 1_000),
+        );
+        activity.will_be_sent(
+            "done",
+            "GET",
+            "https://cdn.example.net/b.jpg",
+            image,
+            at(start, 2_000),
+        );
+        activity.finished("done", 10.0, at(start, 2_500));
+        activity.will_be_sent(
+            "gone",
+            "GET",
+            "https://cdn.example.net/c.jpg",
+            image,
+            at(start, 2_000),
+        );
+        activity.failed("gone", "net::ERR_CONNECTION_RESET", false, at(start, 4_000));
+
+        assert_eq!(
+            activity.pending_loads_report(at(start, 43_000)).unwrap(),
+            "2 pending: [\
+             \"Document https://widget.example.org/frame +1.0s → pending 42.0s\", \
+             \"Image https://cdn.example.net/a.jpg +3.0s → pending 40.0s\"]"
+        );
+        // Pending loads never enter the XHR/fetch report.
+        assert_eq!(activity.data_requests_report(at(start, 43_000)), None);
+    }
+
+    #[test]
+    fn nothing_pending_means_no_report() {
+        let start = Instant::now();
+        let mut activity = PageActivity::new(start);
+        activity.will_be_sent(
+            "1",
+            "GET",
+            "https://x.example/a.css",
+            Some(&ResourceType::Stylesheet),
+            start,
+        );
+        activity.finished("1", 1.0, start);
+        assert_eq!(activity.pending_loads_report(start), None);
     }
 
     #[test]

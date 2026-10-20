@@ -348,8 +348,12 @@ impl Drop for DiagnosticsSession {
             "Diagnostics/timeline: {}",
             buffer.activity.timeline_report()
         );
-        if let Some(report) = buffer.activity.data_requests_report(Instant::now()) {
+        let now = Instant::now();
+        if let Some(report) = buffer.activity.data_requests_report(now) {
             info!("Diagnostics/data requests: {}", report);
+        }
+        if let Some(report) = buffer.activity.pending_loads_report(now) {
+            info!("Diagnostics/pending loads: {}", report);
         }
     }
 }

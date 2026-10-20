@@ -17,7 +17,9 @@
 //! - C2 the same, blocked by CORS or ORB/CORP (a CDN answering the asset with a block page);
 //! - C3 the same, answered HTTP 403/429;
 //! - C4 a script/stylesheet still pending for at least [`STALLED_AFTER`];
-//! - C5 the main document itself still pending (the HTML was cut short).
+//! - C5 the main document itself still pending (the HTML was cut short);
+//! - C6 the main document loaded, but its `load` event never fired — some sub-resource of any
+//!   type is still holding it, and pages that start rendering on `load` never start.
 //!
 //! What does not: HTTP 404 (usually the site's own permanent bug), JS exceptions, images, fonts,
 //! media, beacons, loads the page cancelled itself (`ERR_ABORTED`), loads our own block lists
@@ -123,6 +125,8 @@ pub struct PageLoadTracker {
     main_document: Option<String>,
     /// Request id of the latest main document, loaded or not.
     last_document: Option<String>,
+    /// Whether the latest main document's `load` event fired (C6).
+    load_fired: bool,
 }
 
 impl PageLoadTracker {
@@ -132,6 +136,7 @@ impl PageLoadTracker {
             loads: HashMap::new(),
             main_document: None,
             last_document: None,
+            load_fired: false,
         }
     }
 
@@ -155,6 +160,9 @@ impl PageLoadTracker {
                 .is_some_and(|last| last != request_id)
             {
                 self.loads.clear();
+            }
+            if self.last_document.as_deref() != Some(request_id) {
+                self.load_fired = false;
             }
             self.last_document = Some(request_id.to_string());
             self.main_document = Some(request_id.to_string());
@@ -180,6 +188,12 @@ impl PageLoadTracker {
                 outcome: Outcome::Pending,
             },
         );
+    }
+
+    /// The main frame's `load` lifecycle event. It belongs to the latest main document: a new
+    /// one resets it in [`Self::will_be_sent`].
+    pub fn load_event(&mut self) {
+        self.load_fired = true;
     }
 
     /// `Network.responseReceived`. Only 403/429 are kept: every other status either loaded the
@@ -247,11 +261,18 @@ impl PageLoadTracker {
             .collect();
         // Oldest first: the earliest failure is the likeliest cause of the others.
         loads.sort_by_key(|(started, _)| *started);
-        // C5 leads: it is the most telling marker there is.
-        let markers: Vec<String> = self
-            .main_document
-            .iter()
-            .map(|_| "main document still loading".to_string())
+        // C5 leads: it is the most telling marker there is. C6 follows it, and is implied by it,
+        // so only one of the two is listed.
+        let document = if self.main_document.is_some() {
+            Some("main document still loading")
+        } else if self.last_document.is_some() && !self.load_fired {
+            Some("load event never fired")
+        } else {
+            None
+        };
+        let markers: Vec<String> = document
+            .map(str::to_string)
+            .into_iter()
             .chain(loads.into_iter().map(|(_, text)| text))
             .collect();
         let total = markers.len();
@@ -355,6 +376,7 @@ mod tests {
         t.response("1", 200);
         t.finished("1");
         t.finished("doc");
+        t.load_event();
         assert!(markers(&t).is_empty());
     }
 
@@ -537,10 +559,32 @@ mod tests {
         // A redirect of the same document keeps what was recorded.
         t.will_be_sent("doc1", PAGE, Some(&ResourceType::Document), true);
         t.finished("doc1");
+        t.load_event();
         assert_eq!(markers(&t).len(), 1);
         t.will_be_sent("doc2", PAGE, Some(&ResourceType::Document), true);
         t.finished("doc2");
+        t.load_event();
         assert!(markers(&t).is_empty());
+    }
+
+    #[test]
+    fn a_loaded_document_whose_load_event_never_fired_counts() {
+        let mut t = tracker();
+        t.will_be_sent("doc", PAGE, Some(&ResourceType::Document), true);
+        t.finished("doc");
+        assert_eq!(markers(&t), vec!["load event never fired"]);
+
+        // A later document starts its own lifecycle: the earlier `load` does not carry over.
+        t.load_event();
+        assert!(markers(&t).is_empty());
+        t.will_be_sent("doc2", PAGE, Some(&ResourceType::Document), true);
+        t.finished("doc2");
+        assert_eq!(markers(&t), vec!["load event never fired"]);
+    }
+
+    #[test]
+    fn no_main_document_seen_means_no_load_marker() {
+        assert!(markers(&tracker()).is_empty());
     }
 
     #[test]

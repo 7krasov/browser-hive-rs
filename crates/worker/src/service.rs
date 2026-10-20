@@ -1699,6 +1699,14 @@ impl WorkerService {
                                 );
                             }
                         }
+                        // C6 of `page_load.rs`: the main frame's `load`, not a subframe's.
+                        if let Event::PageLifecycleEvent(ev) = event {
+                            if ev.params.name == "load" && ev.params.frame_id == main_frame_id {
+                                if let Ok(mut page_load) = page_load.lock() {
+                                    page_load.load_event();
+                                }
+                            }
+                        }
                         if let Event::NetworkResponseReceived(ev) = event {
                             if let Ok(mut page_load) = page_load.lock() {
                                 page_load

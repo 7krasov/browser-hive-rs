@@ -241,6 +241,7 @@ Any one marker is enough:
 | C3 | answered HTTP 403 or 429 | as C1 | as C1 |
 | C4 | still pending ≥ 10 s (`STALLED_AFTER`) when the request gives up | Script, Stylesheet | any |
 | C5 | the main document itself still loading (the HTML was cut short) | Document | — |
+| C6 | the main document loaded, but its `load` event never fired (`Page.lifecycleEvent` of the main frame) — a sub-resource of any type, an image or iframe included, is still holding it | Document | — |
 
 Deliberately **not** markers:
 - HTTP 404 and 5xx — a 404 is usually the site's own permanent bug; 5xx was left out by decision;
@@ -249,7 +250,7 @@ Deliberately **not** markers:
 - `ERR_ABORTED` (the page cancelled the load itself) and `blockedReason: inspector` (our own
   block lists);
 - pending XHR/fetch — long-polling looks exactly like a stall;
-- "network never went idle" or `readyState` alone — trackers and chat widgets keep both busy.
+- "network never went idle" — trackers and chat widgets keep it busy long after the page rendered.
 
 Why those choices:
 - **Scripts and stylesheets count from any host** because bundles are often served from a CDN on
@@ -267,13 +268,26 @@ Why those choices:
 https://cdn.example.net/app.js; Stylesheet HTTP 403 https://static.example.com/a.css (+2 more)`.
 Query strings are dropped from the URLs.
 
+**Why C6 exists** (added 2026-10-20, reversing the 2026-09-25 exclusion of "`readyState` alone"):
+on a site family whose templates render their main content from `window.addEventListener('load',
+…)`, a sub-resource that hung without failing kept `load` from firing for the whole 40 s budget —
+`readyState` stayed `interactive`, the content API was never called, and the page answered 4042
+with nothing failed and nothing marked. A retry of the same URL on another context rendered in
+seconds. The objection that trackers and chat widgets hold `readyState` too still stands for idle,
+which they hold routinely; for `load` it means a widget inserted before `load` that hangs for the
+whole budget, which is accepted below.
+
 Accepted risks (decided 2026-09-25):
 - a site with a permanently broken script turns each of its 4042s into a 5009, which the client
   retries for nothing;
 - a third-party script (a tag manager, say) failing with a transport error yields 5009 even if the
   page did not need it;
 - loads inside a cross-site iframe are invisible to the page's session, so content rendered there
-  stays 4042.
+  stays 4042;
+- (2026-10-20) a site whose `load` never fires within the budget — a widget hanging on every visit —
+  turns each of its genuine 4042s into a 5009, which the client retries for nothing. The diagnostics
+  line `Diagnostics/pending loads` names what held `load`, so such a site can be found and the
+  resource blocked downstream.
 
 ⚠️ `WORKER_DIAGNOSTICS_ERROR_CODES` filters on the **final** code: a scope set to `4042,4041` stops
 emitting diagnostics for the requests that become 5009 — add `5009` to keep them. The metric
