@@ -19,11 +19,13 @@
 //! - C4 a script/stylesheet still pending for at least [`STALLED_AFTER`];
 //! - C5 the main document itself still pending (the HTML was cut short);
 //! - C6 the main document loaded, but its `load` event never fired — some sub-resource of any
-//!   type is still holding it, and pages that start rendering on `load` never start.
+//!   type is still holding it, and pages that start rendering on `load` never start;
+//! - C7 a same-site XHR/fetch still pending for at least [`STALLED_AFTER`], with or without its
+//!   response headers — the content request of a page that renders from it.
 //!
 //! What does not: HTTP 404 (usually the site's own permanent bug), JS exceptions, images, fonts,
 //! media, beacons, loads the page cancelled itself (`ERR_ABORTED`), loads our own block lists
-//! dropped, and pending XHR/fetch (long-polling looks exactly like a stall).
+//! dropped. A same-site long poll does count as C7 (accepted risk, see ERROR_HANDLING.md).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -114,6 +116,8 @@ struct Load {
     type_label: &'static str,
     kind: Kind,
     started: Instant,
+    /// Status of the response headers, whatever it is, for the C7 message.
+    responded: Option<u32>,
     outcome: Outcome,
 }
 
@@ -185,6 +189,7 @@ impl PageLoadTracker {
                 type_label,
                 kind,
                 started: Instant::now(),
+                responded: None,
                 outcome: Outcome::Pending,
             },
         );
@@ -196,11 +201,13 @@ impl PageLoadTracker {
         self.load_fired = true;
     }
 
-    /// `Network.responseReceived`. Only 403/429 are kept: every other status either loaded the
-    /// resource or (404, 5xx) is not a marker.
+    /// `Network.responseReceived`. Only 403/429 become an outcome: every other status either
+    /// loaded the resource or (404, 5xx) is not a marker. The arrival of the headers is kept for
+    /// every status, for C7.
     pub fn response(&mut self, request_id: &str, status: u32) {
-        if matches!(status, 403 | 429) {
-            if let Some(load) = self.loads.get_mut(request_id) {
+        if let Some(load) = self.loads.get_mut(request_id) {
+            load.responded = Some(status);
+            if matches!(status, 403 | 429) {
                 load.outcome = Outcome::Status(status);
             }
         }
@@ -285,11 +292,13 @@ impl PageLoadTracker {
             return None;
         }
         match &load.outcome {
-            // C4. Pending XHR/fetch is excluded: long-polling looks exactly like a stall.
+            // C4 (script/stylesheet) and C7 (same-site XHR/fetch, a long poll included).
             Outcome::Pending => {
                 let age = now.saturating_duration_since(load.started);
-                (load.kind == Kind::Asset && age >= STALLED_AFTER)
-                    .then(|| format!("pending {}s", age.as_secs()))
+                (age >= STALLED_AFTER).then(|| match load.responded {
+                    Some(status) => format!("pending {}s, HTTP {} body", age.as_secs(), status),
+                    None => format!("pending {}s", age.as_secs()),
+                })
             }
             // C3.
             Outcome::Status(status) => Some(format!("HTTP {}", status)),
@@ -507,19 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_script_counts_but_a_young_one_or_pending_xhr_does_not() {
+    fn a_stalled_script_counts_but_a_young_one_does_not() {
         let mut t = tracker();
         send(
             &mut t,
             "1",
             "https://cdn.other.net/app.js",
             ResourceType::Script,
-        );
-        send(
-            &mut t,
-            "2",
-            "https://www.example.com/poll",
-            ResourceType::Xhr,
         );
         assert!(
             t.verdict_at(Instant::now()).0.is_empty(),
@@ -528,6 +531,55 @@ mod tests {
         let listed = markers(&t);
         assert_eq!(listed.len(), 1);
         assert!(listed[0].starts_with("Script pending "), "{}", listed[0]);
+    }
+
+    #[test]
+    fn a_stalled_same_site_xhr_counts_with_or_without_its_headers() {
+        let mut t = tracker();
+        send(
+            &mut t,
+            "1",
+            "https://www.example.com/pluginrender/detail.html?id=1",
+            ResourceType::Xhr,
+        );
+        t.response("1", 200);
+        // No headers yet: a stalled request and a long poll look alike, and both count.
+        send(
+            &mut t,
+            "2",
+            "https://www.example.com/poll",
+            ResourceType::Xhr,
+        );
+        // Cross-site data requests are never markers.
+        send(
+            &mut t,
+            "3",
+            "https://analytics.other.net/collect",
+            ResourceType::Fetch,
+        );
+        t.response("3", 200);
+        assert!(
+            t.verdict_at(Instant::now()).0.is_empty(),
+            "too young to count"
+        );
+        let listed = markers(&t);
+        assert_eq!(listed.len(), 2, "{:?}", listed);
+        assert!(
+            listed.iter().any(|m| m.starts_with("XHR pending ")
+                && m.ends_with(
+                    "s, HTTP 200 body https://www.example.com/pluginrender/detail.html"
+                )),
+            "{:?}",
+            listed
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|m| m.starts_with("XHR pending ")
+                    && m.ends_with("s https://www.example.com/poll")),
+            "{:?}",
+            listed
+        );
     }
 
     #[test]

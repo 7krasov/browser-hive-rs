@@ -242,6 +242,7 @@ Any one marker is enough:
 | C4 | still pending ≥ 10 s (`STALLED_AFTER`) when the request gives up | Script, Stylesheet | any |
 | C5 | the main document itself still loading (the HTML was cut short) | Document | — |
 | C6 | the main document loaded, but its `load` event never fired (`Page.lifecycleEvent` of the main frame) — a sub-resource of any type, an image or iframe included, is still holding it | Document | — |
+| C7 | still pending ≥ 10 s (`STALLED_AFTER`) when the request gives up, with or without its response headers (the message says which: `XHR pending 34s, HTTP 200 body …` vs `XHR pending 34s …`) — a same-site long poll included | XHR, Fetch | same site as the requested page only |
 
 Deliberately **not** markers:
 - HTTP 404 and 5xx — a 404 is usually the site's own permanent bug; 5xx was left out by decision;
@@ -249,7 +250,7 @@ Deliberately **not** markers:
 - images, fonts, media, beacons and other types, which cannot hide a DOM element;
 - `ERR_ABORTED` (the page cancelled the load itself) and `blockedReason: inspector` (our own
   block lists);
-- pending XHR/fetch — long-polling looks exactly like a stall;
+- pending **cross-site** XHR/fetch — mostly analytics and chat widgets;
 - "network never went idle" — trackers and chat widgets keep it busy long after the page rendered.
 
 Why those choices:
@@ -277,6 +278,18 @@ seconds. The objection that trackers and chat widgets hold `readyState` too stil
 which they hold routinely; for `load` it means a widget inserted before `load` that hangs for the
 whole budget, which is accepted below.
 
+**Why C7 exists** (added 2026-10-21): on the same site family `load` did fire, and the template's
+content request — a same-site XHR for the rendered fragment — answered `200` and then never
+delivered its body (still pending 34 s after the request was sent; when its headers arrived is
+not logged). The client does not retry a 4042, so the page stayed lost although a retry of the
+same URL rendered. This reverses the exclusion of pending same-site XHR/fetch that dated from C4:
+it was kept for long polls, which look exactly like a stalled request. A narrower first draft
+(count it only once its response headers had arrived — a long poll waits *before* them) was
+dropped the same day, since the logs could not tell when the fragment's headers came, and a
+fragment that never answered at all would have stayed 4042. `Diagnostics/data requests` now shows
+the header time and the body bytes received for a pending request, which is what would justify
+narrowing it again.
+
 Accepted risks (decided 2026-09-25):
 - a site with a permanently broken script turns each of its 4042s into a 5009, which the client
   retries for nothing;
@@ -287,7 +300,10 @@ Accepted risks (decided 2026-09-25):
 - (2026-10-20) a site whose `load` never fires within the budget — a widget hanging on every visit —
   turns each of its genuine 4042s into a 5009, which the client retries for nothing. The diagnostics
   line `Diagnostics/pending loads` names what held `load`, so such a site can be found and the
-  resource blocked downstream.
+  resource blocked downstream;
+- (2026-10-21) a page with a same-site long poll, streaming `fetch()` or SSE read through `fetch`,
+  older than 10 s at the verdict, turns each genuine 4042 into a 5009, which the client retries for
+  nothing. Planned remedy if it happens (not built): a per-request opt-out in `WaitOptions`.
 
 ⚠️ `WORKER_DIAGNOSTICS_ERROR_CODES` filters on the **final** code: a scope set to `4042,4041` stops
 emitting diagnostics for the requests that become 5009 — add `5009` to keep them. The metric

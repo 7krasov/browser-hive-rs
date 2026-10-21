@@ -467,8 +467,16 @@ pub async fn start_capture(
                 }
 
                 Event::NetworkResponseReceived(ev) => {
+                    buf.activity.response(
+                        &ev.params.request_id,
+                        ev.params.response.status,
+                        Instant::now(),
+                    );
+                }
+
+                Event::NetworkDataReceived(ev) => {
                     buf.activity
-                        .response(&ev.params.request_id, ev.params.response.status);
+                        .data_received(&ev.params.request_id, ev.params.data_length as u64);
                 }
 
                 Event::NetworkLoadingFinished(ev) => {

@@ -56,6 +56,11 @@ struct DataRequest {
     /// Offset from the start of capture.
     started: Duration,
     status: Option<u32>,
+    /// Offset of the response headers' arrival from the start of capture.
+    responded: Option<Duration>,
+    /// Decoded body bytes delivered so far (`Network.dataReceived`): tells a body that never
+    /// started from one that stopped midway.
+    received: u64,
     state: State,
 }
 
@@ -131,6 +136,8 @@ impl PageActivity {
                 type_label,
                 started: self.offset(now),
                 status: None,
+                responded: None,
+                received: 0,
                 state: State::Pending,
             },
         );
@@ -166,9 +173,18 @@ impl PageActivity {
     }
 
     /// `Network.responseReceived`.
-    pub fn response(&mut self, request_id: &str, status: u32) {
+    pub fn response(&mut self, request_id: &str, status: u32, now: Instant) {
+        let offset = self.offset(now);
         if let Some(request) = self.requests.get_mut(request_id) {
             request.status = Some(status);
+            request.responded = Some(offset);
+        }
+    }
+
+    /// `Network.dataReceived`. `bytes` is the decoded size of the chunk.
+    pub fn data_received(&mut self, request_id: &str, bytes: u64) {
+        if let Some(request) = self.requests.get_mut(request_id) {
+            request.received = request.received.saturating_add(bytes);
         }
     }
 
@@ -301,18 +317,28 @@ impl PageActivity {
     }
 }
 
-/// `XHR POST https://api.example.com/v1/items +19.9s → 200 in 0.4s, 12.3 KB`.
+/// `XHR POST https://api.example.com/v1/items +19.9s → 200 in 0.4s, 12.3 KB`; a pending one
+/// with headers shows when they came and how much body followed:
+/// `… +14.4s → 200 after 0.3s, 0 B received, pending 34.3s`.
 fn describe(request: &DataRequest, now: Duration) -> String {
     let status = match request.status {
         Some(status) => format!("{} ", status),
         None => String::new(),
     };
     let outcome = match &request.state {
-        State::Pending => format!(
-            "{}pending {}",
-            status,
-            secs(now.saturating_sub(request.started))
-        ),
+        State::Pending => {
+            let pending = secs(now.saturating_sub(request.started));
+            match request.responded {
+                Some(at) => format!(
+                    "{}after {}, {} received, pending {}",
+                    status,
+                    secs(at.saturating_sub(request.started)),
+                    size(request.received as f64),
+                    pending
+                ),
+                None => format!("{}pending {}", status, pending),
+            }
+        }
         State::Finished { took, bytes } => {
             format!("{}in {}, {}", status, secs(*took), size(*bytes))
         }
@@ -368,7 +394,7 @@ mod tests {
             Some(&ResourceType::Fetch),
             at(start, 1_000),
         );
-        activity.response("1", 200);
+        activity.response("1", 200, at(start, 1_200));
         activity.finished("1", 2_048.0, at(start, 1_500));
         activity.will_be_sent(
             "3",
@@ -378,13 +404,24 @@ mod tests {
             at(start, 5_000),
         );
         activity.failed("3", "net::ERR_CONNECTION_RESET", false, at(start, 8_000));
+        activity.will_be_sent(
+            "4",
+            "GET",
+            "https://www.example.com/fragment.html",
+            Some(&ResourceType::Xhr),
+            at(start, 14_000),
+        );
+        activity.response("4", 200, at(start, 14_300));
+        activity.data_received("4", 1_000);
+        activity.data_received("4", 1_048);
 
         let report = activity.data_requests_report(at(start, 41_000)).unwrap();
         assert_eq!(
             report,
-            "3 recorded, 1 pending: [\
+            "4 recorded, 2 pending: [\
              \"Fetch GET https://www.example.com/config +1.0s → 200 in 0.5s, 2.0 KB\", \
              \"XHR GET https://www.example.com/track +5.0s → failed after 3.0s: ERR_CONNECTION_RESET\", \
+             \"XHR GET https://www.example.com/fragment.html +14.0s → 200 after 0.3s, 2.0 KB received, pending 27.0s\", \
              \"XHR POST https://api.example.net/v1/items +20.0s → pending 21.0s\"]"
         );
     }
