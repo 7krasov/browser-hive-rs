@@ -14,7 +14,7 @@
 //! Everything here is Linux-only by nature (`/proc`); elsewhere the collectors return `None` and
 //! the gauges are left out of the exposition rather than reported as zero.
 
-use crate::browser_cdp::BrowserCdpClient;
+use crate::browser_cdp::{BrowserCdpClient, BrowserContexts, TargetInfo};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, TryLockError};
@@ -47,6 +47,20 @@ pub const TARGET_TYPES: [&str; 7] = [
     "browser_ui",
     "other",
 ];
+
+/// Label values of the `context` dimension of the target gauge: whose context a target is in.
+///
+/// - `live`: a context that exists, the default one excluded;
+/// - `default`: the browser's default context;
+/// - `gone`: a context the browser no longer lists — a disposed context whose target outlived it;
+/// - `unknown`: the target carries no context id, or the browser did not report the default
+///   context's id, so `default` and `gone` cannot be told apart.
+///
+/// It exists for `always_new` scopes, where every context is disposed after one request and
+/// `service_worker` targets were seen to accumulate (2026-11-09) while contexts did not: `gone`
+/// says the disposal leaves them behind, `default` says something registers them in the default
+/// context. Locally (Chrome and Brave, macOS) a disposed context's service worker vanished with it.
+pub const TARGET_CONTEXTS: [&str; 4] = ["live", "default", "gone", "unknown"];
 
 /// Bound on each browser-level call of the probe, and on each step of its connection.
 ///
@@ -82,6 +96,8 @@ pub struct ProcessSnapshot {
 pub struct TargetSnapshot {
     /// Targets by type, keyed by values of [`TARGET_TYPES`].
     pub targets: HashMap<&'static str, u64>,
+    /// Targets by `(type, context)`, keyed by values of [`TARGET_TYPES`] and [`TARGET_CONTEXTS`].
+    pub targets_by_context: HashMap<(&'static str, &'static str), u64>,
     /// Browser contexts other than the default one.
     pub contexts: u64,
 }
@@ -242,6 +258,37 @@ fn classify_target(target_type: &str) -> &'static str {
         .unwrap_or("other")
 }
 
+/// Map a target's context id to a value of [`TARGET_CONTEXTS`].
+fn classify_target_context(context_id: Option<&str>, contexts: &BrowserContexts) -> &'static str {
+    let Some(id) = context_id else {
+        return "unknown";
+    };
+    if contexts.ids.iter().any(|live| live == id) {
+        "live"
+    } else {
+        match contexts.default_id.as_deref() {
+            Some(default) if default == id => "default",
+            Some(_) => "gone",
+            None => "unknown",
+        }
+    }
+}
+
+fn count_targets_by_context(
+    targets: &[TargetInfo],
+    contexts: &BrowserContexts,
+) -> HashMap<(&'static str, &'static str), u64> {
+    let mut counts = HashMap::new();
+    for target in targets {
+        let key = (
+            classify_target(&target.target_type),
+            classify_target_context(target.browser_context_id.as_deref(), contexts),
+        );
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+}
+
 fn count_target_types<'a>(types: impl IntoIterator<Item = &'a str>) -> HashMap<&'static str, u64> {
     let mut counts = HashMap::new();
     for target_type in types {
@@ -278,14 +325,12 @@ impl BrowserTargetProbe {
             )),
         };
 
+        let targets = client.targets()?;
+        let contexts = client.browser_contexts()?;
         Ok(TargetSnapshot {
-            targets: count_target_types(
-                client
-                    .targets()?
-                    .iter()
-                    .map(|target| target.target_type.as_str()),
-            ),
-            contexts: client.browser_context_count()? as u64,
+            targets: count_target_types(targets.iter().map(|target| target.target_type.as_str())),
+            targets_by_context: count_targets_by_context(&targets, &contexts),
+            contexts: contexts.ids.len() as u64,
         })
     }
 }
@@ -396,6 +441,46 @@ mod tests {
         let rollup = "55d0-7ffd ---p 00000000 00:00 0 [rollup]\nRss:  900 kB\nPss:  412 kB\n";
         assert_eq!(parse_status_number(rollup, "Pss:"), Some(412));
         assert_eq!(parse_status_number(rollup, "Swap:"), None);
+    }
+
+    #[test]
+    fn targets_are_attributed_to_live_default_or_gone_contexts() {
+        let target = |target_type: &str, context: Option<&str>| TargetInfo {
+            target_id: String::new(),
+            target_type: target_type.to_string(),
+            url: String::new(),
+            browser_context_id: context.map(str::to_string),
+        };
+        let targets = [
+            target("page", Some("live")),
+            target("service_worker", Some("live")),
+            target("service_worker", Some("disposed")),
+            target("service_worker", Some("disposed-too")),
+            target("service_worker", Some("default")),
+            target("page", None),
+        ];
+        let contexts = BrowserContexts {
+            ids: vec!["live".to_string()],
+            default_id: Some("default".to_string()),
+        };
+        let counts = count_targets_by_context(&targets, &contexts);
+        assert_eq!(counts.get(&("page", "live")), Some(&1));
+        assert_eq!(counts.get(&("service_worker", "live")), Some(&1));
+        assert_eq!(counts.get(&("service_worker", "gone")), Some(&2));
+        assert_eq!(counts.get(&("service_worker", "default")), Some(&1));
+        assert_eq!(counts.get(&("page", "unknown")), Some(&1));
+
+        // Without the default context's id, a non-live context cannot be called gone.
+        let unreported = BrowserContexts {
+            default_id: None,
+            ..contexts
+        };
+        let counts = count_targets_by_context(&targets, &unreported);
+        assert_eq!(counts.get(&("service_worker", "unknown")), Some(&3));
+        assert_eq!(counts.get(&("service_worker", "gone")), None);
+        assert!(counts
+            .keys()
+            .all(|(_, context)| TARGET_CONTEXTS.contains(context)));
     }
 
     #[test]

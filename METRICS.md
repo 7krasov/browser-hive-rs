@@ -27,6 +27,7 @@ All metrics carry a `scope` label (e.g. `{scope="local_dev"}`).
 | `browser_hive_worker_browser_process_pss_bytes{scope, type}` | Gauge | Proportional set size of those processes, summed per type |
 | `browser_hive_worker_browser_process_max_pss_bytes{scope, type}` | Gauge | PSS of the largest single process of each type |
 | `browser_hive_worker_browser_targets{scope, type}` | Gauge | CDP targets the browser reports, by target type |
+| `browser_hive_worker_browser_targets_by_context{scope, type, context}` | Gauge | The same targets split by whose context they are in: `live`, `default`, `gone` (a context the browser no longer lists), `unknown` |
 | `browser_hive_worker_browser_contexts` | Gauge | CDP browser contexts that exist in the browser, the default context excluded |
 | `browser_hive_worker_process_resident_memory_bytes` | Gauge | RSS of the worker process itself, the browser excluded |
 | `browser_hive_worker_process_threads` | Gauge | Threads of the worker process |
@@ -51,6 +52,13 @@ A worker's memory limit is spent by the browser's processes, not by the worker, 
   - `page`, `iframe`, `worker`, `shared_worker`, `service_worker`;
   - `browser_ui`, the browser's own internal pages;
   - `other`.
+- **`targets_by_context`** splits the same targets by their `browserContextId`, checked against `Target.getBrowserContexts` (same probe, no extra call):
+  - `live`: a context that exists, the default one excluded;
+  - `default`: the browser's default context (`defaultBrowserContextId`, reported by Chrome and Brave);
+  - `gone`: a context the browser no longer lists, i.e. a target that outlived its context's disposal;
+  - `unknown`: no context id on the target, or a browser that does not report the default context's id.
+
+  It was added for `service_worker` targets accumulating in an `always_new` pod (2026-11-09, see TODO.md). 28 series per pod.
 - **A cross-site iframe appears as an `iframe` target.** This was checked against a real Chrome. `page` includes the browser's initial blank tab.
 - **An unreadable source leaves its gauges absent, not zero.** That covers:
   - no `/proc` (any non-Linux host);
@@ -68,6 +76,9 @@ sum by (type) (browser_hive_worker_browser_process_pss_bytes{scope="<scope>"})
 
 # Out-of-process iframes per page: high values point at site isolation, not at tab age
 browser_hive_worker_browser_targets{type="iframe"} / browser_hive_worker_browser_targets{type="page"}
+
+# Targets that outlived their context (should stay at zero)
+sum by (type) (browser_hive_worker_browser_targets_by_context{context="gone"})
 
 # Contexts the browser still holds after the pool let them go (isolated scopes only;
 # a `shared` scope creates no CDP contexts of its own)

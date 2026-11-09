@@ -2,6 +2,38 @@
 
 Open items that need investigation or a decision. Remove an item once it is resolved.
 
+## Service worker targets accumulate in an `always_new` pod
+
+**Status**: diagnostic gauge implemented 2026-11-09, not released; awaiting production data.
+
+**Observed** (2026-11-04 → 11-09, one pod of a residential headful `always_new` scope, 5 days
+without a restart): PSS of the browser main process grew ~200 → 790 MiB, monotone, and
+`browser_targets{type="service_worker"}` grew ~100 → ~1100 in the same shape. Both curves steepen
+at the same moment as the request rate (~30 → ~50 requests per context per 30 min), so the growth
+follows requests, not time: roughly 0.5 MiB of main-process memory per service worker target.
+Everything else was flat: contexts in the browser 0-1 with none outside the pool (disposal works),
+`page` 2, `iframe` 0-1, process counts constant, renderers 3-4 (so these are not running workers).
+The other pods of the same scope and of its headless twin are at 70-190 MiB, but most show
+`Max == Last` over the window, so they may be growing too and simply be younger — not yet checked.
+
+**Not reproduced locally** (Chrome and Brave on macOS, headless, plain CDP): a page in a fresh
+context registers a service worker, `disposeBrowserContext`, and the `service_worker` target is
+gone with its context. So the production case differs in something not yet known (headful, the
+sites' workers, timing of registration relative to disposal, …).
+
+**Next**: deploy `browser_targets_by_context`, then read the "Targets outside live contexts" panel
+for that scope:
+- `service_worker - gone` growing → targets outlive disposal; look at what differs from the local
+  repro (headful first; the same check on the headless twin separates the two);
+- `service_worker - default` growing → something registers workers in the default context, which
+  an isolated scope should never use;
+- neither → the probe classifies wrongly; re-check `defaultBrowserContextId` on the production
+  browser.
+
+Mitigations, to decide after the data: stop/unregister workers via the CDP `ServiceWorker` domain
+before disposal (effect on main-process memory unmeasured), or block registration in the page
+(an override of `navigator.serviceWorker` is a fingerprinting risk).
+
 ## Verify challenge waiting on production
 
 **Status**: open — released v0.44.0; first production results 2026-10-02: no `passed` yet

@@ -1,5 +1,7 @@
 use crate::browser_pool::BrowserPool;
-use crate::browser_resources::{self, BrowserTargetProbe, PROCESS_TYPES, TARGET_TYPES};
+use crate::browser_resources::{
+    self, BrowserTargetProbe, PROCESS_TYPES, TARGET_CONTEXTS, TARGET_TYPES,
+};
 use crate::third_party::{self, ThirdPartyMetrics};
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
 use prometheus::{
@@ -42,6 +44,7 @@ pub struct Metrics {
     browser_process_pss_bytes: IntGaugeVec,
     browser_process_max_pss_bytes: IntGaugeVec,
     browser_targets: IntGaugeVec,
+    browser_targets_by_context: IntGaugeVec,
     browser_contexts: IntGaugeVec,
     process_resident_memory_bytes: IntGaugeVec,
     process_threads: IntGaugeVec,
@@ -180,6 +183,13 @@ impl Metrics {
             "CDP targets reported by the browser, by target type",
             &["scope", "type"],
         )?;
+        let browser_targets_by_context = register_gauge(
+            &registry,
+            "browser_hive_worker_browser_targets_by_context",
+            "CDP targets by target type and by whose context they are in \
+             (live, default, gone = a context the browser no longer lists, unknown)",
+            &["scope", "type", "context"],
+        )?;
         let browser_contexts = register_gauge(
             &registry,
             "browser_hive_worker_browser_contexts",
@@ -233,6 +243,7 @@ impl Metrics {
             browser_process_pss_bytes,
             browser_process_max_pss_bytes,
             browser_targets,
+            browser_targets_by_context,
             browser_contexts,
             process_resident_memory_bytes,
             process_threads,
@@ -293,6 +304,16 @@ impl Metrics {
                     self.browser_targets
                         .with_label_values(&[scope, target_type])
                         .set(count as i64);
+                    for context in TARGET_CONTEXTS {
+                        let count = snapshot
+                            .targets_by_context
+                            .get(&(target_type, context))
+                            .copied()
+                            .unwrap_or(0);
+                        self.browser_targets_by_context
+                            .with_label_values(&[scope, target_type, context])
+                            .set(count as i64);
+                    }
                 }
                 self.browser_contexts
                     .with_label_values(&[scope])
@@ -300,6 +321,7 @@ impl Metrics {
             }
             None => {
                 self.browser_targets.reset();
+                self.browser_targets_by_context.reset();
                 self.browser_contexts.reset();
             }
         }

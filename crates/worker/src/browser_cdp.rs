@@ -78,6 +78,14 @@ pub struct TargetInfo {
     pub browser_context_id: Option<String>,
 }
 
+/// Result of `Target.getBrowserContexts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BrowserContexts {
+    /// Every context except the default one.
+    pub ids: Vec<String>,
+    pub default_id: Option<String>,
+}
+
 pub struct BrowserCdpClient {
     ws_url: String,
     /// Bound on one call, and on each step (TCP connect, handshake) of opening the socket.
@@ -180,15 +188,27 @@ impl BrowserCdpClient {
             .collect())
     }
 
-    /// Number of browser contexts other than the default one.
-    pub fn browser_context_count(&self) -> Result<usize> {
+    /// The browser contexts that exist right now.
+    ///
+    /// `browserContextIds` excludes the default context; its id comes separately as
+    /// `defaultBrowserContextId` (returned by Chrome and Brave, measured 2026-11-09 on macOS),
+    /// which is `None` on a browser that does not report it.
+    pub fn browser_contexts(&self) -> Result<BrowserContexts> {
         let response = self.call("Target.getBrowserContexts", serde_json::json!({}))?;
 
-        response
+        let ids = response
             .pointer("/result/browserContextIds")
             .and_then(serde_json::Value::as_array)
-            .map(Vec::len)
-            .ok_or_else(|| anyhow!("getBrowserContexts returned no browserContextIds"))
+            .ok_or_else(|| anyhow!("getBrowserContexts returned no browserContextIds"))?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let default_id = response
+            .pointer("/result/defaultBrowserContextId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Ok(BrowserContexts { ids, default_id })
     }
 
     /// Issue one method call, reconnecting once if the socket turned out to be dead.
