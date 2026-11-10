@@ -1,4 +1,4 @@
-use crate::browser_cdp::BrowserCdpClient;
+use crate::browser_cdp::{BrowserCdpClient, TargetInfo};
 use crate::cdp_call;
 use anyhow::{bail, Result};
 use browser_hive_common::{
@@ -258,10 +258,120 @@ fn release_context_detached(
     });
 }
 
+/// Upper bound on how long disposal waits for a context's service worker, see
+/// [`await_service_workers`]. Measured waits were 0–936 ms (median ~360 ms).
+const SERVICE_WORKER_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Pause between two `Target.getTargets` while disposal waits for a service worker.
+const SERVICE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How waiting for a context's service worker before its disposal ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceWorkerWait {
+    /// The context has no service worker target (any more, or never had one).
+    Settled { waited: Duration },
+    /// A service worker target was still in the context when the bound ran out.
+    TimedOut,
+    /// The targets could not be listed; disposal goes ahead at once.
+    ProbeFailed(String),
+}
+
+/// Hold a context's disposal back while it still has a `service_worker` target.
+///
+/// Disposing a context within roughly the first second of its service worker's life leaves that
+/// worker's target behind **with no `browserContextId`, for the browser's lifetime** — about
+/// 0.5 MiB of browser main-process memory each, ~1,100 after 5 days on one `always_new` pod
+/// (2026-11-09, `browser_hive_worker_browser_targets_by_context`). Measured 2026-11-10 (Brave,
+/// macOS, headful, a site whose page registers a worker right after an anti-bot challenge, 20
+/// disposals per variant, each right when the worker target appeared):
+///
+/// | before disposal | orphans |
+/// |---|---|
+/// | nothing (the old behaviour) | ~2 in 15 |
+/// | `closeTarget` on the service worker | 7 in 20 |
+/// | `closeTarget` on the page | 7 in 20 |
+/// | wait until the context's worker target is gone, page open | **0 in 20** |
+/// | wait a fixed 1 s, page open | **0 in 20** |
+///
+/// So the orphan comes from disposing during the worker's startup, not from the worker being
+/// alive. With the page open the target goes away by itself within a second; with the page
+/// closed first it never did within 3 s, which is why the page stays open while this waits. An
+/// orphaned target cannot be removed afterwards (`closeTarget` on it reports success and the
+/// target stays), so preventing it is the only remedy.
+///
+/// Costs: one `getTargets` per disposal when the context has no worker, which is almost always;
+/// up to [`SERVICE_WORKER_SETTLE_TIMEOUT`] of this blocking thread otherwise, during which the old
+/// page still runs next to the request that took its slot. The socket lock is not held between
+/// polls, so other disposals interleave. Any probe error ends the wait at once: a browser that
+/// cannot list its targets would only add call timeouts to a disposal that matters more.
+fn await_service_workers(
+    mut has_service_worker: impl FnMut() -> Result<bool>,
+    timeout: Duration,
+    interval: Duration,
+) -> ServiceWorkerWait {
+    let started = Instant::now();
+    loop {
+        match has_service_worker() {
+            Ok(false) => {
+                return ServiceWorkerWait::Settled {
+                    waited: started.elapsed(),
+                }
+            }
+            Ok(true) if started.elapsed() >= timeout => return ServiceWorkerWait::TimedOut,
+            Ok(true) => std::thread::sleep(interval),
+            Err(e) => return ServiceWorkerWait::ProbeFailed(format!("{e:#}")),
+        }
+    }
+}
+
+/// Whether any of `targets` is a service worker in the CDP context `cdp_context_id`.
+fn context_has_service_worker(targets: &[TargetInfo], cdp_context_id: &str) -> bool {
+    targets.iter().any(|target| {
+        target.target_type == "service_worker"
+            && target.browser_context_id.as_deref() == Some(cdp_context_id)
+    })
+}
+
+/// [`await_service_workers`] against the browser, with its outcome logged.
+fn settle_service_workers(client: &BrowserCdpClient, cdp_context_id: &str) {
+    let outcome = await_service_workers(
+        || {
+            Ok(context_has_service_worker(
+                &client.targets()?,
+                cdp_context_id,
+            ))
+        },
+        SERVICE_WORKER_SETTLE_TIMEOUT,
+        SERVICE_WORKER_POLL_INTERVAL,
+    );
+    match outcome {
+        ServiceWorkerWait::Settled { waited } if waited.is_zero() => {}
+        ServiceWorkerWait::Settled { waited } => debug!(
+            "Waited {:?} for the service worker of CDP context {} before disposing it",
+            waited, cdp_context_id
+        ),
+        ServiceWorkerWait::TimedOut => debug!(
+            "Service worker of CDP context {} still there after {:?} - disposing anyway, its \
+             target may outlive the context",
+            cdp_context_id, SERVICE_WORKER_SETTLE_TIMEOUT
+        ),
+        ServiceWorkerWait::ProbeFailed(e) => debug!(
+            "Could not list targets before disposing CDP context {} - disposing now: {}",
+            cdp_context_id, e
+        ),
+    }
+}
+
+/// Dispose a CDP context once its service worker has settled ([`settle_service_workers`]).
+fn dispose_settled(client: &BrowserCdpClient, cdp_context_id: &str) -> Result<()> {
+    settle_service_workers(client, cdp_context_id);
+    client.dispose_browser_context(cdp_context_id)
+}
+
 /// The body of [`release_context_detached`], for callers already on a blocking thread.
 fn release_context_now(tab: Option<Arc<Tab>>, disposal: Option<Disposal>, context_id: uuid::Uuid) {
     let disposed = match disposal {
-        Some((client, cdp_context_id)) => match client.dispose_browser_context(&cdp_context_id) {
+        Some((client, cdp_context_id)) => match dispose_settled(&client, &cdp_context_id) {
             Ok(()) => {
                 debug!(
                     "Disposed CDP context {} of removed context {}",
@@ -1913,6 +2023,98 @@ pub struct BrowserPoolStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(target_type: &str, context: Option<&str>) -> TargetInfo {
+        TargetInfo {
+            target_id: String::new(),
+            target_type: target_type.to_string(),
+            url: String::new(),
+            browser_context_id: context.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_a_service_worker_in_the_disposed_context_holds_disposal_back() {
+        let targets = [
+            target("page", Some("ctx")),
+            target("service_worker", Some("other")),
+            target("service_worker", None),
+        ];
+        assert!(!context_has_service_worker(&targets, "ctx"));
+
+        let targets = [
+            target("page", Some("ctx")),
+            target("service_worker", Some("ctx")),
+        ];
+        assert!(context_has_service_worker(&targets, "ctx"));
+    }
+
+    #[test]
+    fn a_context_without_a_service_worker_is_disposed_without_waiting() {
+        let mut probes = 0;
+        let outcome = await_service_workers(
+            || {
+                probes += 1;
+                Ok(false)
+            },
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
+        assert!(
+            matches!(outcome, ServiceWorkerWait::Settled { waited } if waited < Duration::from_millis(100))
+        );
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn disposal_waits_until_the_service_worker_is_gone() {
+        let mut probes = 0;
+        let outcome = await_service_workers(
+            || {
+                probes += 1;
+                Ok(probes < 3)
+            },
+            Duration::from_secs(3),
+            Duration::from_millis(1),
+        );
+        assert!(matches!(outcome, ServiceWorkerWait::Settled { .. }));
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn a_service_worker_that_stays_ends_the_wait_at_the_bound() {
+        let started = Instant::now();
+        let outcome = await_service_workers(
+            || Ok(true),
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+        );
+        assert_eq!(outcome, ServiceWorkerWait::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_failed_probe_ends_the_wait_at_once() {
+        let mut probes = 0;
+        let outcome = await_service_workers(
+            || {
+                probes += 1;
+                if probes == 1 {
+                    Ok(true)
+                } else {
+                    Err(anyhow::anyhow!("socket closed"))
+                }
+            },
+            Duration::from_secs(3),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            outcome,
+            ServiceWorkerWait::ProbeFailed("socket closed".into())
+        );
+        assert_eq!(probes, 2);
+    }
 
     /// Build a context without touching a browser: an AlwaysNew pool slot is fully described
     /// by its metadata, so `tab`/`cdp_context_id`/`proxy_host` may stay empty for reclamation

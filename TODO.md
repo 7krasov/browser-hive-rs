@@ -4,44 +4,30 @@ Open items that need investigation or a decision. Remove an item once it is reso
 
 ## Service worker targets accumulate in an `always_new` pod
 
-**Status**: diagnostic gauge released in v0.45.3; first production reading 2026-11-09 (below).
+**Status**: fix in v0.46.0 (disposal waits for the context's service worker); confirm in production.
 
 **Observed** (2026-11-04 → 11-09, one pod of a residential headful `always_new` scope, 5 days
-without a restart): PSS of the browser main process grew ~200 → 790 MiB, monotone, and
-`browser_targets{type="service_worker"}` grew ~100 → ~1100 in the same shape. Both curves steepen
-at the same moment as the request rate (~30 → ~50 requests per context per 30 min), so the growth
-follows requests, not time: roughly 0.5 MiB of main-process memory per service worker target.
-Everything else was flat: contexts in the browser 0-1 with none outside the pool (disposal works),
-`page` 2, `iframe` 0-1, process counts constant, renderers 3-4 (so these are not running workers).
-The other pods of the same scope and of its headless twin are at 70-190 MiB, but most show
-`Max == Last` over the window, so they may be growing too and simply be younger — not yet checked.
+without a restart): PSS of the browser main process grew ~200 → 790 MiB, in the same shape as
+`browser_targets{type="service_worker"}` (~100 → ~1100) — roughly 0.5 MiB per service worker
+target, growing with the request rate. Contexts, pages, iframes and processes were flat.
+`browser_targets_by_context` (v0.45.3) showed them as `service_worker` - `unknown`, i.e. targets with
+**no `browserContextId`**, ~15/h, in that scope only; the orphan log line (v0.45.4) showed every one
+is the same worker script of one site, registered right after its anti-bot challenge passes.
+Headless scopes stay clean: headless never passed that challenge in the local repro.
 
-**Not reproduced locally** (Chrome and Brave on macOS, headless, plain CDP): a page in a fresh
-context registers a service worker, `disposeBrowserContext`, and the `service_worker` target is
-gone with its context. So the production case differs in something not yet known (headful, the
-sites' workers, timing of registration relative to disposal, …).
+**Cause** (reproduced 2026-11-10, Brave on macOS, headful, no proxy): disposing the context within
+roughly the first second of the worker's life leaves its target behind for the browser's lifetime;
+`closeTarget` on it reports success and changes nothing. Closing the worker or the page before
+disposal makes it worse; waiting until the context's worker target is gone (page open, ≤ 3 s,
+median ~360 ms) or a fixed 1 s gave 0 orphans in 20. Measurements and the reasoning are on
+`await_service_workers` in `worker/src/browser_pool.rs`.
 
-**First reading of `browser_targets_by_context`** (2026-11-09, ~1.5 h after the v0.45.3 rollout,
-`max` over the pods of each scope):
-- `page` - `default` = 1 in every scope: the browser's initial blank tab, expected.
-- `service_worker` - `unknown` grew 6 → 28 (~15/h, the same pace as the old pod) in that one scope,
-  and is **0 in every other scope** — including the other headful `always_new` scopes. So neither
-  headful nor `always_new` is the cause by itself; what sets that scope apart is most likely the
-  set of sites it scrapes.
-- `unknown` here means the target carries **no `browserContextId` at all** (the default context's
-  id is reported in the same scope, since its pages classify as `default`). In the local repro
-  every service worker target had one. So the accumulating workers are context-less, most likely
-  left behind by a disposed context.
-
-**Next**: find which site registers them. The probe now logs each orphaned worker once (INFO
-`Service worker target outlived its browser context`, `span_scope`, `sw_host`, `sw_path`; a log
-line rather than a `host` label, since the question is one-off and a label would be a permanent
-client-fed series). Then repro locally with that site's worker and measure whether a cleanup
-before disposal frees main-process memory. Once the site is known, the line can go to DEBUG.
-
-Mitigations, to decide after the data: stop/unregister workers via the CDP `ServiceWorker` domain
-before disposal (effect on main-process memory unmeasured), or block registration in the page
-(an override of `navigator.serviceWorker` is a fingerprinting risk).
+**To confirm after the rollout**: the panel "Targets outside live contexts" stays flat for
+`service_worker` - `unknown` in that scope, and the browser main-process PSS stops climbing.
+If orphans still appear, the 3 s bound is too short for some worker (DEBUG `still there after`
+names the context) or the race has another window — then repeat the repro with that site.
+Not verified: Linux, a proxy, other sites' workers. Once confirmed, the orphan INFO line can go to
+DEBUG.
 
 ## Verify challenge waiting on production
 
