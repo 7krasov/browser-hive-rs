@@ -4,7 +4,7 @@ Open items that need investigation or a decision. Remove an item once it is reso
 
 ## Service worker targets accumulate in an `always_new` pod
 
-**Status**: diagnostic gauge implemented 2026-11-09, not released; awaiting production data.
+**Status**: diagnostic gauge released in v0.45.3; first production reading 2026-11-09 (below).
 
 **Observed** (2026-11-04 → 11-09, one pod of a residential headful `always_new` scope, 5 days
 without a restart): PSS of the browser main process grew ~200 → 790 MiB, monotone, and
@@ -21,14 +21,23 @@ context registers a service worker, `disposeBrowserContext`, and the `service_wo
 gone with its context. So the production case differs in something not yet known (headful, the
 sites' workers, timing of registration relative to disposal, …).
 
-**Next**: deploy `browser_targets_by_context`, then read the "Targets outside live contexts" panel
-for that scope:
-- `service_worker - gone` growing → targets outlive disposal; look at what differs from the local
-  repro (headful first; the same check on the headless twin separates the two);
-- `service_worker - default` growing → something registers workers in the default context, which
-  an isolated scope should never use;
-- neither → the probe classifies wrongly; re-check `defaultBrowserContextId` on the production
-  browser.
+**First reading of `browser_targets_by_context`** (2026-11-09, ~1.5 h after the v0.45.3 rollout,
+`max` over the pods of each scope):
+- `page` - `default` = 1 in every scope: the browser's initial blank tab, expected.
+- `service_worker` - `unknown` grew 6 → 28 (~15/h, the same pace as the old pod) in that one scope,
+  and is **0 in every other scope** — including the other headful `always_new` scopes. So neither
+  headful nor `always_new` is the cause by itself; what sets that scope apart is most likely the
+  set of sites it scrapes.
+- `unknown` here means the target carries **no `browserContextId` at all** (the default context's
+  id is reported in the same scope, since its pages classify as `default`). In the local repro
+  every service worker target had one. So the accumulating workers are context-less, most likely
+  left behind by a disposed context.
+
+**Next**: find which site registers them. The probe now logs each orphaned worker once (INFO
+`Service worker target outlived its browser context`, `span_scope`, `sw_host`, `sw_path`; a log
+line rather than a `host` label, since the question is one-off and a label would be a permanent
+client-fed series). Then repro locally with that site's worker and measure whether a cleanup
+before disposal frees main-process memory. Once the site is known, the line can go to DEBUG.
 
 Mitigations, to decide after the data: stop/unregister workers via the CDP `ServiceWorker` domain
 before disposal (effect on main-process memory unmeasured), or block registration in the page

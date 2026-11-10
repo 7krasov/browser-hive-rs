@@ -59,6 +59,7 @@ A worker's memory limit is spent by the browser's processes, not by the worker, 
   - `unknown`: no context id on the target, or a browser that does not report the default context's id.
 
   It was added for `service_worker` targets accumulating in an `always_new` pod (2026-11-09, see TODO.md). 28 series per pod.
+- **Orphaned service workers are also logged**, since the gauge cannot say which site registered them: every `service_worker` target in `gone` or `unknown` is logged **once** at INFO (`Service worker target outlived its browser context`) with `sw_host` and `sw_path` (the script URL without its query, which may carry tokens), `orphan_service_workers` (how many there are now) and `suppressed`. At most 10 lines a minute; the rest are counted into `suppressed` of the next line. The set of logged ids keeps only targets the browser still reports. Scopes with no orphans log nothing.
 - **A cross-site iframe appears as an `iframe` target.** This was checked against a real Chrome. `page` includes the browser's initial blank tab.
 - **An unreadable source leaves its gauges absent, not zero.** That covers:
   - no `/proc` (any non-Linux host);

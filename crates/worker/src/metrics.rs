@@ -10,6 +10,7 @@ use prometheus::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 /// How long one scrape waits for the browser snapshot before exposing the gauges without it.
 ///
@@ -268,7 +269,14 @@ impl Metrics {
             within_budget(tokio::task::spawn_blocking(
                 browser_resources::collect_processes
             )),
-            within_budget(tokio::task::spawn_blocking(move || probe.snapshot(&ws_url))),
+            within_budget(tokio::task::spawn_blocking({
+                // The probe logs; a blocking task does not inherit the caller's span.
+                let span = tracing::Span::current();
+                move || {
+                    let _entered = span.enter();
+                    probe.snapshot(&ws_url)
+                }
+            })),
         );
         let processes = processes.unwrap_or_default();
         let targets = targets.and_then(|result| {
@@ -422,10 +430,21 @@ struct MetricsState {
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
 ) -> impl IntoResponse {
-    tokio::join!(
-        state.metrics.refresh_pool_gauges(&state.browser_pool),
-        state.metrics.refresh_browser_gauges(&state.browser_pool),
+    // axum runs each connection in a task of its own, outside the `metrics_server` span, so the
+    // scrape needs one for its lines to carry the scope.
+    let span = tracing::info_span!(
+        "metrics_scrape",
+        scope = %state.metrics.scope_name,
+        ray_id = "metrics-scrape",
     );
+    async {
+        tokio::join!(
+            state.metrics.refresh_pool_gauges(&state.browser_pool),
+            state.metrics.refresh_browser_gauges(&state.browser_pool),
+        )
+    }
+    .instrument(span)
+    .await;
 
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();

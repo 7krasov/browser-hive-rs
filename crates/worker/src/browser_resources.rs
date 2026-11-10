@@ -18,7 +18,7 @@ use crate::browser_cdp::{BrowserCdpClient, BrowserContexts, TargetInfo};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Label values of the process gauges. A closed set, so a Chromium release that adds a process
 /// type cannot mint new series; anything unrecognised is `other`.
@@ -61,6 +61,10 @@ pub const TARGET_TYPES: [&str; 7] = [
 /// says the disposal leaves them behind, `default` says something registers them in the default
 /// context. Locally (Chrome and Brave, macOS) a disposed context's service worker vanished with it.
 pub const TARGET_CONTEXTS: [&str; 4] = ["live", "default", "gone", "unknown"];
+
+/// Lines per minute the probe may log about orphaned service workers; the rest are counted and
+/// reported with the next line that is allowed out.
+const ORPHAN_LOG_MAX_PER_MINUTE: u32 = 10;
 
 /// Bound on each browser-level call of the probe, and on each step of its connection.
 ///
@@ -305,6 +309,7 @@ fn count_target_types<'a>(types: impl IntoIterator<Item = &'a str>) -> HashMap<&
 #[derive(Default)]
 pub struct BrowserTargetProbe {
     client: Mutex<Option<(String, BrowserCdpClient)>>,
+    orphans: Mutex<OrphanServiceWorkerLog>,
 }
 
 impl BrowserTargetProbe {
@@ -327,11 +332,113 @@ impl BrowserTargetProbe {
 
         let targets = client.targets()?;
         let contexts = client.browser_contexts()?;
+        let lines = self
+            .orphans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(&targets, &contexts, Instant::now());
+        for line in lines {
+            tracing::info!(
+                sw_host = %line.host,
+                sw_path = %line.path,
+                orphan_service_workers = line.total,
+                suppressed = line.suppressed,
+                "Service worker target outlived its browser context"
+            );
+        }
         Ok(TargetSnapshot {
             targets: count_target_types(targets.iter().map(|target| target.target_type.as_str())),
             targets_by_context: count_targets_by_context(&targets, &contexts),
             contexts: contexts.ids.len() as u64,
         })
+    }
+}
+
+/// One log line about a newly seen orphaned service worker.
+#[derive(Debug, PartialEq, Eq)]
+struct OrphanLine {
+    host: String,
+    /// Path of the worker script, query and fragment dropped.
+    path: String,
+    /// Orphaned service workers the browser reports right now.
+    total: usize,
+    /// New orphans not logged since the previous line, because of the rate limit.
+    suppressed: u64,
+}
+
+/// Logs each service worker target that is in no live context (`gone` or `unknown` in
+/// [`TARGET_CONTEXTS`]) once, so that the script's URL — and so the site that registered it —
+/// reaches Loki. Added for the accumulation described in TODO.md ("Service worker targets
+/// accumulate in an `always_new` pod"); the gauge counts these workers but cannot say whose they are.
+///
+/// Bounded twice: `seen` keeps only ids the browser still reports, so it is never larger than the
+/// orphans themselves, and at most [`ORPHAN_LOG_MAX_PER_MINUTE`] lines leave per minute.
+#[derive(Debug, Default)]
+struct OrphanServiceWorkerLog {
+    seen: HashSet<String>,
+    window_start: Option<Instant>,
+    emitted_in_window: u32,
+    suppressed: u64,
+}
+
+impl OrphanServiceWorkerLog {
+    fn record(
+        &mut self,
+        targets: &[TargetInfo],
+        contexts: &BrowserContexts,
+        now: Instant,
+    ) -> Vec<OrphanLine> {
+        let orphans: Vec<&TargetInfo> = targets
+            .iter()
+            .filter(|target| classify_target(&target.target_type) == "service_worker")
+            .filter(|target| {
+                matches!(
+                    classify_target_context(target.browser_context_id.as_deref(), contexts),
+                    "gone" | "unknown"
+                )
+            })
+            .collect();
+        self.seen
+            .retain(|id| orphans.iter().any(|target| &target.target_id == id));
+
+        if self
+            .window_start
+            .is_none_or(|start| now.duration_since(start) >= Duration::from_secs(60))
+        {
+            self.window_start = Some(now);
+            self.emitted_in_window = 0;
+        }
+
+        let mut lines = Vec::new();
+        for target in &orphans {
+            if !self.seen.insert(target.target_id.clone()) {
+                continue;
+            }
+            if self.emitted_in_window >= ORPHAN_LOG_MAX_PER_MINUTE {
+                self.suppressed += 1;
+                continue;
+            }
+            self.emitted_in_window += 1;
+            let (host, path) = script_location(&target.url);
+            lines.push(OrphanLine {
+                host,
+                path,
+                total: orphans.len(),
+                suppressed: std::mem::take(&mut self.suppressed),
+            });
+        }
+        lines
+    }
+}
+
+/// Host and path of a worker script URL; the query is dropped, since it may carry tokens.
+fn script_location(url: &str) -> (String, String) {
+    match url::Url::parse(url) {
+        Ok(parsed) => (
+            parsed.host_str().unwrap_or_default().to_string(),
+            parsed.path().to_string(),
+        ),
+        Err(_) => (String::new(), String::new()),
     }
 }
 
@@ -481,6 +588,82 @@ mod tests {
         assert!(counts
             .keys()
             .all(|(_, context)| TARGET_CONTEXTS.contains(context)));
+    }
+
+    fn worker(id: &str, url: &str, context: Option<&str>) -> TargetInfo {
+        TargetInfo {
+            target_id: id.to_string(),
+            target_type: "service_worker".to_string(),
+            url: url.to_string(),
+            browser_context_id: context.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn orphaned_service_workers_are_logged_once_without_query() {
+        let contexts = BrowserContexts {
+            ids: vec!["live".to_string()],
+            default_id: Some("default".to_string()),
+        };
+        let mut log = OrphanServiceWorkerLog::default();
+        let start = Instant::now();
+        let targets = vec![
+            worker("a", "https://example.com/sw.js?token=secret", None),
+            worker("b", "https://example.com/sw.js", Some("live")),
+            worker("c", "https://example.com/sw.js", Some("default")),
+            worker(
+                "d",
+                "https://cdn.example.org/push/worker.js",
+                Some("disposed"),
+            ),
+        ];
+
+        let lines = log.record(&targets, &contexts, start);
+        assert_eq!(
+            lines,
+            vec![
+                OrphanLine {
+                    host: "example.com".into(),
+                    path: "/sw.js".into(),
+                    total: 2,
+                    suppressed: 0,
+                },
+                OrphanLine {
+                    host: "cdn.example.org".into(),
+                    path: "/push/worker.js".into(),
+                    total: 2,
+                    suppressed: 0,
+                },
+            ]
+        );
+        // The same targets on the next scrape are not logged again.
+        assert!(log.record(&targets, &contexts, start).is_empty());
+
+        // A target the browser stopped reporting is forgotten.
+        log.record(&targets[..1], &contexts, start);
+        assert_eq!(log.seen, HashSet::from(["a".to_string()]));
+    }
+
+    #[test]
+    fn orphan_lines_are_rate_limited_and_the_rest_is_counted() {
+        let contexts = BrowserContexts::default();
+        let mut log = OrphanServiceWorkerLog::default();
+        let start = Instant::now();
+        let first: Vec<_> = (0..15)
+            .map(|i| worker(&format!("w{i}"), "https://example.com/sw.js", None))
+            .collect();
+
+        let lines = log.record(&first, &contexts, start);
+        assert_eq!(lines.len(), ORPHAN_LOG_MAX_PER_MINUTE as usize);
+        assert_eq!(log.suppressed, 5);
+
+        // A minute later the next new orphan carries the suppressed count.
+        let mut second = first.clone();
+        second.push(worker("new", "https://example.com/sw.js", None));
+        let lines = log.record(&second, &contexts, start + Duration::from_secs(60));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].suppressed, 5);
+        assert_eq!(lines[0].total, 16);
     }
 
     #[test]

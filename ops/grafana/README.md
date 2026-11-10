@@ -129,9 +129,10 @@ resources" section of METRICS.md.
   production); a step up by one browser's worth is a browser process that was never reaped.
 - **Browser contexts: not in the pool** - contexts the browser still holds after the pool
   let them go; meaningful for isolated scopes only.
-- **Targets outside live contexts** - targets in the default context or in a context the browser
-  no longer lists (`gone`). A growing `gone` line is targets outliving their context's disposal
-  (`service_worker` in an `always_new` scope, 2026-11-09, see TODO.md).
+- **Targets outside live contexts** - the worst pod of each scope: targets in the default context,
+  in a context the browser no longer lists (`gone`) or with no context id (`unknown`). `default` -
+  `page` = 1 is the browser's initial blank tab. A growing `service_worker` - `unknown` line is
+  service workers outliving their context (2026-11-09, see TODO.md).
 - **Worker RSS / threads** - growth with uptime is a leak in the worker process itself.
 - **CPU per pod vs. container request and limit** - usage climbing on an almost idle pod is the
   browser burning CPU on its own; usage pinned at the limit is throttling.

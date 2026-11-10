@@ -676,7 +676,7 @@
     {
       "type": "timeseries",
       "title": "Targets outside live contexts",
-      "description": "CDP targets whose context is the browser's default one (`default`) or a context the browser no longer lists (`gone`), by target type. In `always_new` and `reusable` scopes every request runs in its own CDP context, so both lines should stay near zero; a `gone` line that grows means targets outlive the disposal of their context (seen 2026-11-09 for `service_worker`). `default` includes the browser's initial blank tab.",
+      "description": "CDP targets whose context is the browser's default one (`default`), a context the browser no longer lists (`gone`), or none at all (`unknown`), by target type; the worst pod of each scope (`max`, not `sum`, so the value is per pod). `default` - `page` = 1 is normal: the browser's initial blank tab. In isolated scopes everything else should stay at zero; a growing `service_worker` - `unknown` line is service workers outliving their context (2026-11-09, see TODO.md).",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -721,8 +721,8 @@
         {
           "refId": "A",
           "datasource": "${datasource}",
-          "expr": "sum by (type, context) (browser_hive_worker_browser_targets_by_context{scope=~\"$scope\", pod=~\"$pod\", context=~\"default|gone|unknown\"}) > 0",
-          "legendFormat": "{{type}} - {{context}}"
+          "expr": "max by (scope, type, context) (browser_hive_worker_browser_targets_by_context{scope=~\"$scope\", pod=~\"$pod\", context=~\"default|gone|unknown\"}) > 0",
+          "legendFormat": "{{scope}} - {{type}} - {{context}}"
         }
       ]
     },
