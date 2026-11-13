@@ -50,6 +50,18 @@
           "value": "2"
         },
         "hide": 0
+      },
+      {
+        "name": "keda_target",
+        "label": "KEDA busy-per-pod target",
+        "description": "The KEDA scaler's target value of busy contexts per pod (desired replicas = ceil(busy / target)). Feeds only the 'KEDA desired' series of 'Slots vs demand'. Set it to the deployment's threshold.",
+        "type": "textbox",
+        "query": "1.4",
+        "current": {
+          "text": "1.4",
+          "value": "1.4"
+        },
+        "hide": 0
       }
     ]
   },
@@ -792,6 +804,156 @@
           "datasource": "${datasource}",
           "expr": "sum by (scope) (browser_hive_coordinator_scope_workers_total{scope=~\"$scope\"})",
           "legendFormat": "{{scope}} - discovered workers"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Slots vs demand: $scope",
+      "description": "Diagnoses no_slots refusals. One panel per selected scope. Reading rule:\n1. Healthy workers well below KEDA desired = fewer pods alive than KEDA asked for (Pending pods, no nodes). Capacity never arrived.\n2. Healthy workers ~= KEDA desired and coordinator free slots ~= 0 = the fleet really is full. The worker busy gauge is a scrape-time snapshot and under-reads short requests, so KEDA sizes too low.\n3. Coordinator free slots ~= 0 while worker busy is well below total slots = the coordinator's in-flight accounting leaked: routing thinks slots are taken while workers are idle.\nTotal slots = healthy workers x $max_contexts. KEDA desired = ceil(worker busy / $keda_target). Both only match the deployment if those variables do. Min interval is 30s so that short refusal spikes survive long time ranges.",
+      "repeat": "scope",
+      "repeatDirection": "h",
+      "maxPerRow": 2,
+      "interval": "30s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 62
+      },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "no_slots refusals/s"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "reqps"
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "bars"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 60
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total slots"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "KEDA desired"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "max",
+            "mean",
+            "min"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${datasource}",
+          "expr": "sum(browser_hive_coordinator_scope_workers_healthy{scope=~\"$scope\"})",
+          "legendFormat": "healthy workers"
+        },
+        {
+          "refId": "B",
+          "datasource": "${datasource}",
+          "expr": "sum(browser_hive_coordinator_scope_workers_healthy{scope=~\"$scope\"}) * $max_contexts",
+          "legendFormat": "total slots"
+        },
+        {
+          "refId": "C",
+          "datasource": "${datasource}",
+          "expr": "sum(browser_hive_coordinator_scope_available_slots{scope=~\"$scope\"})",
+          "legendFormat": "coordinator free slots"
+        },
+        {
+          "refId": "D",
+          "datasource": "${datasource}",
+          "expr": "sum(browser_hive_worker_active_contexts{scope=~\"$scope\"})",
+          "legendFormat": "worker busy"
+        },
+        {
+          "refId": "E",
+          "datasource": "${datasource}",
+          "expr": "ceil(sum(browser_hive_worker_active_contexts{scope=~\"$scope\"}) / $keda_target)",
+          "legendFormat": "KEDA desired"
+        },
+        {
+          "refId": "F",
+          "datasource": "${datasource}",
+          "expr": "sum(rate(browser_hive_coordinator_requests_rejected_total{scope=~\"$scope\", reason=\"no_slots\"}[2m]))",
+          "legendFormat": "no_slots refusals/s"
         }
       ]
     }

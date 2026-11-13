@@ -51,6 +51,14 @@ fleet rejecting half its traffic look identical from the worker side.
   actually decides on. Free slots pinned at zero with rejections rising is genuine
   saturation; healthy workers collapsing while pods run is a discovery/health problem
   wearing a capacity costume.
+- **Slots vs demand: `$scope`** - one panel per selected scope (repeat), for telling apart
+  the three causes of `no_slots` refusals (red bars, right axis): healthy workers well below
+  *KEDA desired* = pods KEDA asked for never came up; healthy ~= desired with coordinator
+  free slots ~= 0 = the fleet really is full and the busy snapshot under-reads demand;
+  coordinator free slots ~= 0 while *worker busy* is well below *total slots* = leaked
+  in-flight accounting in the coordinator. *Total slots* uses `$max_contexts`, *KEDA
+  desired* uses the `keda_target` variable (the scaler's busy-per-pod target, default 1.4).
+  Min interval 30s, so short refusal spikes are not averaged away over long ranges.
 
 The fix for capacity rejections is `minReplicaCount`/`maxReplicaCount`, **not** a lower KEDA
 threshold: the threshold sets steady-state utilization, and no threshold can conjure a pod
